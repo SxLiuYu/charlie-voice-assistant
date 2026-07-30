@@ -98,6 +98,18 @@ def t_notifications():
     _j.dump(data, open(rf, "w"), ensure_ascii=False, indent=2)
     return d.get("count", 0) > 0, f"通知队列: {d.get('count',0)}条"
 
+def t_manifest():
+    r = requests.get(f"{HOST}/manifest.json", timeout=5)
+    d = r.json()
+    return d.get("name") == "魔幻手机" and d.get("display") == "standalone", f'{d.get("name","?")} {d.get("display","?")}'
+
+def t_search():
+    # First ensure there's some conversation history
+    requests.post(f"{HOST}/api/chat", json={"message": "测试搜索功能hello"}, timeout=30)
+    r = requests.get(f"{HOST}/api/search?q=hello", timeout=5)
+    d = r.json()
+    return d.get("count", 0) >= 1, f"找到{d.get('count',0)}条匹配"
+
 def main():
     print("=" * 50)
     print("  魔幻手机 · 系统自测")
@@ -117,6 +129,8 @@ def main():
         ("监控面板", t_dashboard),
         ("对话导出", t_export),
         ("通知队列", t_notifications),
+        ("PWA Manifest", t_manifest),
+        ("对话搜索", t_search),
     ]
     passed = sum(1 for _, fn in tests if test(_, fn))
     print("=" * 50)
