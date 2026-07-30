@@ -202,6 +202,51 @@ class TestRetry:
 
 
 
+class TestTimestamps:
+    """测试对话时间戳"""
+
+    def test_history_has_timestamp(self):
+        """brain()添加的消息有时间戳"""
+        from unittest.mock import patch, MagicMock
+        mock_brain = MagicMock()
+        mock_brain.run = MagicMock(return_value=[
+            [{"role": "user", "content": "你好"},
+             {"role": "assistant", "content": "你好！"}]
+        ])
+        voice_agent.reset_history()
+        voice_agent._cache.clear()  # 清除缓存, 确保走真实brain路径
+        with patch.object(voice_agent, '_brain', mock_brain):
+            voice_agent.brain("你好")
+        hist = voice_agent._get_history("default")
+        assert len(hist) >= 2
+        for m in hist:
+            assert "ts" in m  # 每条消息都有时间戳
+            assert m["ts"]  # 时间戳非空
+        voice_agent.reset_history()
+
+    def test_timestamp_stripped_from_brain_input(self):
+        """时间戳不传递给大脑"""
+        voice_agent.reset_history()
+        # 手动添加带时间戳的历史
+        voice_agent._get_history("default").append(
+            {"role": "user", "content": "old msg", "ts": "2026-01-01T00:00:00"})
+        
+        mock_brain = MagicMock()
+        mock_brain.run = MagicMock(return_value=[
+            [{"role": "user", "content": "old msg"},
+             {"role": "user", "content": "test"},
+             {"role": "assistant", "content": "reply"}]
+        ])
+        with patch.object(voice_agent, '_brain', mock_brain):
+            voice_agent.brain("test")
+        
+        # 验证brain.run收到的消息没有ts字段
+        called_messages = mock_brain.run.call_args[0][0]
+        for m in called_messages:
+            assert "ts" not in m  # ts不应该传递给大脑
+        voice_agent.reset_history()
+
+
 class TestApiKeyFailover:
     """GLM密钥故障转移测试"""
 

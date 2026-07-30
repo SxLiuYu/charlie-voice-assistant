@@ -908,11 +908,13 @@ async def export_conversation(format: str = "txt"):
         return Response(content=text.encode("utf-8"), media_type="text/markdown",
                        headers={"Content-Disposition": "attachment; filename=conversation.md"})
     
-    # 默认txt格式
+    # 默认txt格式(带时间戳)
     lines = []
     for m in hist:
         role = "我" if m.get("role") == "user" else "魔幻手机"
-        lines.append(f"[{role}] {m.get('content', '')}")
+        ts = m.get("ts", "")[:19].replace("T", " ") if m.get("ts") else ""
+        ts_prefix = f"[{ts}] " if ts else ""
+        lines.append(f"[{role}] {ts_prefix}{m.get('content', '')}")
     text = "\n\n".join(lines)
     return Response(content=text.encode("utf-8"), media_type="text/plain",
                    headers={"Content-Disposition": "attachment; filename=conversation.txt"})

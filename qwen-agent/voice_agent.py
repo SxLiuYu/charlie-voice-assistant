@@ -415,7 +415,7 @@ def brain(text: str, session_id: str = "default") -> str:
             return "大脑启动失败，请稍后重试"
 
     hist = _get_history(session_id)
-    messages = list(hist) + [{'role': 'user', 'content': text}]
+    messages = [{'role': m['role'], 'content': m['content']} for m in hist] + [{'role': 'user', 'content': text}]
     try:
         final = None
         for rsp in _brain.run(messages):
@@ -442,8 +442,9 @@ def brain(text: str, session_id: str = "default") -> str:
                         break
 
     with _history_lock:
-        hist.append({'role': 'user', 'content': text})
-        hist.append({'role': 'assistant', 'content': reply})
+        ts = datetime.datetime.now().isoformat()
+        hist.append({'role': 'user', 'content': text, 'ts': ts})
+        hist.append({'role': 'assistant', 'content': reply, 'ts': ts})
         if len(hist) > MAX_HISTORY * 2:
             # 原地截断(保持引用有效)
             del hist[:len(hist) - (MAX_HISTORY * 2)]
@@ -514,7 +515,7 @@ def brain_stream_sentences(text: str, session_id: str = "default") -> Generator[
             return
 
     hist = _get_history(session_id)
-    messages = list(hist) + [{"role": "user", "content": text}]
+    messages = [{"role": m["role"], "content": m["content"]} for m in hist] + [{"role": "user", "content": text}]
     sent_len = 0       # 已yield的字符数
     full_reply = ""
 
@@ -564,8 +565,9 @@ def brain_stream_sentences(text: str, session_id: str = "default") -> Generator[
 
     # 更新历史+缓存(与brain()保持一致)
     with _history_lock:
-        hist.append({"role": "user", "content": text})
-        hist.append({"role": "assistant", "content": full_reply})
+        ts = datetime.datetime.now().isoformat()
+        hist.append({"role": "user", "content": text, "ts": ts})
+        hist.append({"role": "assistant", "content": full_reply, "ts": ts})
         if len(hist) > MAX_HISTORY * 2:
             del hist[:len(hist) - (MAX_HISTORY * 2)]
         _trim_history_tokens(hist)  # token感知截断
