@@ -26,9 +26,13 @@ display:flex;align-items:center;justify-content:center;font-size:40px;cursor:poi
 #volbarbg{height:12px;background:rgba(255,255,255,.1);border-radius:6px;overflow:hidden}
 #volbar{height:100%;width:0;background:linear-gradient(90deg,#4e9,#e94560);transition:width .05s}
 #volnum{font-size:14px;color:#e94560;text-align:center;margin-top:4px;font-weight:bold}
+#controls{display:flex;gap:8px;margin-bottom:10px;align-items:center}
 #holdbtn{padding:12px 30px;border:2px solid #e94560;border-radius:28px;background:transparent;color:#e94560;
-font-size:14px;margin-bottom:10px;user-select:none;touch-action:none}
+font-size:14px;user-select:none;touch-action:none}
 #holdbtn:active{background:rgba(233,69,96,.2)}
+#autobtn{padding:10px 18px;border:2px solid #4e9;border-radius:28px;background:rgba(78,255,153,.1);
+color:#4e9;font-size:13px;cursor:pointer;user-select:none}
+#autobtn.off{border-color:#555;color:#555;background:transparent}
 #conv{width:90%;max-width:520px;max-height:24vh;overflow-y:auto;background:rgba(255,255,255,.04);
 border-radius:12px;padding:10px}
 .msg{margin:5px 0;padding:7px 11px;border-radius:10px;font-size:13px;line-height:1.5;word-break:break-word}
@@ -43,7 +47,7 @@ border-radius:12px;padding:10px}
 #rempanel{width:90%;max-width:520px;margin-top:8px}
 #rempanel h3{color:#f5a623;font-size:14px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 #rempanel h3 span{font-size:11px;color:#666;cursor:pointer}
-#remlist{max-height:160px;overflow-y:auto;margin-bottom:8px}
+#remlist{max-height:140px;overflow-y:auto;margin-bottom:8px}
 .remitem{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;margin:4px 0;
 background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 .remitem .rtxt{flex:1}.remitem .rtime{color:#888;font-size:11px;margin-left:8px}
@@ -54,15 +58,18 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 #remadd button{padding:8px 14px;border:none;border-radius:16px;background:#f5a623;color:#222;font-size:13px;cursor:pointer}
 </style></head><body>
 <h1>魔幻手机</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
-<div id="diag">📡 点击下方球，授权麦克风开始…</div>
+<div id="diag">📡 点击球授权麦克风，开启自动监听…</div>
 <div id="orb" onclick="init()">🎙️</div>
 <div id="status">点击球授权麦克风</div>
 <div id="volwrap"><div id="volbarbg"><div id="volbar"></div></div></div>
 <div id="volnum">音量 0.0</div>
+<div id="controls">
+<button id="autobtn" onclick="toggleAuto()">自动监听 ON</button>
 <button id="holdbtn" onmousedown="holdStart()" onmouseup="holdEnd()" onmouseleave="holdEnd()" ontouchstart="holdStart()" ontouchend="holdEnd()">按住说话</button>
+</div>
 <div id="conv"></div>
 <div id="textinput">
-<input id="msginput" placeholder="打字也行… 6个MCP大脑流式回复">
+<input id="msginput" placeholder="打字也行… 6个MCP流式回复">
 <button onclick="sendText()">发送</button>
 <button onclick="resetChat()" style="background:#4CAF50;color:#fff;padding:10px 14px;border:none;border-radius:20px;font-size:14px;cursor:pointer">重置</button>
 </div>
@@ -71,74 +78,56 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 <script>
 const st=document.getElementById('status'),diag=document.getElementById('diag'),conv=document.getElementById('conv');
 const orb=document.getElementById('orb'),volbar=document.getElementById('volbar'),volnum=document.getElementById('volnum');
-let mic=false,rec,state='idle',peakVol=0,recStart=0,streamingMsg=null;
+let micStream=null,audioCtx=null,analyser=null,mediaRecorder=null;
+let state='idle',mic=false,autoListen=true,recChunks=[],recStart=0;
+let soundTimer=null,silenceTimer=null,cooldownTimer=null,streamingMsg=null;
+let curVolume=0;
+const SOUND_THRESHOLD=0.8,SILENCE_THRESHOLD=0.3,SOUND_DELAY=300,SILENCE_DELAY=1200,COOLDOWN=800;
 
 function setState(s,icon,txt){state=s;orb.textContent=icon;orb.className=s;st.textContent=txt;}
 function addMsg(cls,txt){const d=document.createElement('div');d.className='msg '+cls;d.textContent=txt;conv.appendChild(d);conv.scrollTop=conv.scrollHeight;return d;}
-function addReplyChunk(txt){
-  if(!streamingMsg){streamingMsg=addMsg('b streaming','');}
-  streamingMsg.textContent+=txt;
-  conv.scrollTop=conv.scrollHeight;
-}
+function addReplyChunk(txt){if(!streamingMsg)streamingMsg=addMsg('b streaming','');streamingMsg.textContent+=txt;conv.scrollTop=conv.scrollHeight;}
 function finishReply(){if(streamingMsg){streamingMsg.classList.remove('streaming');streamingMsg=null;}}
 
 // ===== 音频队列(顺序播放) =====
 let audioQueue=[],isPlaying=false;
-function enqueueAudio(b64mp3){
-  const blob=base64ToBlob(b64mp3,'audio/mpeg');
-  audioQueue.push(blob);
-  if(!isPlaying)playNextAudio();
-}
+function enqueueAudio(b64mp3){audioQueue.push(base64ToBlob(b64mp3,'audio/mpeg'));if(!isPlaying)playNextAudio();}
 function playNextAudio(){
-  if(audioQueue.length===0){isPlaying=false;setState('idle','🎙️','在听…');return;}
+  if(audioQueue.length===0){isPlaying=false;setState('idle','🎙️','在听…');startCooldown();return;}
   isPlaying=true;setState('speaking','🔊','朗读中…');
-  const blob=audioQueue.shift();
-  const audio=new Audio(URL.createObjectURL(blob));
-  audio.onended=playNextAudio;
-  audio.onerror=playNextAudio;
-  audio.play().catch(()=>{setState('idle','🎙️','在听…');isPlaying=false;});
+  const blob=audioQueue.shift();const audio=new Audio(URL.createObjectURL(blob));
+  audio.onended=playNextAudio;audio.onerror=playNextAudio;
+  audio.play().catch(()=>{setState('idle','🎙️','在听…');isPlaying=false;startCooldown();});
 }
-function base64ToBlob(b64,mime){const bin=atob(b64);const arr=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);return new Blob([arr],{type:mime});}
+function base64ToBlob(b64,mime){const bin=atob(b64);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return new Blob([a],{type:mime});}
 
 // ===== SSE流解析 =====
-async function streamSSE(response, onEvent){
-  const reader=response.body.getReader();
-  const decoder=new TextDecoder();
-  let buffer='';
-  while(true){
-    const{done,value}=await reader.read();
-    if(done)break;
-    buffer+=decoder.decode(value,{stream:true});
-    const lines=buffer.split('\n');
-    buffer=lines.pop();
-    for(const line of lines){
-      if(line.startsWith('data: ')){
-        try{onEvent(JSON.parse(line.slice(6)));}catch(e){}
-      }
-    }
-  }
-}
-
-// ===== 流式文字对话 =====
-async function sendText(){
-  const m=document.getElementById('msginput').value.trim();if(!m)return;
-  document.getElementById('msginput').value='';addMsg('u',m);
-  setState('thinking','🧠','思考中(流式)…');
-  streamingMsg=null;
-  try{
-    const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});
-    if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
-    await streamSSE(r,handleStreamEvent);
-  }catch(e){st.textContent='网络错误';setState('idle','🎙️','在听…');}
+async function streamSSE(response,onEvent){
+  const reader=response.body.getReader();const dec=new TextDecoder();let buf='';
+  while(true){const{done,value}=await reader.read();if(done)break;
+    buf+=dec.decode(value,{stream:true});const lines=buf.split('\n');buf=lines.pop();
+    for(const ln of lines)if(ln.startsWith('data: '))try{onEvent(JSON.parse(ln.slice(6)));}catch(e){}}
 }
 function handleStreamEvent(data){
   switch(data.type){
     case'text':addReplyChunk(data.text);break;
     case'audio':enqueueAudio(data.audio);break;
     case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','思考中(流式)…');break;
-    case'done':finishReply();if(!isPlaying&&audioQueue.length===0)setState('idle','🎙️','在听…');break;
-    case'error':addMsg('sys','⚠️ '+(data.message||'错误'));setState('idle','🎙️','在听…');break;
+    case'done':finishReply();if(!isPlaying&&audioQueue.length===0){setState('idle','🎙️','在听…');startCooldown();}break;
+    case'error':addMsg('sys','⚠️ '+(data.message||'错误'));setState('idle','🎙️','在听…');startCooldown();break;
   }
+}
+function startCooldown(){if(cooldownTimer)clearTimeout(cooldownTimer);cooldownTimer=setTimeout(()=>{cooldownTimer=null;},COOLDOWN);}
+
+// ===== 流式文字对话 =====
+async function sendText(){
+  const m=document.getElementById('msginput').value.trim();if(!m)return;
+  document.getElementById('msginput').value='';addMsg('u',m);
+  setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
+  try{const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});
+    if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
+    await streamSSE(r,handleStreamEvent);
+  }catch(e){st.textContent='网络错误';setState('idle','🎙️','在听…');}
 }
 document.getElementById('msginput').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
 
@@ -146,49 +135,74 @@ document.getElementById('msginput').addEventListener('keydown',e=>{if(e.key==='E
 async function init(){
   if(mic)return;
   try{
-    const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});
-    mic=true;diag.textContent='✅ 麦克风就绪';
-    const ctx=new(window.AudioContext||window.webkitAudioContext)();
-    const src=ctx.createMediaStreamSource(s);
-    const an=ctx.createAnalyser();an.fftSize=512;an.smoothingTimeConstant=0.6;
-    src.connect(an);
-    function upd(){
-      const d=new Uint8Array(an.frequencyBinCount);an.getByteFrequencyData(d);
-      let v=0;for(let i=0;i<d.length;i++)v+=d[i];v=v/d.length/255*3;
-      volbar.style.width=Math.min(100,v*40)+'%';volnum.textContent='音量 '+v.toFixed(1);
-      if(state==='idle'&&v>0.8)setState('listening','👂','检测到声音…');
-      if(state==='listening'&&v<0.3){volbar.style.width='0%';volnum.textContent='音量 0.0';}
-      requestAnimationFrame(upd);
-    }upd();setState('idle','🎙️','在听… 自动监听中');
+    micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});
+    mic=true;diag.textContent='✅ 麦克风就绪 · 自动监听已'+(autoListen?'开启':'关闭');
+    audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+    const src=audioCtx.createMediaStreamSource(micStream);
+    analyser=audioCtx.createAnalyser();analyser.fftSize=512;analyser.smoothingTimeConstant=0.6;
+    src.connect(analyser);updateVolume();setState('idle','🎙️','在听…');
   }catch(e){diag.textContent='❌ 麦克风错误:'+e.message+' — 可用打字';}
 }
-// ===== 录音+流式发送 =====
-function startRec(){
-  if(!mic)return;
-  rec=new MediaRecorder(mic?navigator.mediaDevices.stream:null,{mimeType:'audio/webm'});
-  // 重新获取stream用于录制
-  navigator.mediaDevices.getUserMedia({audio:true}).then(s=>{
-    const chunks=[];rec=new MediaRecorder(s,{mimeType:'audio/webm'});
-    rec.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
-    rec.onstop=async()=>{
-      const dur=Date.now()-recStart;
-      if(dur<500){setState('idle','🎙️','在听…');return;}
-      const blob=new Blob(chunks,{type:'audio/webm'});
-      diag.textContent='📤 发送语音('+blob.size+'字节)…';
-      setState('thinking','🧠','识别+思考中(流式)…');
-      streamingMsg=null;
-      try{
-        const fd=new FormData();fd.append('file',blob,'audio.webm');
-        const r=await fetch('/api/voice/stream',{method:'POST',body:fd});
-        if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
-        await streamSSE(r,handleStreamEvent);
-      }catch(e){st.textContent='发送失败:'+e.message;setState('idle','🎙️','在听…');}
-    };
-    rec.start();peakVol=0;recStart=Date.now();
-  });
+function updateVolume(){
+  if(!analyser){return;}
+  const d=new Uint8Array(analyser.frequencyBinCount);analyser.getByteFrequencyData(d);
+  let v=0;for(let i=0;i<d.length;i++)v+=d[i];v=v/d.length/255*3;curVolume=v;
+  volbar.style.width=Math.min(100,v*40)+'%';volnum.textContent='音量 '+v.toFixed(1);
+  // 自动监听逻辑: 仅在idle+自动开启+无cooldown时触发
+  if(autoListen&&state==='idle'&&!cooldownTimer){
+    if(v>SOUND_THRESHOLD){
+      if(!soundTimer)soundTimer=setTimeout(()=>{if(state==='idle'&&autoListen&&!cooldownTimer)startAutoRecord();},SOUND_DELAY);
+    }else{clearTimeout(soundTimer);soundTimer=null;}
+  }
+  // 静默停止: 录音中检测到静默
+  if(state==='listening'&&v<SILENCE_THRESHOLD){
+    if(!silenceTimer)silenceTimer=setTimeout(()=>{if(state==='listening')stopAutoRecord();},SILENCE_DELAY);
+  }else if(state==='listening'){clearTimeout(silenceTimer);silenceTimer=null;}
+  requestAnimationFrame(updateVolume);
 }
-function holdStart(){if(state!=='idle'||!mic)return;setState('listening','👂','聆听中…');startRec();}
-function holdEnd(){if(state==='listening'&&rec&&rec.state==='recording')rec.stop();}
+function toggleAuto(){
+  autoListen=!autoListen;
+  const btn=document.getElementById('autobtn');
+  btn.textContent='自动监听 '+(autoListen?'ON':'OFF');
+  btn.className=autoListen?'':'off';
+  diag.textContent='自动监听已'+(autoListen?'开启':'关闭');
+  if(!autoListen){clearTimeout(soundTimer);clearTimeout(silenceTimer);}
+}
+// ===== 自动录音 =====
+function startAutoRecord(){
+  if(!micStream||state!=='idle')return;
+  recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:'audio/webm'});
+  mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recChunks.push(e.data);};
+  mediaRecorder.onstop=onAutoRecordStop;
+  mediaRecorder.start();recStart=Date.now();
+  setState('listening','👂','聆听中…(自动)');
+}
+function stopAutoRecord(){
+  if(mediaRecorder&&mediaRecorder.state==='recording')mediaRecorder.stop();
+}
+async function onAutoRecordStop(){
+  const dur=Date.now()-recStart;
+  if(dur<500){setState('idle','🎙️','在听…');return;}
+  const blob=new Blob(recChunks,{type:'audio/webm'});
+  diag.textContent='📤 发送语音('+blob.size+'B,'+(dur/1000).toFixed(1)+'s)…';
+  setState('thinking','🧠','识别+思考(流式)…');streamingMsg=null;
+  try{const fd=new FormData();fd.append('file',blob,'audio.webm');
+    const r=await fetch('/api/voice/stream',{method:'POST',body:fd});
+    if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');startCooldown();return;}
+    await streamSSE(r,handleStreamEvent);
+  }catch(e){st.textContent='发送失败:'+e.message;setState('idle','🎙️','在听…');startCooldown();}
+}
+// ===== 按住说话(手动模式) =====
+function holdStart(){
+  if(state!=='idle'||!micStream)return;
+  clearTimeout(soundTimer);clearTimeout(silenceTimer);
+  recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:'audio/webm'});
+  mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recChunks.push(e.data);};
+  mediaRecorder.onstop=onAutoRecordStop;
+  mediaRecorder.start();recStart=Date.now();
+  setState('listening','👂','聆听中…');
+}
+function holdEnd(){if(state==='listening'&&mediaRecorder&&mediaRecorder.state==='recording')mediaRecorder.stop();}
 
 // ===== 提醒管理 =====
 async function loadRems(){
