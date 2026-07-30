@@ -77,6 +77,11 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 <div id="rempanel"><h3>⏰ 提醒 <span onclick="loadRems()">刷新</span></h3><div id="remlist"></div>
 <div id="remadd"><input id="remtext" placeholder="提醒内容…"><input id="remtime" placeholder="时间(如明天9点)" style="max-width:120px"><button onclick="addRem()">+</button></div></div>
 <script>
+// ===== 会话ID(多用户隔离, localStorage持久化) =====
+function genSessionId(){return 's'+Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+let SESSION_ID=localStorage.getItem('magic_session_id')||genSessionId();
+localStorage.setItem('magic_session_id',SESSION_ID);
+
 const st=document.getElementById('status'),diag=document.getElementById('diag'),conv=document.getElementById('conv');
 const orb=document.getElementById('orb'),volbar=document.getElementById('volbar'),volnum=document.getElementById('volnum');
 let micStream=null,audioCtx=null,analyser=null,mediaRecorder=null;
@@ -128,7 +133,7 @@ async function sendText(){
   if(await sendTextWS(m))return;
   // 降级到SSE
   addMsg('u',m);setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
-  try{const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});
+  try{const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m,session_id:SESSION_ID})});
     if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
     await streamSSE(r,handleStreamEvent);
   }catch(e){st.textContent='网络错误';setState('idle','🎙️','在听…');}
@@ -191,7 +196,7 @@ async function onAutoRecordStop(){
   diag.textContent='📤 发送语音('+blob.size+'B,'+(dur/1000).toFixed(1)+'s)…';
   setState('thinking','🧠','识别+思考(流式)…');streamingMsg=null;
   try{const fd=new FormData();fd.append('file',blob,'audio.webm');
-    const r=await fetch('/api/voice/stream',{method:'POST',body:fd});
+    const r=await fetch('/api/voice/stream?session_id='+SESSION_ID,{method:'POST',body:fd});
     if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');startCooldown();return;}
     await streamSSE(r,handleStreamEvent);
   }catch(e){st.textContent='发送失败:'+e.message;setState('idle','🎙️','在听…');startCooldown();}
@@ -227,12 +232,12 @@ async function addRem(){
 }
 async function delRem(id){try{await fetch('/api/reminders/'+id,{method:'DELETE'});loadRems();}catch(e){}}
 async function resetChat(){
-  try{const r=await fetch('/api/reset',{method:'POST'});const d=await r.json();
+  try{const r=await fetch('/api/reset?session_id='+SESSION_ID,{method:'POST'});const d=await r.json();
     conv.innerHTML='';addMsg('sys','🔄 '+d.message);setState('idle','🎙️','新对话，在听…');
   }catch(e){addMsg('sys','重置失败');}
 }
 async function loadConv(){
-  try{const r=await fetch('/api/conversation');const d=await r.json();
+  try{const r=await fetch('/api/conversation?session_id='+SESSION_ID);const d=await r.json();
     if(d.history&&d.history.length){d.history.forEach(m=>{if(m.role==='user'||m.role==='assistant')addMsg(m.role==='user'?'u':'b',m.content);});
       addMsg('sys','📂 已加载'+d.count+'条历史');}}catch(e){}
 }
@@ -285,7 +290,7 @@ function wsConnect(){
 async function sendTextWS(msg){
   if(wsReady&&wsConn&&wsConn.readyState===1){
     addMsg('u',msg);setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
-    wsConn.send(JSON.stringify({type:'text',message:msg}));
+    wsConn.send(JSON.stringify({type:'text',message:msg,session_id:SESSION_ID}));
     return true;
   }
   return false; // 降级到SSE

@@ -23,6 +23,7 @@ from fastapi.responses import Response, HTMLResponse, JSONResponse, StreamingRes
 import uvicorn
 import requests
 import fcntl
+from pydantic import BaseModel, Field, field_validator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("magic")
@@ -76,6 +77,7 @@ class Metrics:
         }
 
 _metrics = Metrics()
+_start_time = time.time()  # 服务启动时间(用于健康检查uptime)
 
 
 @asynccontextmanager
@@ -93,6 +95,7 @@ async def lifespan(app):
         truncate_history_file(REMINDERS_FILE.replace("reminders.json", "conversation_history.json"), 100)
         _start_scheduler()
         _start_proactive()
+        _start_ws_cleanup()
         _warmup_brain()
     yield
     # === 关闭 ===
@@ -133,6 +136,26 @@ def _validate_env():
     return len(missing) == 0
 
 _validate_env()
+
+# ===== Pydantic请求模型(自动验证+Swagger文档) =====
+class ChatRequest(BaseModel):
+    """文字对话请求"""
+    message: str = Field(..., min_length=1, max_length=500, description="用户消息(1-500字)")
+    session_id: str = Field(default="default", description="会话ID(多用户隔离)")
+
+class TTSRequest(BaseModel):
+    """TTS语音合成请求"""
+    text: str = Field(..., min_length=1, max_length=500, description="要合成的文字(1-500字)")
+
+class ReminderRequest(BaseModel):
+    """添加提醒请求"""
+    text: str = Field(..., min_length=1, max_length=200, description="提醒内容(1-200字)")
+    time: str = Field(default="", description="提醒时间(自然语言,如'30分钟后')")
+
+class BrainRestartRequest(BaseModel):
+    """大脑重启请求(预留)"""
+    force: bool = Field(default=False, description="强制重启")
+
 app = FastAPI(title="魔幻手机语音服务", lifespan=lifespan)
 
 # CORS: 允许跨域访问(手机/其他设备)
@@ -570,7 +593,7 @@ def _flush_tts_buffer(tts_buffer: str) -> str:
         return ""
     return _b64enc.b64encode(mp3).decode()
 
-async def _stream_brain_tts(text: str, asr_text: str = ""):
+async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "default"):
     """
     流式大脑+TTS生成器(SSE事件流)。
     大脑在后台线程逐句产出 → 文本事件即时推送(显示) → TTS批量推送(音频)。
@@ -582,7 +605,7 @@ async def _stream_brain_tts(text: str, asr_text: str = ""):
     
     def brain_worker():
         try:
-            for sentence, full_reply in brain_stream_sentences(text):
+            for sentence, full_reply in brain_stream_sentences(text, session_id):
                 q.put(("sentence", sentence, full_reply))
         except Exception as e:
             q.put(("error", str(e)[:60], None))
@@ -644,23 +667,16 @@ async def _stream_brain_tts(text: str, asr_text: str = ""):
                         yield f'data: {json.dumps({"type":"audio","audio":audio_b64}, ensure_ascii=False)}\n\n'
 
 @app.post("/api/chat/stream")
-async def chat_stream_api(req: Request):
+async def chat_stream_api(req: ChatRequest):
     """流式文字对话: 文字进 → 大脑逐句产出 → TTS批量推送(SSE)"""
-    try:
-        body = await req.json()
-    except Exception:
-        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
-    text = body.get("message", "")
-    if len(text) > MAX_TEXT_LENGTH:
-        return JSONResponse({"error": f"输入过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
-    if not text.strip():
-        return JSONResponse({"error": "消息不能为空"}, status_code=400)
-    log.info(f"/api/chat/stream 流式对话: {text[:40]}")
-    return StreamingResponse(_stream_brain_tts(text), media_type="text/event-stream",
+    text = req.message
+    session_id = req.session_id
+    log.info(f"/api/chat/stream 流式对话: {text[:40]} (session={session_id[:8]})")
+    return StreamingResponse(_stream_brain_tts(text, session_id=session_id), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.post("/api/voice/stream")
-async def voice_stream_api(file: UploadFile = File(...)):
+async def voice_stream_api(file: UploadFile = File(...), session_id: str = "default"):
     """流式语音对话: 音频进 → ASR → 大脑逐句 → TTS批量(SSE)"""
     data = await file.read()
     ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
@@ -680,25 +696,17 @@ async def voice_stream_api(file: UploadFile = File(...)):
     if not asr_text:
         asr_text = "(未识别到语音)"
     
-    return StreamingResponse(_stream_brain_tts(asr_text, asr_text), 
+    return StreamingResponse(_stream_brain_tts(asr_text, asr_text, session_id=session_id), 
                              media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.post("/api/chat")
-async def chat_api(req: Request):
-    try:
-        body = await req.json()
-    except Exception:
-        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
-    text = body.get("message", "")
-    if not text.strip():
-        return JSONResponse({"error": "消息不能为空"}, status_code=400)
-    if len(text) > MAX_TEXT_LENGTH:
-        return JSONResponse({"error": f"输入过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
+async def chat_api(req: ChatRequest):
+    text = req.message
     from voice_agent import brain
     try:
         reply = await asyncio.wait_for(
-            asyncio.to_thread(brain, text), timeout=30)
+            asyncio.to_thread(brain, text, req.session_id), timeout=30)
         return {"reply": reply}
     except asyncio.TimeoutError:
         log.error("/api/chat 超时(30s)")
@@ -709,11 +717,11 @@ async def chat_api(req: Request):
         return JSONResponse({"error": sanitize_error(str(e))}, status_code=500)
 
 @app.post("/api/reset")
-async def reset_conversation():
-    """清空对话历史，开始新对话"""
+async def reset_conversation(session_id: str = "default"):
+    """清空指定会话的对话历史"""
     from voice_agent import reset_history
-    reset_history()
-    return {"ok": True, "message": "对话已重置"}
+    reset_history(session_id)
+    return {"ok": True, "message": "对话已重置", "session_id": session_id}
 
 @app.get("/api/status")
 async def system_status():
@@ -748,17 +756,9 @@ async def list_reminders():
     return {"total": len(data), "pending": len(pending), "reminders": data}
 
 @app.post("/api/reminders")
-async def add_reminder(req: Request):
-    try:
-        body = await req.json()
-    except Exception:
-        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
-    text = body.get("text", "").strip()
-    time_str = body.get("time", "").strip()
-    if not text:
-        raise HTTPException(400, "text不能为空")
-    if len(text) > 200:
-        raise HTTPException(400, "提醒内容过长(上限200字)")
+async def add_reminder(req: ReminderRequest):
+    text = req.text.strip()
+    time_str = req.time.strip()
     # 复用共享时间解析工具
     due = None
     if time_str:
@@ -787,23 +787,30 @@ async def delete_reminder(rid: int):
     return {"ok": True, "message": f"提醒{rid}已标记完成"}
 
 @app.get("/api/conversation")
-async def get_conversation():
-    """获取当前对话历史"""
-    from voice_agent import _history
-    return {"history": _history, "count": len(_history)}
+async def get_conversation(page: int = 1, limit: int = 50, session_id: str = "default"):
+    """获取对话历史(支持分页)
+    page: 页码(从1开始), limit: 每页条数(默认50)
+    """
+    from voice_agent import _get_history
+    hist = _get_history(session_id)
+    total = len(hist)
+    # 分页计算
+    start = max(0, (page - 1) * limit)
+    end = start + limit
+    items = hist[start:end]
+    return {
+        "history": items,
+        "count": len(items),
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "has_more": end < total,
+    }
 
 @app.post("/api/tts")
-async def tts_api(req: Request):
-    """文字 → 语音(WAV)"""
-    try:
-        body = await req.json()
-    except Exception:
-        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
-    text = body.get("text", "")
-    if not text:
-        return JSONResponse({"error": "text不能为空"}, status_code=400)
-    if len(text) > MAX_TEXT_LENGTH:
-        return JSONResponse({"error": f"文本过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
+async def tts_api(req: TTSRequest):
+    """文字 → 语音(MP3)"""
+    text = req.text
     from voice_agent import tts
     try:
         audio = await asyncio.wait_for(
@@ -900,7 +907,34 @@ async def sse_events():
 
 
 # ===== WebSocket 双向通信(实时语音/文字, 支持打断TTS) =====
-_ws_clients = {}  # {ws_id: {"ws": ws, "interrupt": False}}
+_ws_clients = {}  # {ws_id: {"ws": ws, "interrupt": False, "last_active": time.time()}}
+_WS_STALE_TIMEOUT = 300  # 5分钟无活动视为过期
+
+def _ws_cleanup_stale():
+    """清理过期的WebSocket连接(5分钟无活动)"""
+    now = time.time()
+    stale = [sid for sid, info in _ws_clients.items()
+             if now - info.get("last_active", now) > _WS_STALE_TIMEOUT]
+    for sid in stale:
+        try:
+            ws = _ws_clients[sid].get("ws")
+            if ws:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(asyncio.ensure_future, ws.close())
+        except Exception:
+            pass
+        _ws_clients.pop(sid, None)
+    if stale:
+        log.info(f"[ws] 清理{len(stale)}个过期连接, 剩余{len(_ws_clients)}个")
+
+def _start_ws_cleanup():
+    """启动WebSocket过期连接清理线程(每60秒)"""
+    def _cleanup_loop():
+        while True:
+            time.sleep(60)
+            _ws_cleanup_stale()
+    threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -922,7 +956,7 @@ async def websocket_endpoint(ws: WebSocket):
     """
     await ws.accept()
     ws_id = id(ws)
-    _ws_clients[ws_id] = {"ws": ws, "interrupt": False}
+    _ws_clients[ws_id] = {"ws": ws, "interrupt": False, "last_active": time.time()}
     log.info(f"[ws] 客户端已连接 (id={ws_id}), 共{len(_ws_clients)}个连接")
     
     # 发送连接确认
@@ -933,6 +967,7 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             try:
                 msg = await asyncio.wait_for(ws.receive_text(), timeout=120)
+                _ws_clients[ws_id]["last_active"] = time.time()
             except asyncio.TimeoutError:
                 # 2分钟无消息, 发心跳检测
                 await ws.send_json({"type": "ping"})
@@ -959,6 +994,7 @@ async def websocket_endpoint(ws: WebSocket):
             
             if mtype == "text":
                 text = data.get("message", "").strip()
+                session_id = data.get("session_id", "default")
                 if not text:
                     await ws.send_json({"type": "error", "message": "消息不能为空"})
                     continue
@@ -967,10 +1003,10 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 # 重置打断标志
                 _ws_clients[ws_id]["interrupt"] = False
-                log.info(f"[ws] 文字对话: {text[:40]}")
+                log.info(f"[ws] 文字对话: {text[:40]} (session={session_id[:8]})")
                 
                 # 流式处理大脑回复
-                async for event in _ws_stream_brain(ws_id, text, ""):
+                async for event in _ws_stream_brain(ws_id, text, "", session_id):
                     await ws.send_json(event)
                     # 检查打断
                     if _ws_clients[ws_id]["interrupt"]:
@@ -1009,7 +1045,8 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({"type": "asr", "text": asr_text})
                 
                 # 流式大脑回复
-                async for event in _ws_stream_brain(ws_id, asr_text, asr_text):
+                ws_session_id = data.get("session_id", "default")
+                async for event in _ws_stream_brain(ws_id, asr_text, asr_text, ws_session_id):
                     await ws.send_json(event)
                     if _ws_clients[ws_id]["interrupt"]:
                         await ws.send_json({"type": "interrupted"})
@@ -1027,7 +1064,7 @@ async def websocket_endpoint(ws: WebSocket):
         _ws_clients.pop(ws_id, None)
         log.info(f"[ws] 连接清理完成 (id={ws_id}), 剩余{len(_ws_clients)}个")
 
-async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = ""):
+async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = "", session_id: str = "default"):
     """WebSocket专用流式大脑+TTS生成器(检查打断标志)"""
     from voice_agent import brain_stream_sentences, _clean_for_tts
     
@@ -1035,7 +1072,7 @@ async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = ""):
     
     def brain_worker():
         try:
-            for sentence, full_reply in brain_stream_sentences(text):
+            for sentence, full_reply in brain_stream_sentences(text, session_id):
                 q.put(("sentence", sentence, full_reply))
         except Exception as e:
             q.put(("error", str(e)[:60], None))
@@ -1100,17 +1137,26 @@ async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = ""):
 
 
 @app.get("/api/search")
-async def search_conversation(q: str = ""):
+async def search_conversation(q: str = "", session_id: str = "default"):
     """搜索对话历史中的关键词(同时搜索内存+文件)"""
     if not q:
         return JSONResponse({"error": "请提供搜索关键词?q=xxx"}, status_code=400)
-    from voice_agent import _history, HISTORY_FILE
+    from voice_agent import _get_history, HISTORY_FILE
     # 合并内存历史和文件历史(去重)
-    all_history = list(_history)
+    hist = _get_history(session_id)
+    all_history = list(hist)
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            file_hist = json.load(f)
-        # 添加文件中存在但内存中没有的条目
+            file_data = json.load(f)
+        # 新格式: dict {session_id: [messages]}
+        if isinstance(file_data, dict):
+            file_hist = file_data.get(session_id, [])
+        # 旧格式: list [messages]
+        elif isinstance(file_data, list):
+            file_hist = file_data
+        else:
+            file_hist = []
+        # 使用文件中更完整的历史
         if len(file_hist) > len(all_history):
             all_history = file_hist
     except Exception:
@@ -1277,7 +1323,18 @@ async def tunnel_status():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "magic-phone-voice"}
+    """增强健康检查: 服务状态 + 大脑就绪 + WebSocket连接 + 运行时间"""
+    uptime_s = int(time.time() - _start_time) if _start_time else 0
+    return {
+        "ok": True,
+        "service": "magic-phone-voice",
+        "version": "3.1.0",
+        "uptime_seconds": uptime_s,
+        "uptime_human": f"{uptime_s//3600}h{(uptime_s%3600)//60}m",
+        "brain_ready": _brain_is_warm(),
+        "websocket_clients": _ws_client_count(),
+        "sse_clients": len(_sse_clients),
+    }
 
 @app.get("/", response_class=HTMLResponse)
 async def web_client():

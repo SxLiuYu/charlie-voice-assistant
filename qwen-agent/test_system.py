@@ -108,12 +108,24 @@ def t_search():
     import json as _j, os as _os
     hf = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "conversation_history.json")
     try:
-        hist = _j.load(open(hf))
+        data = _j.load(open(hf))
+        # 新格式: dict {session_id: [messages]}
+        if isinstance(data, dict):
+            hist = data.get("default", [])
+            data["default"] = hist
+        # 旧格式: list [messages]
+        elif isinstance(data, list):
+            hist = data
+            data = {"default": hist}
+        else:
+            hist = []
+            data = {"default": hist}
     except:
         hist = []
+        data = {"default": hist}
     hist.append({"role": "user", "content": "测试搜索功能hello"})
     hist.append({"role": "assistant", "content": "搜索测试回复"})
-    _j.dump(hist, open(hf, "w"), ensure_ascii=False, indent=2)
+    _j.dump(data, open(hf, "w"), ensure_ascii=False, indent=2)
     r = requests.get(f"{HOST}/api/search?q=hello", timeout=5)
     d = r.json()
     return d.get("count", 0) >= 1, f"找到{d.get('count',0)}条匹配"

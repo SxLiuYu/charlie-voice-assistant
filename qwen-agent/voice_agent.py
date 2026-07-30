@@ -46,32 +46,62 @@ def _cache_set(text: str, reply: str) -> None:
         _cache.pop(next(iter(_cache)))  # 移除最旧的
     _cache[text.strip().lower()] = (reply, time.time())
 
-# ===== 对话历史(跨请求持久化) =====
-_history = []
-MAX_HISTORY = 20  # 保留最近20轮对话(40条消息)
+# ===== 对话历史(多会话, 跨请求持久化) =====
+_history = []  # 默认会话历史(向后兼容)
+_sessions = {"default": _history}  # 多会话: {session_id: [history]}
+MAX_HISTORY = 20  # 每个会话保留最近20轮对话(40条消息)
+MAX_SESSIONS = 10  # 最多10个并发会话
 _history_lock = threading.Lock()  # 防止多线程同时修改对话历史
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation_history.json")
+
+def _get_history(session_id: str = "default") -> list:
+    """获取指定会话的历史(不存在则自动创建)"""
+    with _history_lock:
+        if session_id not in _sessions:
+            _sessions[session_id] = []
+            # 超过最大会话数时移除最旧的(非default)
+            if len(_sessions) > MAX_SESSIONS:
+                for k in list(_sessions.keys()):
+                    if k != "default":
+                        del _sessions[k]
+                        break
+        return _sessions[session_id]
 
 def _save_history() -> None:
     with _history_lock:
         try:
+            # 保存所有会话(格式: {"default": [...], "session_xxx": [...]})
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(_history, f, ensure_ascii=False, indent=2)
+                json.dump(_sessions, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
 def _load_history() -> None:
-    global _history
+    global _history, _sessions
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            _history = json.load(f)
+            data = json.load(f)
+        if isinstance(data, dict):
+            # 新格式: 多会话
+            _sessions = data
+            _history = _sessions.get("default", [])
+            _sessions["default"] = _history
+        elif isinstance(data, list):
+            # 旧格式: 单一会话列表(向后兼容)
+            _history = data
+            _sessions = {"default": _history}
     except Exception:
         _history = []
+        _sessions = {"default": _history}
 
-def reset_history() -> None:
-    global _history
+def reset_history(session_id: str = "default") -> None:
+    """重置指定会话的历史(原地清空, 保持引用有效)"""
     with _history_lock:
-        _history = []
+        hist = _sessions.get(session_id)
+        if hist is not None:
+            hist.clear()  # 原地清空, 不重新赋值
+        else:
+            _sessions[session_id] = []
     _save_history()
 
 _load_history()
@@ -278,9 +308,9 @@ def brain_status() -> dict:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-def brain(text: str) -> str:
+def brain(text: str, session_id: str = "default") -> str:
     """大脑推理: 文字→GLM-5.2+MCP→回复文字"""
-    global _brain, _history
+    global _brain
     # 缓存命中(60秒内相同查询直接返回)
     cached = _cache_get(text)
     if cached is not None:
@@ -297,7 +327,8 @@ def brain(text: str) -> str:
             log.error(f"大脑构建失败: {e}")
             return "大脑启动失败，请稍后重试"
 
-    messages = list(_history) + [{'role': 'user', 'content': text}]
+    hist = _get_history(session_id)
+    messages = list(hist) + [{'role': 'user', 'content': text}]
     try:
         final = None
         for rsp in _brain.run(messages):
@@ -324,10 +355,11 @@ def brain(text: str) -> str:
                         break
 
     with _history_lock:
-        _history.append({'role': 'user', 'content': text})
-        _history.append({'role': 'assistant', 'content': reply})
-        if len(_history) > MAX_HISTORY * 2:
-            _history = _history[-(MAX_HISTORY * 2):]
+        hist.append({'role': 'user', 'content': text})
+        hist.append({'role': 'assistant', 'content': reply})
+        if len(hist) > MAX_HISTORY * 2:
+            # 原地截断(保持引用有效)
+            del hist[:len(hist) - (MAX_HISTORY * 2)]
     _save_history()
     _cache_set(text, reply)
     return reply
@@ -371,7 +403,7 @@ def _clean_for_tts(text: str) -> str:
     t = _re.sub(r'\s{2,}', ' ', t)          # 多余空格
     return t.strip()
 
-def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
+def brain_stream_sentences(text: str, session_id: str = "default") -> Generator[Tuple[str, str], None, None]:
     """
     流式大脑: 逐句yield完整句子，供TTS流水线使用。
     brain.run()增量产出token → 检测句子边界 → yield完整句。
@@ -379,7 +411,7 @@ def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
     yield: (sentence:str, full_reply:str)
     最后一次yield后，full_reply是完整回复。
     """
-    global _brain, _history
+    global _brain
     # 缓存命中直接返回
     cached = _cache_get(text)
     if cached is not None:
@@ -394,7 +426,8 @@ def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
             yield (f"大脑启动失败: {str(e)[:40]}", f"大脑启动失败: {str(e)[:40]}")
             return
 
-    messages = list(_history) + [{"role": "user", "content": text}]
+    hist = _get_history(session_id)
+    messages = list(hist) + [{"role": "user", "content": text}]
     sent_len = 0       # 已yield的字符数
     full_reply = ""
 
@@ -444,10 +477,10 @@ def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
 
     # 更新历史+缓存(与brain()保持一致)
     with _history_lock:
-        _history.append({"role": "user", "content": text})
-        _history.append({"role": "assistant", "content": full_reply})
-        if len(_history) > MAX_HISTORY * 2:
-            _history = _history[-(MAX_HISTORY * 2):]
+        hist.append({"role": "user", "content": text})
+        hist.append({"role": "assistant", "content": full_reply})
+        if len(hist) > MAX_HISTORY * 2:
+            del hist[:len(hist) - (MAX_HISTORY * 2)]
     _save_history()
     _cache_set(text, full_reply)
 

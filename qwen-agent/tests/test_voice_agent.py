@@ -198,3 +198,71 @@ class TestRetry:
         with patch.object(voice_agent, 'RETRY_BACKOFF', [0, 0, 0]):
             with _pytest.raises(Exception, match="test超时"):
                 voice_agent._retry(fn, "test")
+
+
+class TestMultiUserSessions:
+    """多用户会话隔离测试"""
+
+    def test_session_isolation(self):
+        """不同session_id的对话历史相互隔离"""
+        voice_agent.reset_history("default")
+        voice_agent.reset_history("user2")
+        
+        # default session
+        hist1 = voice_agent._get_history("default")
+        hist1.append({"role": "user", "content": "hello from user1"})
+        
+        # user2 session
+        hist2 = voice_agent._get_history("user2")
+        hist2.append({"role": "user", "content": "hello from user2"})
+        
+        assert len(hist1) == 1
+        assert len(hist2) == 1
+        assert hist1[0]["content"] == "hello from user1"
+        assert hist2[0]["content"] == "hello from user2"
+        assert hist1 is not hist2  # 不同列表对象
+        
+        # 清理
+        voice_agent.reset_history("default")
+        voice_agent.reset_history("user2")
+
+    def test_default_session_backward_compat(self):
+        """default会话向后兼容(_history仍指向同一列表)"""
+        voice_agent.reset_history()
+        hist = voice_agent._get_history("default")
+        hist.append({"role": "user", "content": "compat test"})
+        # _history应该指向同一个列表
+        assert len(voice_agent._history) == 1
+        assert voice_agent._history[0]["content"] == "compat test"
+        voice_agent.reset_history()
+
+    def test_reset_specific_session(self):
+        """重置特定会话不影响其他会话"""
+        voice_agent.reset_history("default")
+        voice_agent.reset_history("user3")
+        
+        hist1 = voice_agent._get_history("default")
+        hist1.append({"role": "user", "content": "user1 msg"})
+        
+        hist2 = voice_agent._get_history("user3")
+        hist2.append({"role": "user", "content": "user3 msg"})
+        
+        # 重置default不影响user3
+        voice_agent.reset_history("default")
+        assert len(voice_agent._get_history("default")) == 0
+        assert len(voice_agent._get_history("user3")) == 1
+        
+        voice_agent.reset_history("user3")
+
+    def test_max_sessions_limit(self):
+        """超过最大会话数时自动清理"""
+        # 创建MAX_SESSIONS+1个会话
+        for i in range(voice_agent.MAX_SESSIONS + 2):
+            voice_agent._get_history(f"test_session_{i}")
+        # 应该不超过MAX_SESSIONS+1(default + MAX_SESSIONS-1 others)
+        # (因为每次创建新的非default会话时, 如果超限会删一个旧的)
+        assert len(voice_agent._sessions) <= voice_agent.MAX_SESSIONS + 1
+        # 清理测试会话
+        for k in list(voice_agent._sessions.keys()):
+            if k.startswith("test_session_"):
+                del voice_agent._sessions[k]

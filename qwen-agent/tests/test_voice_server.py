@@ -33,6 +33,10 @@ class TestHealthAndStatus:
         data = r.json()
         assert data["ok"] is True
         assert "service" in data
+        assert "version" in data
+        assert "uptime_seconds" in data
+        assert "brain_ready" in data
+        assert "websocket_clients" in data
 
     def test_status(self, client):
         r = client.get("/api/status")
@@ -76,11 +80,11 @@ class TestReminders:
 
     def test_add_reminder_no_text(self, client):
         r = client.post("/api/reminders", json={"text": "", "time": ""})
-        assert r.status_code in (400, 422)
+        assert r.status_code == 422  # Pydantic validation
 
     def test_add_reminder_too_long(self, client):
         r = client.post("/api/reminders", json={"text": "x" * 300, "time": ""})
-        assert r.status_code in (400, 422)
+        assert r.status_code == 422  # Pydantic max_length validation
 
 
 class TestConversation:
@@ -92,6 +96,19 @@ class TestConversation:
         data = r.json()
         assert "history" in data
         assert "count" in data
+        assert "total" in data
+        assert "page" in data
+        assert "limit" in data
+        assert "has_more" in data
+
+    def test_conversation_pagination(self, client):
+        """测试对话历史分页"""
+        r = client.get("/api/conversation?page=1&limit=5")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["page"] == 1
+        assert data["limit"] == 5
+        assert len(data["history"]) <= 5
 
     def test_reset_conversation(self, client):
         r = client.post("/api/reset")
@@ -117,7 +134,7 @@ class TestSearch:
 
     def test_search_no_query(self, client):
         r = client.get("/api/search")
-        assert r.status_code == 400
+        assert r.status_code == 400  # 搜索无关键词
 
     def test_search_with_query(self, client):
         r = client.get("/api/search?q=你好")
@@ -131,15 +148,15 @@ class TestChat:
 
     def test_chat_empty(self, client):
         r = client.post("/api/chat", json={"message": ""})
-        assert r.status_code == 400
+        assert r.status_code == 422  # Pydantic validation
 
     def test_chat_too_long(self, client):
         r = client.post("/api/chat", json={"message": "x" * 600})
-        assert r.status_code == 413
+        assert r.status_code == 422  # Pydantic max_length validation
 
     def test_chat_invalid_json(self, client):
         r = client.post("/api/chat", data="not json", headers={"Content-Type": "application/json"})
-        assert r.status_code == 400
+        assert r.status_code == 422  # Pydantic validation error
 
     def test_chat_success(self, client):
         """使用mock测试成功对话"""
@@ -156,11 +173,11 @@ class TestTTS:
 
     def test_tts_empty(self, client):
         r = client.post("/api/tts", json={"text": ""})
-        assert r.status_code == 400
+        assert r.status_code == 422  # Pydantic validation
 
     def test_tts_too_long(self, client):
         r = client.post("/api/tts", json={"text": "x" * 600})
-        assert r.status_code == 413
+        assert r.status_code == 422  # Pydantic max_length validation
 
     @patch("voice_agent.tts")
     @patch("voice_server._wav_to_mp3")
