@@ -184,10 +184,28 @@ app = FastAPI(title="魔幻手机语音服务", lifespan=lifespan)
 
 # CORS: 允许跨域访问(手机/其他设备)
 from fastapi.middleware.cors import CORSMiddleware
+# CORS: 动态允许来源(localhost + tunnel + 局域网)
+_cors_origins = [
+    "*",  # 开发阶段仍允许所有(生产环境可移除)
+    "http://localhost:8000",
+    "http://localhost:8443",
+    "https://localhost:8443",
+]
+# 动态加载tunnel URL
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnel_url.txt")) as f:
+        _tunnel = f.read().strip()
+        if _tunnel:
+            _cors_origins.append(_tunnel)
+except Exception:
+    pass
+
 app.add_middleware(CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"])
+    allow_origins=_cors_origins,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
+    allow_credentials=True,
+    max_age=3600)
 
 # ===== 限流中间件(防滥用, 每IP每分钟60次普通+10次语音) =====
 _rate_buckets = {}  # {ip: {"voice": [timestamps], "general": [timestamps]}}
@@ -737,8 +755,15 @@ async def chat_api(req: ChatRequest):
         return JSONResponse({"error": "思考超时，请重试"}, status_code=504)
     except Exception as e:
         log.error(f"/api/chat 异常: {e}")
-        from utils import sanitize_error
-        return JSONResponse({"error": sanitize_error(str(e))}, status_code=500)
+        # 优雅降级: 返回友好提示而非500错误
+        fallback = "抱歉，我现在有点忙不过来，请稍等一下再试。"
+        try:
+            from voice_agent import _rotate_glm_key
+            _rotate_glm_key()  # 尝试切换密钥
+            log.info("[chat] 密钥已轮换, 下次请求将使用新密钥")
+        except Exception:
+            pass
+        return {"reply": fallback, "degraded": True}
 
 @app.post("/api/reset")
 async def reset_conversation(session_id: str = "default"):

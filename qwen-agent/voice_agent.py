@@ -41,9 +41,19 @@ TTS_VOICE = os.getenv("TTS_VOICE", "Cherry")
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 3, 5]  # 秒，逐次递增
 
-# ===== 连接池复用 =====
+# ===== 连接池复用(调优: max_connections=10, keep_alive=30s) =====
+import requests.adapters
 _session = requests.Session()
 _session.headers.update({"Connection": "keep-alive"})
+# 连接池调优: 每个主机最多10个连接, 超时30秒
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=10,    # 连接池大小
+    pool_maxsize=10,        # 最大连接数
+    max_retries=0,          # 重试由_retry()处理
+    pool_block=False,       # 不阻塞, 满了直接新建
+)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
 
 # ===== 响应缓存(60秒TTL, 减少重复GLM调用) =====
 _cache = {}
