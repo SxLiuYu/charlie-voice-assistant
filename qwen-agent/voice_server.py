@@ -836,6 +836,7 @@ async def dashboard():
     pending = [r for r in rems if not r.get("done")]
     brain_warm = _brain_is_warm()
     from voice_agent import _history
+    m = _metrics.summary()
     return f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>魔幻手机 · 监控面板</title><meta http-equiv="refresh" content="10">
@@ -880,12 +881,20 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 {"".join(f'<div class="rem">📌 {r["text"]} <span style="color:#888">⏰{r.get("due","")[:16].replace("T"," ")}</span></div>' for r in pending[:5]) or '<div class="rem" style="color:#666">暂无待办</div>'}
 <a href="/api/reminders" style="font-size:12px">查看全部 →</a>
 </div>
-<div class="card"><h3>🔧 API 端点 (20个)</h3>
+<div class="card"><h3>🔧 API 端点 (22个)</h3>
 <div class="metric"><span>语音</span><span class="val">/api/voice /api/voice/stream</span></div>
 <div class="metric"><span>TTS/ASR</span><span class="val">/api/tts /api/asr</span></div>
-<div class="metric"><span>对话</span><span class="val">/api/chat /api/chat/stream /api/reset /api/conversation /api/export</span></div>
-<div class="metric"><span>提醒</span><span class="val">/api/reminders (GET/POST/DELETE)</span></div>
-<div class="metric"><span>系统</span><span class="val">/api/status /api/version /health</span></div>
+<div class="metric"><span>对话</span><span class="val">/api/chat /api/chat/stream</span></div>
+<div class="metric"><span>提醒/搜索</span><span class="val">/api/reminders /api/search /api/export</span></div>
+<div class="metric"><span>实时/系统</span><span class="val">/api/events /api/metrics /api/status</span></div>
+</div>
+<div class="card"><h3>📊 请求指标</h3>
+<div class="metric"><span>总请求</span><span class="val">{m["total_requests"]}</span></div>
+<div class="metric"><span>错误</span><span class="val">{m["total_errors"]}</span></div>
+<div class="metric"><span>缓存命中</span><span class="val">{m["cache_hits"]}</span></div>
+<div class="metric"><span>平均响应</span><span class="val">{m["avg_response_ms"]}ms</span></div>
+<div class="metric"><span>P95响应</span><span class="val">{m["p95_response_ms"]}ms</span></div>
+<a href="/api/metrics" style="font-size:12px">详情 →</a>
 </div>
 </div>
 </body></html>"""
