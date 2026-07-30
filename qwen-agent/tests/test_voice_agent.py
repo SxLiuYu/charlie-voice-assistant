@@ -200,6 +200,57 @@ class TestRetry:
                 voice_agent._retry(fn, "test")
 
 
+
+class TestContextManagement:
+    """测试对话上下文管理(token感知截断)"""
+
+    def test_estimate_tokens_chinese(self):
+        """中文token估算"""
+        tokens = voice_agent._estimate_tokens("你好世界")
+        assert tokens > 0
+        assert 5 <= tokens <= 7  # 4 Chinese chars * ~1.5
+
+    def test_estimate_tokens_english(self):
+        """英文token估算"""
+        tokens = voice_agent._estimate_tokens("hello world")
+        assert tokens > 0
+        assert 2 <= tokens <= 4  # 2 words + space
+
+    def test_estimate_tokens_empty(self):
+        """空文本token为0"""
+        assert voice_agent._estimate_tokens("") == 0
+        assert voice_agent._estimate_tokens(None) == 0
+
+    def test_estimate_msg_tokens(self):
+        """消息token估算(含role开销)"""
+        msg = {"role": "user", "content": "你好"}
+        tokens = voice_agent._estimate_msg_tokens(msg)
+        assert tokens > 4  # content tokens + 4 for role
+
+    def test_trim_short_history(self):
+        """短历史不截断"""
+        hist = [{"role": "user", "content": "hi"}]
+        voice_agent._trim_history_tokens(hist, 4000)
+        assert len(hist) == 1
+
+    def test_trim_long_history(self):
+        """长历史截断到token预算内"""
+        # 创建超长历史(每条100字, 50条)
+        hist = [{"role": "user" if i % 2 == 0 else "assistant",
+                 "content": "测" * 100} for i in range(50)]
+        original_len = len(hist)
+        voice_agent._trim_history_tokens(hist, 400)
+        assert len(hist) < original_len  # 应该被截断
+        assert len(hist) >= 4  # 至少保留4条(2轮)
+
+    def test_trim_preserves_recent(self):
+        """截断后保留最近的消息"""
+        hist = [{"role": "user" if i % 2 == 0 else "assistant",
+                 "content": f"消息{i}" + "测" * 50} for i in range(20)]
+        voice_agent._trim_history_tokens(hist, 200)
+        # 保留的最后一条应该是原来的最后一条
+        assert "消息19" in hist[-1]["content"]
+
 class TestMultiUserSessions:
     """多用户会话隔离测试"""
 

@@ -82,6 +82,63 @@ def _load_history() -> None:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
+            _sessions = data
+            _history = _sessions.get("default", [])
+            _sessions["default"] = _history
+        elif isinstance(data, list):
+            _history = data
+            _sessions = {"default": _history}
+    except Exception:
+        _history = []
+        _sessions = {"default": _history}
+
+_load_history()
+
+# ===== 对话上下文管理(token感知截断) =====
+MAX_CONTEXT_TOKENS = 4000  # 历史对话token预算(留空间给系统提示+新消息+回复)
+
+def _estimate_tokens(text: str) -> int:
+    """粗略估算token数: 中文1字≈1.5token, 英文1词≈1.3token, 符号1个≈1token"""
+    if not text:
+        return 0
+    # 中文字符数
+    cn = len(re.findall(r'[\u4e00-\u9fff]', text))
+    # 英文单词数
+    en = len(re.findall(r'[a-zA-Z]+', text))
+    # 其他字符(符号/数字)
+    other = len(text) - cn - sum(len(w) for w in re.findall(r'[a-zA-Z]+', text))
+    return int(cn * 1.5 + en * 1.3 + other * 0.5)
+
+def _estimate_msg_tokens(msg: dict) -> int:
+    """估算单条消息的token数(含role开销)"""
+    content = msg.get("content", "")
+    return _estimate_tokens(content) + 4  # role标记约4token
+
+def _trim_history_tokens(hist: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> None:
+    """原地截断对话历史, 保持在token预算内。
+    策略: 从最新的开始保留, 如果超限则移除最旧的。
+    总是保留最近2轮(4条消息)作为即时上下文。
+    """
+    if len(hist) <= 4:
+        return  # 不超过4条不截断
+    total = sum(_estimate_msg_tokens(m) for m in hist)
+    if total <= max_tokens:
+        return  # 未超限
+    # 从最旧的开始移除, 但保留最近4条
+    min_keep = 4
+    while len(hist) > min_keep:
+        total -= _estimate_msg_tokens(hist[0])
+        del hist[0]
+        if total <= max_tokens:
+            break
+    log.debug(f"[context] 截断至{len(hist)}条({total}tok, 预算{max_tokens})")
+
+# 替换原有的简单截断为token感知截断 -> None:
+    global _history, _sessions
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
             # 新格式: 多会话
             _sessions = data
             _history = _sessions.get("default", [])
@@ -481,6 +538,7 @@ def brain_stream_sentences(text: str, session_id: str = "default") -> Generator[
         hist.append({"role": "assistant", "content": full_reply})
         if len(hist) > MAX_HISTORY * 2:
             del hist[:len(hist) - (MAX_HISTORY * 2)]
+        _trim_history_tokens(hist)  # token感知截断
     _save_history()
     _cache_set(text, full_reply)
 
