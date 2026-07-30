@@ -323,10 +323,11 @@ def brain(text: str) -> str:
                     if reply != "我没听明白":
                         break
 
-    _history.append({'role': 'user', 'content': text})
-    _history.append({'role': 'assistant', 'content': reply})
-    if len(_history) > MAX_HISTORY * 2:
-        _history = _history[-(MAX_HISTORY * 2):]
+    with _history_lock:
+        _history.append({'role': 'user', 'content': text})
+        _history.append({'role': 'assistant', 'content': reply})
+        if len(_history) > MAX_HISTORY * 2:
+            _history = _history[-(MAX_HISTORY * 2):]
     _save_history()
     _cache_set(text, reply)
     return reply
@@ -442,10 +443,11 @@ def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
         yield (full_reply, full_reply)
 
     # 更新历史+缓存(与brain()保持一致)
-    _history.append({"role": "user", "content": text})
-    _history.append({"role": "assistant", "content": full_reply})
-    if len(_history) > MAX_HISTORY * 2:
-        _history = _history[-(MAX_HISTORY * 2):]
+    with _history_lock:
+        _history.append({"role": "user", "content": text})
+        _history.append({"role": "assistant", "content": full_reply})
+        if len(_history) > MAX_HISTORY * 2:
+            _history = _history[-(MAX_HISTORY * 2):]
     _save_history()
     _cache_set(text, full_reply)
 
