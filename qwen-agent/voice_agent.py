@@ -24,6 +24,27 @@ RETRY_BACKOFF = [1, 3, 5]  # 秒，逐次递增
 _session = requests.Session()
 _session.headers.update({"Connection": "keep-alive"})
 
+# ===== 响应缓存(60秒TTL, 减少重复GLM调用) =====
+_cache = {}
+_CACHE_TTL = 60  # 秒
+_CACHE_MAX = 50
+
+def _cache_get(text: str):
+    """获取缓存响应(60秒内有效)"""
+    key = text.strip().lower()
+    if key in _cache:
+        reply, ts = _cache[key]
+        if time.time() - ts < _CACHE_TTL:
+            return reply
+        del _cache[key]
+    return None
+
+def _cache_set(text: str, reply: str):
+    """设置缓存响应"""
+    if len(_cache) >= _CACHE_MAX:
+        _cache.pop(next(iter(_cache)))  # 移除最旧的
+    _cache[text.strip().lower()] = (reply, time.time())
+
 # ===== 对话历史(跨请求持久化) =====
 _history = []
 MAX_HISTORY = 20  # 保留最近20轮对话(40条消息)
@@ -191,6 +212,11 @@ def _ensure_event_loop():
 
 def brain(text: str) -> str:
     global _brain, _history
+    # 缓存命中(60秒内相同查询直接返回)
+    cached = _cache_get(text)
+    if cached is not None:
+        log.info(f"[cache] 命中: {text[:20]}")
+        return cached
     _ensure_event_loop()
     if _brain is None:
         try:
@@ -229,6 +255,7 @@ def brain(text: str) -> str:
     if len(_history) > MAX_HISTORY * 2:
         _history = _history[-(MAX_HISTORY * 2):]
     _save_history()
+    _cache_set(text, reply)
     return reply
 
 # ===== 完整语音闭环 =====
