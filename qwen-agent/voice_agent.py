@@ -193,6 +193,59 @@ def reset_history(session_id: str = "default") -> None:
 
 _load_history()
 
+# ===== 用户偏好系统(越用越懂你) =====
+PREFS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preferences.json")
+_preferences = {}
+_prefs_lock = threading.RLock()  # RLock: 允许同线程重入(防死锁)
+
+def _load_preferences() -> None:
+    """加载用户偏好"""
+    global _preferences
+    try:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            _preferences = json.load(f)
+    except Exception:
+        _preferences = {}
+
+def _save_preferences() -> None:
+    """保存用户偏好"""
+    with _prefs_lock:
+        try:
+            with open(PREFS_FILE, "w", encoding="utf-8") as f:
+                json.dump(_preferences, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+def set_preference(key: str, value: str) -> str:
+    """设置用户偏好(供MCP工具调用)"""
+    with _prefs_lock:
+        _preferences[key] = value
+    _save_preferences()
+    log.info(f"[prefs] 设置偏好: {key}={value[:30]}")
+    return f"已记住：{key}={value}"
+
+def get_preference(key: str) -> str:
+    """获取用户偏好"""
+    return _preferences.get(key, "")
+
+def list_preferences() -> dict:
+    """列出所有用户偏好"""
+    return dict(_preferences)
+
+def del_preference(key: str) -> str:
+    """删除用户偏好"""
+    found = False
+    with _prefs_lock:
+        if key in _preferences:
+            del _preferences[key]
+            found = True
+    if found:
+        _save_preferences()
+        return f"已忘记：{key}"
+    return f"未找到偏好：{key}"
+
+_load_preferences()
+
 def _build_system_msg() -> str:
     now = datetime.datetime.now()
     weekdays = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
@@ -214,7 +267,12 @@ def _build_system_msg() -> str:
         todo_ctx = ""
     ctx = (f"当前时间：{now.strftime('%Y年%m月%d日')} {weekdays[now.weekday()]} "
            f"{period} {now.strftime('%H:%M')}。{todo_ctx}。用户在Mac Mini上。")
-    return (f"你是魔幻手机，中国版贾维斯——用户的私人AI助理。{ctx}\n"
+    # 加载用户偏好到系统提示词
+    prefs_ctx = ""
+    if _preferences:
+        prefs_items = [f"{k}: {v}" for k, v in list(_preferences.items())[:10]]
+        prefs_ctx = f"\n用户偏好(请主动应用)：{'，'.join(prefs_items)}。"
+    return (f"你是魔幻手机，中国版贾维斯——用户的私人AI助理。{ctx}{prefs_ctx}\n"
             "你的性格：高效、主动、偶尔幽默，像老朋友一样亲切。\n"
             "你有多个MCP工具：高德地图(天气/POI/路线)、充电桩搜索、购物推荐、翻译、"
             "提醒管理(add_reminder可设提醒,list_reminders可查待办)、文件读写等。\n"
@@ -222,7 +280,7 @@ def _build_system_msg() -> str:
             "1. 回复简洁口语化，适合语音播报，通常不超过3句\n"
             "2. 能用工具就用工具，给真实数据而非编造\n"
             "3. 用户提到时间/待办时，主动调add_reminder设提醒\n"
-            "4. 记住用户偏好(用Memory MCP)，下次主动应用\n"
+            "4. 记住用户偏好(用户说'我喜欢/我不喜欢/记住'时, 用set_preference存储), 下次主动应用\n"
             "5. 涉及敏感操作(支付/车辆控制)需先确认\n"
             "6. 如果用户说'你刚才说的'之类，回顾对话历史回答\n"
             "7. 用户问'今天有什么安排'时，如果有提醒会主动列出")

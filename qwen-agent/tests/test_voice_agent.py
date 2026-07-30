@@ -202,6 +202,53 @@ class TestRetry:
 
 
 
+
+class TestPreferences:
+    """用户偏好系统测试"""
+
+    def setup_method(self):
+        """每个测试前清空偏好"""
+        voice_agent._preferences.clear()
+
+    def test_set_and_get_preference(self):
+        """设置和获取偏好"""
+        voice_agent.set_preference("喜欢的食物", "意大利菜")
+        assert voice_agent.get_preference("喜欢的食物") == "意大利菜"
+
+    def test_list_preferences(self):
+        """列出所有偏好"""
+        voice_agent.set_preference("key1", "val1")
+        voice_agent.set_preference("key2", "val2")
+        prefs = voice_agent.list_preferences()
+        assert "key1" in prefs
+        assert "key2" in prefs
+        assert prefs["key1"] == "val1"
+
+    def test_del_preference(self):
+        """删除偏好"""
+        voice_agent.set_preference("temp", "val")
+        result = voice_agent.del_preference("temp")
+        assert "已忘记" in result
+        assert voice_agent.get_preference("temp") == ""
+
+    def test_del_nonexistent(self):
+        """删除不存在的偏好"""
+        result = voice_agent.del_preference("nonexistent")
+        assert "未找到" in result
+
+    def test_preferences_in_system_prompt(self):
+        """偏好出现在系统提示词中"""
+        voice_agent.set_preference("下班时间", "18:00")
+        msg = voice_agent._build_system_msg()
+        assert "18:00" in msg
+        assert "用户偏好" in msg or "下班时间" in msg
+
+    def test_no_preferences_no_crash(self):
+        """无偏好时不崩溃"""
+        voice_agent._preferences.clear()
+        msg = voice_agent._build_system_msg()
+        assert "魔幻手机" in msg  # 系统提示词仍然正常
+
 class TestTimestamps:
     """测试对话时间戳"""
 

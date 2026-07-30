@@ -134,5 +134,39 @@ def calculate(expression: str) -> str:
     return aliyun_chat([{"role":"system","content":"你是计算换算助手，直接给结果和一行过程"},
         {"role":"user","content":expression}], temperature=0)
 
+
+
+# ===== 用户偏好(越用越懂你) =====
+PREFS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preferences.json")
+
+def _load_prefs():
+    try:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_prefs(prefs):
+    with open(PREFS_FILE, "w", encoding="utf-8") as f:
+        json.dump(prefs, f, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def set_preference(key: str, value: str) -> str:
+    """记住用户偏好(越用越懂你)。key=偏好名(如'喜欢的食物'/'下班时间'), value=偏好值(如'意大利菜'/'18:00')。
+    当用户说'我喜欢/我不喜欢/记住/我每天/我习惯'时调用此工具。"""
+    prefs = _load_prefs()
+    prefs[key] = value
+    _save_prefs(prefs)
+    return f"已记住您的偏好：{key} = {value}"
+
+@mcp.tool()
+def get_preferences() -> str:
+    """查看所有已记住的用户偏好。"""
+    prefs = _load_prefs()
+    if not prefs:
+        return "暂无已记住的偏好"
+    items = [f"{k}: {v}" for k, v in prefs.items()]
+    return f"已记住{len(prefs)}项偏好：" + chr(10) + chr(10).join(items)
+
 if __name__ == "__main__":
     mcp.run()

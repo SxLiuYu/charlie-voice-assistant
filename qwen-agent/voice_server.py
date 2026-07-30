@@ -1379,6 +1379,33 @@ async def metrics():
     return _metrics.summary()
 
 
+# ===== 用户偏好管理API =====
+class PreferenceRequest(BaseModel):
+    """设置偏好请求"""
+    key: str = Field(..., min_length=1, max_length=50, description="偏好键名(如'喜欢的食物')")
+    value: str = Field(..., min_length=1, max_length=200, description="偏好值(如'意大利菜')")
+
+@app.get("/api/preferences")
+async def get_preferences():
+    """获取所有用户偏好"""
+    from voice_agent import list_preferences
+    prefs = list_preferences()
+    return {"total": len(prefs), "preferences": prefs}
+
+@app.post("/api/preferences")
+async def set_preference_api(req: PreferenceRequest):
+    """设置用户偏好"""
+    from voice_agent import set_preference
+    msg = set_preference(req.key, req.value)
+    return {"ok": True, "message": msg, "key": req.key, "value": req.value}
+
+@app.delete("/api/preferences/{key}")
+async def del_preference_api(key: str):
+    """删除用户偏好"""
+    from voice_agent import del_preference
+    msg = del_preference(key)
+    return {"ok": True, "message": msg}
+
 @app.get("/api/sessions")
 async def list_sessions():
     """列出所有活跃会话(多用户监控)"""
