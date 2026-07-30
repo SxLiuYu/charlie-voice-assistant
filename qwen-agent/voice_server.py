@@ -1262,6 +1262,19 @@ async def metrics():
     return _metrics.summary()
 
 
+@app.get("/api/tunnel")
+async def tunnel_status():
+    """获取Cloudflare Tunnel公网访问地址"""
+    tunnel_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnel_url.txt")
+    try:
+        with open(tunnel_file, "r") as f:
+            url = f.read().strip()
+        if url:
+            return {"active": True, "url": url}
+    except Exception:
+        pass
+    return {"active": False, "url": None, "message": "隧道未运行, 运行 bash start_tunnel.sh 启动"}
+
 @app.get("/health")
 def health():
     return {"ok": True, "service": "magic-phone-voice"}

@@ -40,6 +40,17 @@ while true; do
         NEED_RESTART=1
     fi
 
+    # 检查Cloudflare Tunnel(如果tunnel_url.txt存在则监控)
+    TUNNEL_FILE="$(dirname "$0")/tunnel_url.txt"
+    if [ -f "$TUNNEL_FILE" ]; then
+        TUNNEL_RUNNING=$(pgrep -f "cloudflared tunnel" 2>/dev/null | head -1)
+        if [ -z "$TUNNEL_RUNNING" ]; then
+            log "⚠️ Cloudflare Tunnel已停止，重启中..."
+            bash "$(dirname "$0")/start_tunnel.sh" >> "$WATCHDOG_LOG" 2>&1
+            log "✅ Cloudflare Tunnel已重启"
+        fi
+    fi
+
     if [ $NEED_RESTART -eq 1 ]; then
         RESTART_COUNT=$((RESTART_COUNT + 1))
         log "重启完成 (累计重启$RESTART_COUNT次)"

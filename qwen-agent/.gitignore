@@ -27,3 +27,4 @@ __pycache__/
 
 # 旧测试文件(含硬编码密钥)
 tests/old/
+tunnel_url.txt
