@@ -67,6 +67,8 @@ async def request_logger(request: Request, call_next):
     return response
 
 REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
+MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB 音频上限
+MAX_TEXT_LENGTH = 500  # 文字输入上限
 
 # ===== 音频转wav =====
 def to_wav(data: bytes, ext: str) -> bytes:
@@ -79,7 +81,7 @@ def to_wav(data: bytes, ext: str) -> bytes:
     try:
         subprocess.run(["ffmpeg", "-y", "-i", inp, "-ar", "16000", "-ac", "1", "-f", "wav", out],
                        capture_output=True, timeout=15)
-        return open(out, "rb").read()
+        with open(out, "rb") as f: return f.read()
     except Exception:
         return data
     finally:
@@ -95,7 +97,7 @@ def _wav_to_mp3(wav_data: bytes, bitrate: str = "32k") -> bytes:
     try:
         subprocess.run(["ffmpeg", "-y", "-i", inp, "-b:a", bitrate, "-ac", "1", out],
                        capture_output=True, timeout=10)
-        return open(out, "rb").read()
+        with open(out, "rb") as f: return f.read()
     except Exception:
         return wav_data  # 失败返回原始WAV
     finally:
@@ -334,6 +336,9 @@ def _warmup_brain():
 async def voice_api(file: UploadFile = File(...)):
     data = await file.read()
     ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
+    if len(data) > MAX_AUDIO_SIZE:
+        log.warning(f"/api/voice 音频过大: {len(data)}字节 (>{MAX_AUDIO_SIZE})")
+        return JSONResponse({"error": f"音频过大({len(data)//1024}KB), 上限{MAX_AUDIO_SIZE//1024//1024}MB"}, status_code=413)
     log.info(f"/api/voice 收到音频: {len(data)}字节, 格式={ext}")
     wav = to_wav(data, ext)
     from voice_agent import voice_loop
@@ -355,6 +360,8 @@ async def voice_api(file: UploadFile = File(...)):
 async def chat_api(req: Request):
     body = await req.json()
     text = body.get("message", "")
+    if len(text) > MAX_TEXT_LENGTH:
+        return JSONResponse({"error": f"输入过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
     from voice_agent import brain
     try:
         reply = await asyncio.wait_for(
@@ -406,6 +413,8 @@ async def add_reminder(req: Request):
     time_str = body.get("time", "").strip()
     if not text:
         raise HTTPException(400, "text不能为空")
+    if len(text) > 200:
+        raise HTTPException(400, "提醒内容过长(上限200字)")
     # 复用baize_skills的时间解析
     due = None
     if time_str:
@@ -475,6 +484,8 @@ async def tts_api(req: Request):
     text = body.get("text", "")
     if not text:
         return JSONResponse({"error": "text不能为空"}, status_code=400)
+    if len(text) > MAX_TEXT_LENGTH:
+        return JSONResponse({"error": f"文本过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
     from voice_agent import tts
     try:
         audio = await asyncio.wait_for(
@@ -601,7 +612,7 @@ def health():
 @app.get("/", response_class=HTMLResponse)
 async def web_client():
     html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "voice.html")
-    return open(html_path, encoding="utf-8").read()
+    with open(html_path, encoding="utf-8") as f: return f.read()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

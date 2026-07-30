@@ -51,9 +51,11 @@ def translate(text: str, target: str = "英文") -> str:
 
 # ===== 提醒 =====
 def _load(): 
-    try: return json.load(open(STORE))
+    try:
+        with open(STORE) as f: return json.load(f)
     except: return []
-def _save(d): json.dump(d, open(STORE, "w"), ensure_ascii=False, indent=2)
+def _save(d):
+    with open(STORE, "w") as f: json.dump(d, f, ensure_ascii=False, indent=2)
 def _parse_time(s):
     if not s: return None
     t = datetime.datetime.now(); tg = t; ok = False

@@ -64,7 +64,7 @@ def _build_system_msg():
     # 动态加载今日待办数量
     try:
         rf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
-        rems = json.load(open(rf, encoding="utf-8"))
+        with open(rf, encoding="utf-8") as f: rems = json.load(f)
         today = now.strftime("%Y-%m-%d")
         today_rems = [r for r in rems if not r.get("done") and r.get("due","").startswith(today)]
         todo_ctx = f"今日有{len(today_rems)}项待办" if today_rems else "今日无待办"
@@ -245,5 +245,5 @@ if __name__ == "__main__":
     print(f"\n  ASR识别: {text}")
     print(f"  大脑回复: {reply}")
     print(f"  回复音频: {len(audio_out)}字节")
-    open("/tmp/voice_reply.wav", "wb").write(audio_out)
+    with open("/tmp/voice_reply.wav", "wb") as f: f.write(audio_out)
     print(f"  已保存 /tmp/voice_reply.wav")

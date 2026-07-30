@@ -61,14 +61,18 @@ def main():
             print("(没录到声音，重试)\n"); continue
         print("🧠 处理中(ASR→大脑调MCP→TTS)…")
         try:
-            text, reply, audio = voice_loop(open("/tmp/cli_mic.wav","rb").read(), "wav")
+            with open("/tmp/cli_mic.wav","rb") as f: audio_data = f.read()
+            text, reply, audio = voice_loop(audio_data, "wav")
         except Exception as e:
             print(f"处理失败: {e}\n"); continue
         print(f"\n🗣️ 你说: {text}")
         print(f"🤖 白泽: {reply}\n")
-        open("/tmp/cli_reply.wav","wb").write(audio)
-        print("🔊 播放回复…")
-        play("/tmp/cli_reply.wav")
+        if audio and len(audio) > 100:
+            with open("/tmp/cli_reply.wav","wb") as f: f.write(audio)
+            print("🔊 播放回复…")
+            play("/tmp/cli_reply.wav")
+        else:
+            print("(语音合成失败，仅文字回复)")
 
 if __name__ == "__main__":
     main()
