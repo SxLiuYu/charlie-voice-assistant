@@ -60,6 +60,17 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 #remadd{display:flex;gap:6px;margin-top:6px}
 #remadd input{flex:1;padding:8px 12px;border-radius:16px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:13px}
 #remadd button{padding:8px 14px;border:none;border-radius:16px;background:#f5a623;color:#222;font-size:13px;cursor:pointer}
+#prefpanel{width:90%;max-width:520px;margin-top:8px}
+#prefpanel h3{color:#4e9;font-size:14px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+#prefpanel h3 span{font-size:11px;color:#666;cursor:pointer}
+#preflist{max-height:100px;overflow-y:auto;margin-bottom:8px}
+.prefitem{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;margin:4px 0;
+background:rgba(78,255,153,.06);border-radius:8px;font-size:13px}
+.prefitem .pk{color:#4e9;font-weight:bold;margin-right:8px}.prefitem .pv{flex:1;color:#ccc}
+.prefitem .pdel{color:#e94560;cursor:pointer;font-size:16px;margin-left:8px;flex-shrink:0}
+#prefadd{display:flex;gap:6px;margin-top:6px}
+#prefadd input{flex:1;padding:8px 12px;border-radius:16px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:13px}
+#prefadd button{padding:8px 14px;border:none;border-radius:16px;background:#4e9;color:#222;font-size:13px;cursor:pointer}
 </style></head><body>
 <h1>魔幻手机</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
 <div id="tunnelurl" style="display:none;font-size:11px;color:#4e9;margin-bottom:4px;text-align:center;cursor:pointer" onclick="copyTunnelURL()"></div>
@@ -73,6 +84,15 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 <button id="holdbtn" onmousedown="holdStart()" onmouseup="holdEnd()" onmouseleave="holdEnd()" ontouchstart="holdStart()" ontouchend="holdEnd()">按住说话</button>
 </div>
 <div id="conv"></div>
+<div id="prefpanel">
+<h3>👤 用户偏好 <span onclick="loadPrefs()">刷新</span></h3>
+<div id="preflist"></div>
+<div id="prefadd">
+<input id="prefkey" placeholder="偏好名(如:喜欢的食物)" style="flex:0.4">
+<input id="prefval" placeholder="偏好值(如:意大利菜)">
+<button onclick="addPref()">记住</button>
+</div>
+</div>
 <div id="textinput">
 <input id="msginput" placeholder="打字也行… 6个MCP流式回复">
 <button onclick="sendText()">发送</button>
@@ -387,5 +407,26 @@ function stopWakeListener(){
 // 心跳保活
 setInterval(()=>{if(wsReady&&wsConn&&wsConn.readyState===1)wsConn.send(JSON.stringify({type:'ping'}));},30000);
 
-loadConv();loadRems();wsConnect();initSSE();loadTunnelURL();setInterval(loadRems,30000);setInterval(loadTunnelURL,60000);
+// ===== 用户偏好管理 =====
+async function loadPrefs(){
+  try{
+    const r=await fetch('/api/preferences');const d=await r.json();const el=document.getElementById('preflist');
+    if(!d.preferences||!Object.keys(d.preferences).length){el.innerHTML='<div style="color:#666;font-size:13px;padding:8px">暂无偏好,说"记住我喜欢..."让AI自动记录</div>';return;}
+    el.innerHTML=Object.entries(d.preferences).map(([k,v])=>
+      '<div class="prefitem"><span class="pk">'+k+'</span><span class="pv">'+v+'</span><span class="pdel" onclick="delPref(\''+k+'\')">×</span></div>'
+    ).join('');
+  }catch(e){document.getElementById('preflist').innerHTML='<div style="color:#e94560">加载失败</div>';}
+}
+async function addPref(){
+  const k=document.getElementById('prefkey').value.trim();const v=document.getElementById('prefval').value.trim();
+  if(!k||!v)return;
+  document.getElementById('prefkey').value='';document.getElementById('prefval').value='';
+  try{const r=await fetch('/api/preferences',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});
+    const d=await r.json();addMsg('sys','👤 '+d.message);loadPrefs();
+  }catch(e){addMsg('sys','设置偏好失败');}
+}
+async function delPref(k){
+  try{await fetch('/api/preferences/'+encodeURIComponent(k),{method:'DELETE'});loadPrefs();}catch(e){}
+}
+loadConv();loadRems();loadPrefs();wsConnect();initSSE();loadTunnelURL();setInterval(loadRems,30000);setInterval(loadPrefs,60000);setInterval(loadTunnelURL,60000);
 </script></body></html>
