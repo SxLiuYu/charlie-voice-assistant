@@ -250,6 +250,9 @@ async def request_logger(request: Request, call_next):
     rid = str(uuid.uuid4())[:8]
     start = _t.time()
     log.info(f"[{rid}] {request.method} {request.url.path}")
+    # 认证检查
+    if not _check_auth(request):
+        return JSONResponse({"error": "未授权"}, status_code=401)
     # 限流检查
     ip = _client_ip(request)
     path = request.url.path
@@ -989,6 +992,22 @@ async def sse_events():
 
 
 
+
+# ===== API令牌认证(保护公网访问) =====
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+
+def _is_local_request(request):
+    ip = _client_ip(request)
+    return ip in ("127.0.0.1", "localhost", "::1", "")
+
+def _check_auth(request):
+    if not AUTH_TOKEN:
+        return True
+    if _is_local_request(request):
+        return True
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    return token == AUTH_TOKEN
+
 # ===== 输入清洗(防XSS/注入) =====
 def _sanitize_text(text: str, max_len: int = 500) -> str:
     """清洗用户输入: 去除HTML标签、脚本、控制字符"""
@@ -1056,6 +1075,14 @@ async def websocket_endpoint(ws: WebSocket):
       {"type":"pong"}                            → 心跳回复
     """
     await ws.accept()
+    # WebSocket认证
+    if AUTH_TOKEN:
+        ci = ws.client.host if ws.client else ""
+        if ci not in ("127.0.0.1", "::1", ""):
+            tk = ws.query_params.get("token", "")
+            if tk != AUTH_TOKEN:
+                await ws.close(code=4001, reason="未授权")
+                return
     ws_id = id(ws)
     _ws_clients[ws_id] = {"ws": ws, "interrupt": False, "last_active": time.time()}
     log.info(f"[ws] 客户端已连接 (id={ws_id}), 共{len(_ws_clients)}个连接")
@@ -1486,6 +1513,7 @@ def health():
         "brain_ready": _brain_is_warm(),
         "websocket_clients": _ws_client_count(),
         "sse_clients": len(_sse_clients),
+        "auth_enabled": bool(AUTH_TOKEN),
     }
 
 @app.get("/", response_class=HTMLResponse)
