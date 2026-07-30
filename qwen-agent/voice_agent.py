@@ -4,7 +4,7 @@
 连接韧性: Session复用 + 自动重试 + 异常降级
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
 """
-import os, json, base64, requests, datetime, time, logging
+import os, json, base64, requests, datetime, time, logging, asyncio
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
     from dotenv import load_dotenv; load_dotenv()
@@ -182,8 +182,16 @@ def _build_brain():
 
 _brain = None
 
+def _ensure_event_loop():
+    """确保当前线程有event loop(Qwen-Agent MCP可能需要)"""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
 def brain(text: str) -> str:
     global _brain, _history
+    _ensure_event_loop()
     if _brain is None:
         try:
             _brain = _build_brain()

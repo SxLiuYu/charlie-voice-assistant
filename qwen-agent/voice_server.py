@@ -32,6 +32,8 @@ async def lifespan(app):
     if os.environ.get("SKIP_BACKGROUND") == "1":
         log.info("后台调度器跳过(SKIP_BACKGROUND=1，由HTTP进程管理)")
     else:
+        global _main_loop
+        _main_loop = asyncio.get_event_loop()
         _start_scheduler()
         _start_proactive()
         _warmup_brain()
@@ -129,13 +131,32 @@ _notifications = []
 MAX_NOTIFICATIONS = 20
 
 def _add_notification(text: str, ntype: str = "reminder"):
-    """添加通知到队列(供Web客户端轮询获取)"""
+    """添加通知到队列+SSE推送"""
     _notifications.append({
         "text": text, "type": ntype,
         "time": datetime.datetime.now().isoformat()
     })
     if len(_notifications) > MAX_NOTIFICATIONS:
         _notifications.pop(0)
+    _push_notification_to_sse(text, ntype)  # SSE实时推送
+
+# ===== SSE实时通知推送 =====
+_sse_clients = []  # 已连接的SSE客户端队列列表
+_main_loop = None  # 主线程event loop(启动时捕获)
+
+def _push_notification_to_sse(text: str, ntype: str = "reminder"):
+    """推送通知到所有已连接的SSE客户端(线程安全)"""
+    global _main_loop
+    if _main_loop is None:
+        return  # 没有SSE客户端或loop未初始化
+    for client_q in list(_sse_clients):
+        try:
+            _main_loop.call_soon_threadsafe(
+                client_q.put_nowait, {"text": text, "type": ntype,
+                    "time": datetime.datetime.now().isoformat()})
+        except Exception:
+            try: _sse_clients.remove(client_q)
+            except: pass
 
 def _play_reminder_audio(text: str):
     """生成提醒语音并播放到默认音频输出(AirPods/扬声器)"""
@@ -529,6 +550,35 @@ async def get_notifications():
     notifs = list(_notifications)
     _notifications.clear()
     return {"count": len(notifs), "notifications": notifs}
+
+@app.get("/api/events")
+async def sse_events():
+    """SSE实时通知流(Web客户端用EventSource连接, 免轮询)"""
+    import asyncio
+    from starlette.responses import StreamingResponse
+
+    queue = asyncio.Queue()
+    _sse_clients.append(queue)
+
+    async def event_stream():
+        try:
+            # 发送连接确认
+            yield f"data: {json.dumps({'type':'connect','text':'已连接','time':datetime.datetime.now().isoformat()})}\n\n"
+            while True:
+                try:
+                    notif = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield f"data: {json.dumps(notif, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    # 心跳保活
+                    yield f"data: {json.dumps({'type':'heartbeat','text':'','time':''})}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if queue in _sse_clients:
+                _sse_clients.remove(queue)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+                            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 @app.get("/api/version")
 async def version():

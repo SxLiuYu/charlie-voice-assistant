@@ -229,22 +229,37 @@ async function loadConv(){
     }
   }catch(e){}
 }
-// 主动通知轮询(每15秒)
-async function checkNotifications(){
+// SSE实时通知(EventSource, 免轮询)
+let evtSource=null;
+function initSSE(){
+  if(evtSource) evtSource.close();
   try{
-    const r=await fetch('/api/notifications');const d=await r.json();
-    if(d.count>0){
-      d.notifications.forEach(n=>{
+    evtSource=new EventSource('/api/events');
+    evtSource.onmessage=function(e){
+      try{
+        const n=JSON.parse(e.data);
+        if(n.type==='heartbeat'||n.type==='connect')return;
         const icon=n.type==='weather'?'🌦️':n.type==='morning'?'☀️':n.type==='bedtime'?'🌙':n.type==='health'?'⚠️':'⏰';
         addMsg('b',icon+' '+n.text);
-        // 浏览器TTS朗读通知
         if(window.speechSynthesis){const u=new SpeechSynthesisUtterance(n.text.replace(/[\n#*]/g,' '));u.lang='zh-CN';u.rate=1.05;speechSynthesis.speak(u);}
-      });
-    }
-  }catch(e){}
+      }catch(err){}
+    };
+    evtSource.onerror=function(){ evtSource.close(); setTimeout(initSSE,5000); };
+  }catch(e){ console.log('SSE不支持,回退轮询'); initPolling(); }
+}
+// 轮询回退(如果SSE不支持)
+function initPolling(){
+  setInterval(async()=>{
+    try{
+      const r=await fetch('/api/notifications');const d=await r.json();
+      if(d.count>0){d.notifications.forEach(n=>{
+        addMsg('b','⏰ '+n.text);
+        if(window.speechSynthesis){const u=new SpeechSynthesisUtterance(n.text.replace(/[\n#*]/g,' '));u.lang='zh-CN';u.rate=1.05;speechSynthesis.speak(u);}
+      });}
+    }catch(e){}
+  },15000);
 }
 // 初始加载
-loadConv();loadRems();checkNotifications();
+loadConv();loadRems();initSSE();
 setInterval(loadRems,30000);
-setInterval(checkNotifications,15000);
 </script></body></html>
