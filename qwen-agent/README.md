@@ -196,8 +196,14 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 - [ ] 开发板多端(树莓派直接跑/ESP32瘦客户端)
 - [ ] 外卖购物商品搜索(京东union API需授权认证)
 - [x] ~~WebSocket双向实时通信~~ (v3.1: /ws端点, 文字/语音/打断TTS)
-- [x] ~~pytest单元测试~~ (v3.1: 67个测试全通过, mock GLM/TTS/ASR)
-- [ ] 多用户会话管理(当前单用户)
+- [x] ~~pytest单元测试~~ (v3.1: 95个测试全通过, mock GLM/TTS/ASR)
+- [x] ~~多用户会话管理~~ (v3.1: session_id全链路隔离, 最多10会话)
+- [x] ~~唤醒词检测~~ (v3.1: 浏览器端'魔幻手机'唤醒)
+- [x] ~~API密钥故障转移~~ (v3.1: GLM_KEY_1~5多密钥轮换)
+- [x] ~~输入清洗(XSS防护)~~ (v3.1: _sanitize_text全端点)
+- [x] ~~CORS加固~~ (v3.1: 动态来源+最小权限)
+- [x] ~~优雅降级~~ (v3.1: 大脑失败时返回友好提示+密钥轮换)
+- [ ] 对话历史时间戳(消息带ts字段, 支持时间搜索)
 
 
 ## 请求指标
@@ -222,9 +228,27 @@ POST /api/voice/stream  : 流式语音对话(SSE: asr→text→audio→done, 逐
   - 自动重连+SSE降级(Web客户端)
   - 支持多设备同时连接
 - **限流防护**: 每IP每分钟60次普通+10次语音请求, 超限429+Retry-After
-- **pytest单元测试**: 67个测试全通过(0.83s)
+- **pytest单元测试**: 95个测试全通过(0.83s)
   - test_utils.py(21): 时间解析/错误脱敏/文件清理/历史截断
   - test_voice_agent.py(21): 缓存/历史/流式大脑/Mock/重试逻辑
   - test_voice_server.py(25): API端点/WebSocket/限流/Mock TTS
 - **空消息校验**: /api/chat空消息返回400
+
+## v3.1 进阶功能(第2-3轮优化)
+- **多用户会话隔离**: session_id全链路(chat/stream/voice/ws/reset/search/export)
+  - _sessions dict, 最多10个并发会话, 超限自动清理
+  - Web客户端localStorage持久化session_id
+  - /api/sessions列出所有活跃会话
+- **对话上下文管理**: token感知截断(_trim_history_tokens)
+  - 估算token数(中文1.5/英文1.3/符号0.5)
+  - 保持在4000token预算内, 总保留最近2轮
+- **唤醒词检测**: 浏览器端'魔幻手机'唤醒(webkitSpeechRecognition)
+  - 唤醒后自动启动录音, 无需点击
+  - 支持中英文, Chrome/Safari兼容
+- **结构化日志**: LOG_FORMAT=json切换JSON格式(便于ELK/Fluentd收集)
+- **API密钥故障转移**: GLM_KEY_1~5多密钥, _rotate_glm_key()自动轮换
+- **输入清洗(XSS防护)**: _sanitize_text()去HTML标签/脚本/控制字符
+- **CORS加固**: 动态来源(localhost+tunnel) + 限制方法/头部 + credentials
+- **优雅降级**: 大脑失败时返回友好提示+自动密钥轮换, 非500错误
+- **连接池调优**: pool_connections=10, pool_maxsize=10, keep-alive
 - **Web客户端WebSocket**: 自动重连+打断按钮+SSE降级
