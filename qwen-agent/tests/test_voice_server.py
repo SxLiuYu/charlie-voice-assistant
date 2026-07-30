@@ -260,6 +260,25 @@ class TestExport:
         assert r.status_code == 200
 
 
+class TestContextEndpoint:
+    """上下文摘要端点测试"""
+
+    def test_get_context(self, client):
+        r = client.get("/api/context")
+        assert r.status_code == 200
+        data = r.json()
+        assert "history_count" in data
+        assert "estimated_tokens" in data
+        assert "token_budget" in data
+        assert "preferences_count" in data
+
+    def test_get_context_with_session(self, client):
+        r = client.get("/api/context?session_id=test_ctx")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["history_count"] == 0  # new session
+
+
 class TestSessions:
     """多用户会话监控API"""
 

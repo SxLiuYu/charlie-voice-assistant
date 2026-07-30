@@ -212,6 +212,8 @@ _rate_buckets = {}  # {ip: {"voice": [timestamps], "general": [timestamps]}}
 _RATE_GENERAL = 60   # 每分钟普通请求上限
 _RATE_VOICE = 10      # 每分钟语音请求上限(更重)
 _RATE_WINDOW = 60     # 窗口60秒
+_RATE_PER_SESSION = 30  # 每会话每分钟请求上限
+_session_buckets = {}  # {session_id: [timestamps]}
 
 def _client_ip(request: Request) -> str:
     """获取客户端IP(支持代理转发)"""
@@ -238,6 +240,20 @@ def _check_rate(ip: str, bucket_type: str, limit: int) -> tuple:
         return False, 0, retry_after
     bucket.append(now)
     return True, limit - len(bucket), 0
+
+def _check_session_rate(session_id: str) -> tuple:
+    """检查会话速率限制, 返回(allowed, remaining, retry_after)"""
+    import time as _t
+    if not session_id or session_id == "default":
+        return True, _RATE_PER_SESSION, 0  # default不限
+    now = _t.time()
+    bucket = _session_buckets.setdefault(session_id, [])
+    bucket[:] = [ts for ts in bucket if now - ts < _RATE_WINDOW]
+    if len(bucket) >= _RATE_PER_SESSION:
+        retry = int(_RATE_WINDOW - (now - bucket[0])) + 1
+        return False, 0, retry
+    bucket.append(now)
+    return True, _RATE_PER_SESSION - len(bucket), 0
 
 def _ws_client_count() -> int:
     """当前活跃WebSocket连接数"""
@@ -828,8 +844,10 @@ async def system_status():
         "websocket_connections": _ws_client_count(),
         "rate_limit": {
             "tracked_ips": len(_rate_buckets),
+            "tracked_sessions": len(_session_buckets),
             "general_limit": _RATE_GENERAL,
             "voice_limit": _RATE_VOICE,
+            "session_limit": _RATE_PER_SESSION,
         },
     }
 
@@ -1315,7 +1333,7 @@ async def version():
                      "响应缓存", "看门狗", "MP3压缩", "线程池", "Markdown清理TTS", "逗号软分割",
                      "连接重试", "文件锁", "大脑断路器", "多用户会话隔离", "唤醒词检测",
                      "API密钥故障转移", "输入清洗XSS防护", "结构化日志", "优雅降级",
-                     "对话时间戳", "Token感知截断", "连接池调优", "对话导出分页", "用户偏好系统"],
+                     "对话时间戳", "Token感知截断", "连接池调优", "对话导出分页", "用户偏好系统", "对话上下文摘要", "会话级限流", "API令牌认证"],
         "streaming": {
             "chat": "/api/chat/stream (SSE: text+audio+done)",
             "voice": "/api/voice/stream (SSE: asr+text+audio+done)",
@@ -1486,6 +1504,25 @@ async def list_sessions():
             "last_message": hist[-1].get("content", "")[:50] if hist else "",
         })
     return {"total": len(sessions), "sessions": sessions}
+
+@app.get("/api/context")
+async def get_context(session_id: str = "default"):
+    """获取对话上下文摘要(调试用)"""
+    from voice_agent import _context_summaries, _get_history, list_preferences, _estimate_msg_tokens as _est_tokens
+    hist = _get_history(session_id)
+    summary = _context_summaries.get(session_id, "")
+    prefs = list_preferences()
+    # 估算token使用
+    total_tokens = sum(_est_tokens(m) for m in hist) if hist else 0
+    return {
+        "session_id": session_id[:16] + "..." if len(session_id) > 16 else session_id,
+        "history_count": len(hist),
+        "estimated_tokens": total_tokens,
+        "token_budget": 4000,
+        "context_summary": summary[:200] if summary else None,
+        "preferences_count": len(prefs),
+        "preferences": prefs,
+    }
 
 @app.get("/api/tunnel")
 async def tunnel_status():

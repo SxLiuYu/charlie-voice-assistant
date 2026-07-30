@@ -125,7 +125,9 @@ def _load_history() -> None:
 _load_history()
 
 # ===== 对话上下文管理(token感知截断) =====
-MAX_CONTEXT_TOKENS = 4000  # 历史对话token预算(留空间给系统提示+新消息+回复)
+MAX_CONTEXT_TOKENS = 4000
+_context_summaries = {}  # per-session summaries
+MAX_SUMMARY_LEN = 200  # 历史对话token预算(留空间给系统提示+新消息+回复)
 
 def _estimate_tokens(text: str) -> int:
     """粗略估算token数: 中文1字≈1.5token, 英文1词≈1.3token, 符号1个≈1token"""
@@ -144,7 +146,7 @@ def _estimate_msg_tokens(msg: dict) -> int:
     content = msg.get("content", "")
     return _estimate_tokens(content) + 4  # role标记约4token
 
-def _trim_history_tokens(hist: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> None:
+def _trim_history_tokens(hist: list, max_tokens: int = MAX_CONTEXT_TOKENS, session_id: str = "default") -> None:
     """原地截断对话历史, 保持在token预算内。
     策略: 从最新的开始保留, 如果超限则移除最旧的。
     总是保留最近2轮(4条消息)作为即时上下文。
@@ -154,13 +156,26 @@ def _trim_history_tokens(hist: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> No
     total = sum(_estimate_msg_tokens(m) for m in hist)
     if total <= max_tokens:
         return  # 未超限
+    # Collect key info from removed messages
+    removed_topics = []
     # 从最旧的开始移除, 但保留最近4条
     min_keep = 4
     while len(hist) > min_keep:
-        total -= _estimate_msg_tokens(hist[0])
+        msg = hist[0]
+        total -= _estimate_msg_tokens(msg)
+        # Extract key info for context summary
+        content = msg.get("content", "")[:50]
+        if content:
+            removed_topics.append(content[:15] if msg.get("role") == "user" else content[:10])
         del hist[0]
         if total <= max_tokens:
             break
+    if removed_topics:
+        old_sum = _context_summaries.get(session_id, "")
+        new_part = ", ".join(removed_topics[-5:])
+        combined = (old_sum + ", " + new_part) if old_sum else new_part
+        _context_summaries[session_id] = combined[-MAX_SUMMARY_LEN:]
+        log.info(f"[context] {session_id[:8]} summary: {_context_summaries[session_id][:60]}")
     log.debug(f"[context] 截断至{len(hist)}条({total}tok, 预算{max_tokens})")
 
 # 替换原有的简单截断为token感知截断 -> None:
@@ -272,6 +287,8 @@ def _build_system_msg() -> str:
     if _preferences:
         prefs_items = [f"{k}: {v}" for k, v in list(_preferences.items())[:10]]
         prefs_ctx = f"\n用户偏好(请主动应用)：{'，'.join(prefs_items)}。"
+    summary = _context_summaries.get("default", "")
+    summary_ctx = f"\n之前对话过的内容: {summary}。" if summary else ""
     return (f"你是魔幻手机，中国版贾维斯——用户的私人AI助理。{ctx}{prefs_ctx}\n"
             "你的性格：高效、主动、偶尔幽默，像老朋友一样亲切。\n"
             "你有多个MCP工具：高德地图(天气/POI/路线)、充电桩搜索、购物推荐、翻译、"
@@ -628,7 +645,7 @@ def brain_stream_sentences(text: str, session_id: str = "default") -> Generator[
         hist.append({"role": "assistant", "content": full_reply, "ts": ts})
         if len(hist) > MAX_HISTORY * 2:
             del hist[:len(hist) - (MAX_HISTORY * 2)]
-        _trim_history_tokens(hist)  # token感知截断
+        _trim_history_tokens(hist, session_id=session_id)  # token感知截断+摘要
     _save_history()
     _cache_set(text, full_reply)
 

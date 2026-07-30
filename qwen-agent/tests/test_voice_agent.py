@@ -203,6 +203,75 @@ class TestRetry:
 
 
 
+
+class TestContextSummarization:
+    """对话上下文摘要测试"""
+
+    def setup_method(self):
+        voice_agent._context_summaries.clear()
+
+    def test_summary_stored_on_trim(self):
+        """截断后存储上下文摘要"""
+        # 创建超长历史触发截断
+        hist = [{"role": "user" if i % 2 == 0 else "assistant",
+                 "content": f"测试消息{i}" + "x" * 80} for i in range(30)]
+        voice_agent._trim_history_tokens(hist, max_tokens=200, session_id="test_summary")
+        # 摘要应该被存储
+        assert "test_summary" in voice_agent._context_summaries
+        assert len(voice_agent._context_summaries["test_summary"]) > 0
+
+    def test_summary_preserves_topics(self):
+        """摘要保留了对话话题"""
+        hist = [
+            {"role": "user", "content": "帮我查天气"},
+            {"role": "assistant", "content": "今天晴天"},
+            {"role": "user", "content": "帮我叫车"},
+            {"role": "assistant", "content": "已叫车"},
+            {"role": "user", "content": "帮我订餐"},
+            {"role": "assistant", "content": "已订餐"},
+            {"role": "user", "content": "最新消息"},
+            {"role": "assistant", "content": "回复"},
+        ]
+        voice_agent._trim_history_tokens(hist, max_tokens=50, session_id="test_topics")
+        summary = voice_agent._context_summaries.get("test_topics", "")
+        # 摘要应该包含一些被移除的话题关键词
+        assert len(summary) > 0
+
+    def test_no_summary_on_short_history(self):
+        """短历史不触发摘要"""
+        hist = [{"role": "user", "content": "hi"}]
+        voice_agent._trim_history_tokens(hist, max_tokens=4000, session_id="test_short")
+        assert "test_short" not in voice_agent._context_summaries
+
+    def test_summary_max_length(self):
+        """摘要不超过最大长度"""
+        # 创建大量历史
+        hist = [{"role": "user", "content": f"话题{i}" + "y" * 100} for i in range(50)]
+        voice_agent._trim_history_tokens(hist, max_tokens=100, session_id="test_maxlen")
+        summary = voice_agent._context_summaries.get("test_maxlen", "")
+        assert len(summary) <= voice_agent.MAX_SUMMARY_LEN
+
+    def test_summary_accumulates(self):
+        """多次截断摘要累积"""
+        sid = "test_accumulate"
+        # 第一次截断
+        hist1 = [{"role": "user", "content": "话题A" + "z" * 100}] * 10
+        voice_agent._trim_history_tokens(hist1, max_tokens=100, session_id=sid)
+        first_summary = voice_agent._context_summaries.get(sid, "")
+        # 第二次截断
+        hist2 = [{"role": "user", "content": "话题B" + "z" * 100}] * 10
+        voice_agent._trim_history_tokens(hist2, max_tokens=100, session_id=sid)
+        second_summary = voice_agent._context_summaries.get(sid, "")
+        # 第二次应该包含之前的内容
+        assert len(second_summary) >= len(first_summary)
+
+    def test_summary_in_system_prompt(self):
+        """摘要出现在系统提示词中"""
+        voice_agent._context_summaries["default"] = "之前聊过天气和订餐"
+        msg = voice_agent._build_system_msg()
+        assert "天气" in msg or "订餐" in msg
+        voice_agent._context_summaries.clear()
+
 class TestPreferences:
     """用户偏好系统测试"""
 
