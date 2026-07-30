@@ -168,7 +168,9 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 | `reminders.json` | 提醒数据 |
 | `cert/` | HTTPS自签证书 |
 | `web/voice.html` | Web客户端(语音VAD+文字+TTS+提醒+历史+新对话) |
-| `test_system.py` | 系统自测脚本(10项验证, 13秒) |
+| `test_system.py` | 系统集成自测脚本(18项验证) |
+| `tests/` | pytest单元测试(67个: utils/voice_agent/voice_server) |
+| `pytest.ini` | pytest配置(忽略old/目录) |
 | `conversation_history.json` | 对话历史持久化 |
 | `suggestions_state.json` | 主动建议状态(防重复播报) |
 
@@ -190,21 +192,39 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 
 ## 待办
 - [ ] 特斯拉真实控制(需Tesla Developer授权)
-- [x] ~~流式响应降延迟~~ (v3.0已实现: SSE逐句产出, 首文本1.7s/首音频3.5s)
+- [x] ~~流式响应降延迟~~ (v3.0: SSE逐句产出, 首文本1.7s/首音频3.5s)
 - [ ] 开发板多端(树莓派直接跑/ESP32瘦客户端)
 - [ ] 外卖购物商品搜索(京东union API需授权认证)
-- [ ] WebSocket双向实时通信(替代SSE单向)
-- [ ] pytest单元测试(当前为集成测试)
+- [x] ~~WebSocket双向实时通信~~ (v3.1: /ws端点, 文字/语音/打断TTS)
+- [x] ~~pytest单元测试~~ (v3.1: 67个测试全通过, mock GLM/TTS/ASR)
 - [ ] 多用户会话管理(当前单用户)
 
 
 ## 请求指标
 GET /api/metrics  : 实时性能监控(请求数/错误率/缓存命中/p50/p95响应时间/各端点明细)
 
-## 流式语音闭环 (v3.0 新增)
+## WebSocket双向通信 (v3.1 新增)
+WebSocket /ws : 双向实时通信(文字/语音/打断TTS)
+- 客户端发送: {"type":"text","message":"你好"} / {"type":"audio","data":"base64..."} / {"type":"interrupt"} / {"type":"ping"}
+- 服务端返回: {"type":"asr","text":"..."} / {"type":"text","text":"..."} / {"type":"audio","data":"..."} / {"type":"done"} / {"type":"interrupted"}
+
+## 流式语音闭环 (v3.0+)
 POST /api/chat/stream   : 流式文字对话(SSE: text→audio→done, 大脑逐句产出)
 POST /api/voice/stream  : 流式语音对话(SSE: asr→text→audio→done, 逐句播报)
 - 首文本延迟: 1.7s (原5s)
 - 首音频延迟: 3.5s (原8s)
 - TTS批量50字/块, 自动去Markdown
 - 自动监听: 声音检测→自动录音→静默停止→防回声cooldown
+
+## v3.1 新增功能
+- **WebSocket双向通信**: /ws端点, 支持文字/语音/打断TTS/心跳
+  - 客户端可实时打断AI播报(用户说话时中断TTS)
+  - 自动重连+SSE降级(Web客户端)
+  - 支持多设备同时连接
+- **限流防护**: 每IP每分钟60次普通+10次语音请求, 超限429+Retry-After
+- **pytest单元测试**: 67个测试全通过(0.83s)
+  - test_utils.py(21): 时间解析/错误脱敏/文件清理/历史截断
+  - test_voice_agent.py(21): 缓存/历史/流式大脑/Mock/重试逻辑
+  - test_voice_server.py(25): API端点/WebSocket/限流/Mock TTS
+- **空消息校验**: /api/chat空消息返回400
+- **Web客户端WebSocket**: 自动重连+打断按钮+SSE降级
