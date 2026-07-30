@@ -154,6 +154,20 @@ def t_metrics():
     has_endpoints = "endpoints" in d
     return has_total and has_endpoints, f"总请求{d.get('total_requests',0)} 错误{d.get('total_errors',0)}"
 
+
+def t_utils():
+    """共享工具模块测试"""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from utils import parse_time_str, sanitize_error, truncate_history_file, cleanup_temp_files
+    # 时间解析
+    t1 = parse_time_str("30分钟后")
+    ok1 = t1 is not None and "T" in t1
+    # 错误脱敏
+    e = sanitize_error("Error in /Users/sxliuyu/code.py key sk-abc123 ip 10.0.0.1")
+    ok2 = "code.py" not in e and "sk-abc123" not in e and "10.0.0.1" not in e
+    return ok1 and ok2, "parse_time=%s sanitize=%s" % ("Y" if ok1 else "N", "Y" if ok2 else "N")
+
 def main():
     print("=" * 50)
     print("  魔幻手机 · 系统自测")
@@ -177,6 +191,7 @@ def main():
         ("对话搜索", t_search),
         ("流式对话", t_stream_chat),
         ("请求指标", t_metrics),
+        ("工具模块", t_utils),
     ]
     passed = sum(1 for _, fn in tests if test(_, fn))
     print("=" * 50)

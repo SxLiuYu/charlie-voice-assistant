@@ -1,13 +1,20 @@
 #!/bin/bash
-# 魔幻手机 - 自动重启看门狗
-# 每60秒检查服务健康，挂了自动重启
+# 魔幻手机 - 自动重启看门狗 v2
+# 每60秒检查服务健康，挂了自动重启 + 文件日志 + 内存监控
 # 用法: screen -dmS watchdog bash watchdog.sh
 
 cd "$(dirname "$0")"
 source .venv/bin/activate
 LOG=/tmp/voice_srv.log
 HTTPS_LOG=/tmp/voice_https.log
+WATCHDOG_LOG=/tmp/watchdog.log
 RESTART_COUNT=0
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$WATCHDOG_LOG"
+}
+
+log "看门狗v2启动 - 检查间隔60s"
 
 while true; do
     # 检查HTTP
@@ -18,7 +25,7 @@ while true; do
     NEED_RESTART=0
 
     if [ "$HTTP_OK" != "200" ]; then
-        echo "[$(date '+%H:%M:%S')] HTTP服务异常($HTTP_OK)，重启中..."
+        log "⚠️ HTTP服务异常($HTTP_OK)，重启中..."
         pkill -9 -f "python voice_server.py" 2>/dev/null
         sleep 2
         screen -dmS voice bash -c "source .venv/bin/activate && python voice_server.py > $LOG 2>&1"
@@ -26,7 +33,7 @@ while true; do
     fi
 
     if [ "$HTTPS_OK" != "200" ]; then
-        echo "[$(date '+%H:%M:%S')] HTTPS服务异常($HTTPS_OK)，重启中..."
+        log "⚠️ HTTPS服务异常($HTTPS_OK)，重启中..."
         pkill -9 -f "python https_server.py" 2>/dev/null
         sleep 2
         screen -dmS voice-https bash -c "source .venv/bin/activate && python https_server.py > $HTTPS_LOG 2>&1"
@@ -35,15 +42,21 @@ while true; do
 
     if [ $NEED_RESTART -eq 1 ]; then
         RESTART_COUNT=$((RESTART_COUNT + 1))
-        echo "[$(date '+%H:%M:%S')] 重启完成 (累计重启$RESTART_COUNT次)"
-        sleep 15  # 等服务恢复
+        log "重启完成 (累计重启$RESTART_COUNT次)"
+        sleep 15
     else
+        # 内存检查
+        MEM_PCT=$(python3 -c "import psutil;print(int(psutil.virtual_memory().percent))" 2>/dev/null || echo 0)
+        if [ "$MEM_PCT" -gt 90 ]; then
+            log "⚠️ 内存过高(${MEM_PCT}%)，可能OOM风险"
+        fi
+        
         # 日志轮转: 超过10MB截断
-        for f in $LOG $HTTPS_LOG; do
+        for f in $LOG $HTTPS_LOG $WATCHDOG_LOG; do
             if [ -f "$f" ]; then
                 SIZE=$(stat -f%z "$f" 2>/dev/null || echo 0)
                 if [ $SIZE -gt 10485760 ]; then
-                    echo "[$(date '+%H:%M:%S')] 日志轮转: $f (${SIZE}字节 > 10MB)"
+                    log "日志轮转: $f ($(echo "scale=0; $SIZE/1048576" | bc 2>/dev/null || echo "?")MB > 10MB)"
                     tail -5000 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
                 fi
             fi
