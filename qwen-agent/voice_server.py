@@ -596,7 +596,10 @@ async def _stream_brain_tts(text: str, asr_text: str = ""):
 @app.post("/api/chat/stream")
 async def chat_stream_api(req: Request):
     """流式文字对话: 文字进 → 大脑逐句产出 → TTS批量推送(SSE)"""
-    body = await req.json()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
     text = body.get("message", "")
     if len(text) > MAX_TEXT_LENGTH:
         return JSONResponse({"error": f"输入过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
@@ -633,7 +636,10 @@ async def voice_stream_api(file: UploadFile = File(...)):
 
 @app.post("/api/chat")
 async def chat_api(req: Request):
-    body = await req.json()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
     text = body.get("message", "")
     if len(text) > MAX_TEXT_LENGTH:
         return JSONResponse({"error": f"输入过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
@@ -685,7 +691,10 @@ async def list_reminders():
 
 @app.post("/api/reminders")
 async def add_reminder(req: Request):
-    body = await req.json()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
     text = body.get("text", "").strip()
     time_str = body.get("time", "").strip()
     if not text:
@@ -728,7 +737,10 @@ async def get_conversation():
 @app.post("/api/tts")
 async def tts_api(req: Request):
     """文字 → 语音(WAV)"""
-    body = await req.json()
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
     text = body.get("text", "")
     if not text:
         return JSONResponse({"error": "text不能为空"}, status_code=400)

@@ -4,7 +4,7 @@
 连接韧性: Session复用 + 自动重试 + 异常降级
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
 """
-import os, json, base64, requests, datetime, time, logging, asyncio, re
+import os, json, base64, requests, datetime, time, logging, asyncio, re, threading
 from typing import Optional, Generator, Tuple, List, Dict, Any
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -49,14 +49,16 @@ def _cache_set(text: str, reply: str) -> None:
 # ===== 对话历史(跨请求持久化) =====
 _history = []
 MAX_HISTORY = 20  # 保留最近20轮对话(40条消息)
+_history_lock = threading.Lock()  # 防止多线程同时修改对话历史
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation_history.json")
 
 def _save_history() -> None:
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(_history, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    with _history_lock:
+        try:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(_history, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 def _load_history() -> None:
     global _history
@@ -68,7 +70,8 @@ def _load_history() -> None:
 
 def reset_history() -> None:
     global _history
-    _history = []
+    with _history_lock:
+        _history = []
     _save_history()
 
 _load_history()
