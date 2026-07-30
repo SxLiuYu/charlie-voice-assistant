@@ -772,14 +772,34 @@ async def asr_api(file: UploadFile = File(...)):
         return JSONResponse({"error": "ASR超时"}, status_code=504)
 
 @app.get("/api/export")
-async def export_conversation():
-    """导出对话历史为文本"""
+async def export_conversation(format: str = "txt"):
+    """导出对话历史(支持txt/markdown/json格式)"""
     from voice_agent import _history
+    if not _history:
+        return Response(content="(对话历史为空)".encode("utf-8"), media_type="text/plain")
+    
+    if format == "json":
+        import json as _j
+        return Response(content=_j.dumps(_history, ensure_ascii=False, indent=2).encode("utf-8"),
+                       media_type="application/json",
+                       headers={"Content-Disposition": "attachment; filename=conversation.json"})
+    
+    if format in ("markdown", "md"):
+        lines = ["# 魔幻手机 · 对话记录\n"]
+        for m in _history:
+            role = "🙋 我" if m.get("role") == "user" else "🤖 魔幻手机"
+            lines.append(f"### {role}\n\n{m.get('content', '')}\n")
+        lines.append(f"\n---\n*共{len(_history)}条消息 · {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}导出*")
+        text = "\n".join(lines)
+        return Response(content=text.encode("utf-8"), media_type="text/markdown",
+                       headers={"Content-Disposition": "attachment; filename=conversation.md"})
+    
+    # 默认txt格式
     lines = []
     for m in _history:
         role = "我" if m.get("role") == "user" else "魔幻手机"
         lines.append(f"[{role}] {m.get('content', '')}")
-    text = "\n\n".join(lines) if lines else "(对话历史为空)"
+    text = "\n\n".join(lines)
     return Response(content=text.encode("utf-8"), media_type="text/plain",
                    headers={"Content-Disposition": "attachment; filename=conversation.txt"})
 
@@ -853,7 +873,7 @@ async def version():
     return {
         "name": "魔幻手机",
         "version": "3.0.0",
-        "brain": "GLM-5.2 + Qwen-Agent + 6 MCP",
+        "brain": "GLM-5.2 + Qwen-Agent + 4 MCP (可配置)",
         "voice": "qwen3-asr/tts-flash (finna)",
         "features": ["流式语音对话", "流式文字对话", "大脑逐句产出", "TTS批量推送",
                      "语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
@@ -914,7 +934,7 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 <div class="bar"><div class="{'green' if disk.percent<80 else 'yellow' if disk.percent<90 else 'red'}" style="width:{disk.percent}%"></div></div>
 </div>
 <div class="card"><h3>🧠 大脑</h3>
-<div class="metric"><span>模型</span><span class="val">GLM-5.2 + 6 MCP</span></div>
+<div class="metric"><span>模型</span><span class="val">GLM-5.2 + 4 MCP (可配置)</span></div>
 <div class="metric"><span>预热状态</span><span class="tag {'ok' if brain_warm else 'warn'}">{'✅ 已就绪' if brain_warm else '⏳ 预热中'}</span></div>
 <div class="metric"><span>对话历史</span><span class="val">{len(_history)} 条</span></div>
 <div class="metric"><span>语音引擎</span><span class="val">qwen3-asr/tts-flash</span></div>
