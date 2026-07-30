@@ -508,15 +508,23 @@ async def _stream_brain_tts(text: str, asr_text: str = ""):
         yield f'data: {json.dumps({"type":"asr","text":asr_text}, ensure_ascii=False)}\n\n'
     
     tts_buffer = ""
+    total_wait = 0
+    HEARTBEAT_INTERVAL = 5  # 每5秒发心跳
+    MAX_WAIT = 120  # 总超时120秒
     
     while True:
         try:
             item = await asyncio.wait_for(
-                asyncio.to_thread(q.get, True, 60), timeout=65)
+                asyncio.to_thread(q.get, True, HEARTBEAT_INTERVAL), timeout=HEARTBEAT_INTERVAL + 2)
+            total_wait = 0  # 收到数据,重置计时
         except asyncio.TimeoutError:
-            yield f'data: {json.dumps({"type":"error","message":"思考超时"}, ensure_ascii=False)}\n\n'
-            yield 'data: {"type":"done"}\n\n'
-            break
+            total_wait += HEARTBEAT_INTERVAL + 2
+            if total_wait >= MAX_WAIT:
+                yield f'data: {json.dumps({"type":"error","message":"思考超时"}, ensure_ascii=False)}\n\n'
+                yield 'data: {"type":"done"}\n\n'
+                break
+            yield ': heartbeat\n\n'  # SSE心跳(注释,客户端忽略,保活连接)
+            continue
         
         etype, sentence, full_reply = item
         if etype == "done":
