@@ -1256,7 +1256,7 @@ async def version():
                      "响应缓存", "看门狗", "MP3压缩", "线程池", "Markdown清理TTS", "逗号软分割",
                      "连接重试", "文件锁", "大脑断路器", "多用户会话隔离", "唤醒词检测",
                      "API密钥故障转移", "输入清洗XSS防护", "结构化日志", "优雅降级",
-                     "对话时间戳", "Token感知截断", "连接池调优", "对话导出分页"],
+                     "对话时间戳", "Token感知截断", "连接池调优", "对话导出分页", "用户偏好系统"],
         "streaming": {
             "chat": "/api/chat/stream (SSE: text+audio+done)",
             "voice": "/api/voice/stream (SSE: asr+text+audio+done)",
@@ -1265,6 +1265,14 @@ async def version():
         }
     }
 
+
+def _pref_count() -> int:
+    """获取用户偏好数量"""
+    try:
+        from voice_agent import list_preferences
+        return len(list_preferences())
+    except Exception:
+        return 0
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
@@ -1317,12 +1325,13 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 <div class="metric"><span>预热状态</span><span class="tag {'ok' if brain_warm else 'warn'}">{'✅ 已就绪' if brain_warm else '⏳ 预热中'}</span></div>
 <div class="metric"><span>对话历史</span><span class="val">{len(_history)} 条</span></div>
 <div class="metric"><span>语音引擎</span><span class="val">qwen3-asr/tts-flash</span></div>
+<div class="metric"><span>用户偏好</span><span class="val">{_pref_count()} 项</span></div>
 </div>
 <div class="card"><h3>⏰ 提醒 ({len(pending)} 待办)</h3>
 {"".join(f'<div class="rem">📌 {r["text"]} <span style="color:#888">⏰{r.get("due","")[:16].replace("T"," ")}</span></div>' for r in pending[:5]) or '<div class="rem" style="color:#666">暂无待办</div>'}
 <a href="/api/reminders" style="font-size:12px">查看全部 →</a>
 </div>
-<div class="card"><h3>🔧 API 端点 (24个 + WS)</h3>
+<div class="card"><h3>🔧 API 端点 (27个 + WS)</h3>
 <div class="metric"><span>语音</span><span class="val">/api/voice /api/voice/stream</span></div>
 <div class="metric"><span>TTS/ASR</span><span class="val">/api/tts /api/asr</span></div>
 <div class="metric"><span>对话</span><span class="val">/api/chat /api/chat/stream</span></div>
