@@ -96,8 +96,8 @@ def _build_system_msg() -> str:
            f"{period} {now.strftime('%H:%M')}。{todo_ctx}。用户在Mac Mini上。")
     return (f"你是魔幻手机，中国版贾维斯——用户的私人AI助理。{ctx}\n"
             "你的性格：高效、主动、偶尔幽默，像老朋友一样亲切。\n"
-            "你有6个MCP工具：高德地图(天气/POI/路线)、充电桩搜索、购物推荐、翻译、"
-            "提醒管理(add_reminder可设提醒,list_reminders可查待办)、文件读写、知识图谱记忆。\n"
+            "你有多个MCP工具：高德地图(天气/POI/路线)、充电桩搜索、购物推荐、翻译、"
+            "提醒管理(add_reminder可设提醒,list_reminders可查待办)、文件读写等。\n"
             "行为准则：\n"
             "1. 回复简洁口语化，适合语音播报，通常不超过3句\n"
             "2. 能用工具就用工具，给真实数据而非编造\n"
@@ -180,32 +180,95 @@ def asr(audio_bytes: bytes, fmt: str = "mp3") -> str:
 
 # ===== 大脑: GLM-5.2 + Qwen-Agent + MCP =====
 def _build_brain():
+    # 内存检查: 防止OOM崩溃
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        if mem.percent > 90:
+            raise RuntimeError(f"内存不足({mem.percent}%), 拒绝构建大脑防OOM")
+        log.info(f"[brain] 内存检查通过: {mem.percent}% ({(mem.total-mem.available)//1073741824:.1f}GB可用)")
+    except ImportError:
+        pass
     from qwen_agent.agents import Assistant
     llm_cfg = {
         'model': os.getenv('GLM_MODEL', 'glm-5.2'), 'model_type': 'oai',
         'api_base': FINNA, 'api_key': GLM_KEY,
         'generate_cfg': {'use_raw_api': True},
     }
-    tools = [{"mcpServers": {
+    # MCP服务器配置(可通过MCP_SERVERS环境变量控制启用哪些, 逗号分隔)
+    all_mcp = {
         "amap-maps": {"command": "npx", "args": ["-y", "@amap/amap-maps-mcp-server"],
             "env": {"AMAP_MAPS_API_KEY": os.getenv("AMAP_KEY", "REDACTED")}},
         "magic-phone": {"command": os.path.join(os.getcwd(), ".venv/bin/python"),
             "args": ["mcp_server.py"], "cwd": os.getcwd()},
-        "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/sxliuyu/orca/projects/傻妞"]},
-        "memory": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]},
         "baize-skills": {"command": os.path.join(os.getcwd(), ".venv/bin/python"),
             "args": ["baize_skills_mcp.py"], "cwd": os.getcwd(),
             "env": {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", ""),
                     "ALIYUN_API_KEY": os.getenv("ALIYUN_API_KEY", "")}},
-        "sequential-thinking": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]}
-    }}]
+        "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/sxliuyu/orca/projects/傻妞"]},
+        "memory": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]},
+        "sequential-thinking": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]},
+    }
+    # 默认启用4个核心服务器(省内存); 可通过.env的MCP_SERVERS覆盖
+    enabled = os.getenv("MCP_SERVERS", "amap-maps,magic-phone,baize-skills,filesystem").split(",")
+    enabled = [s.strip() for s in enabled if s.strip()]
+    mcp_servers = {k: v for k, v in all_mcp.items() if k in enabled}
+    log.info(f"[brain] 启用{len(mcp_servers)}个MCP: {list(mcp_servers.keys())}")
+    tools = [{"mcpServers": mcp_servers}]
     return Assistant(llm=llm_cfg, name='魔幻手机',
         system_message=_build_system_msg(),
         function_list=tools)
 
 _brain = None
+_brain_failures = 0          # 连续失败计数
+_brain_last_failure = 0       # 上次失败时间戳
+_brain_last_success = 0       # 上次成功时间戳
+_MAX_BRAIN_FAILURES = 3       # 连续失败3次后自动重建大脑
+_brain_build_time = 0         # 大脑构建时间
 
 def _ensure_event_loop():
+    """确保当前线程有event loop(Qwen-Agent MCP可能需要)"""
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+def _record_brain_failure(error: str = ""):
+    """记录大脑失败, 连续失败超过阈值时自动重建"""
+    global _brain_failures, _brain_last_failure, _brain
+    _brain_failures += 1
+    _brain_last_failure = time.time()
+    log.error(f"[brain] 失败#{_brain_failures}: {error}")
+    if _brain_failures >= _MAX_BRAIN_FAILURES:
+        log.warning(f"[brain] 连续失败{_brain_failures}次, 重建大脑+MCP...")
+        _brain = None  # 清除旧大脑, 下次请求自动重建
+        _brain_failures = 0
+
+def _record_brain_success():
+    """记录大脑成功, 重置失败计数"""
+    global _brain_failures, _brain_last_success
+    _brain_failures = 0
+    _brain_last_success = time.time()
+
+def restart_brain() -> str:
+    """手动重启大脑(清除旧实例+MCP连接, 下次请求重建)"""
+    global _brain, _brain_failures
+    _brain = None
+    _brain_failures = 0
+    log.info("[brain] 手动重启请求, 大脑将在下次请求时重建")
+    return "大脑重启中, 下次请求将自动重建"
+
+def brain_status() -> dict:
+    """获取大脑健康状态"""
+    import datetime as _dt
+    return {
+        "ready": _brain is not None,
+        "consecutive_failures": _brain_failures,
+        "max_failures_before_rebuild": _MAX_BRAIN_FAILURES,
+        "last_success": _dt.datetime.fromtimestamp(_brain_last_success).isoformat() if _brain_last_success else None,
+        "last_failure": _dt.datetime.fromtimestamp(_brain_last_failure).isoformat() if _brain_last_failure else None,
+        "uptime_since": _dt.datetime.fromtimestamp(_brain_build_time).isoformat() if _brain_build_time else None,
+    }
     """确保当前线程有event loop(Qwen-Agent MCP可能需要)"""
     try:
         asyncio.get_event_loop()
@@ -224,6 +287,9 @@ def brain(text: str) -> str:
     if _brain is None:
         try:
             _brain = _build_brain()
+            global _brain_build_time
+            _brain_build_time = time.time()
+            log.info(f"[brain] 大脑构建完成, {len(messages) if 'messages' in dir() else '?'}消息")
         except Exception as e:
             log.error(f"大脑构建失败: {e}")
             return "大脑启动失败，请稍后重试"
@@ -233,8 +299,9 @@ def brain(text: str) -> str:
         final = None
         for rsp in _brain.run(messages):
             final = rsp
+        _record_brain_success()
     except Exception as e:
-        log.error(f"大脑推理异常: {e}")
+        _record_brain_failure(str(e)[:60])
         return f"抱歉，我处理时出错了：{str(e)[:50]}"
 
     reply = "我没听明白"
@@ -333,6 +400,7 @@ def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
             if not t or len(t) <= sent_len:
                 continue
             full_reply = t
+            _record_brain_success()
             unsent = full_reply[sent_len:]
             while True:
                 # 优先在句末标点处切割
@@ -357,7 +425,7 @@ def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
                 break
             sent_len = len(full_reply) - len(unsent)
     except Exception as e:
-        log.error(f"流式大脑推理异常: {e}")
+        _record_brain_failure(str(e)[:60])
         if not full_reply:
             full_reply = f"抱歉，处理时出错了：{str(e)[:40]}"
 

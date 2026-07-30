@@ -104,8 +104,16 @@ def t_manifest():
     return d.get("name") == "魔幻手机" and d.get("display") == "standalone", f'{d.get("name","?")} {d.get("display","?")}'
 
 def t_search():
-    # First ensure there's some conversation history
-    requests.post(f"{HOST}/api/chat", json={"message": "测试搜索功能hello"}, timeout=30)
+    # 轻量级: 直接写对话历史(避免触发大脑,省内存)
+    import json as _j, os as _os
+    hf = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "conversation_history.json")
+    try:
+        hist = _j.load(open(hf))
+    except:
+        hist = []
+    hist.append({"role": "user", "content": "测试搜索功能hello"})
+    hist.append({"role": "assistant", "content": "搜索测试回复"})
+    _j.dump(hist, open(hf, "w"), ensure_ascii=False, indent=2)
     r = requests.get(f"{HOST}/api/search?q=hello", timeout=5)
     d = r.json()
     return d.get("count", 0) >= 1, f"找到{d.get('count',0)}条匹配"

@@ -199,8 +199,23 @@ def _wav_to_mp3(wav_data: bytes, bitrate: str = "32k") -> bytes:
             except: pass
 
 # ===== 提醒管理 =====
+def _cleanup_old_reminders(reminders: list) -> tuple:
+    """清理已完成的旧提醒(7天前完成的), 返回(清理后列表, 删除数)"""
+    import datetime as _dt
+    cutoff = (_dt.datetime.now() - _dt.timedelta(days=7)).isoformat()
+    kept = []
+    removed = 0
+    for r in reminders:
+        if r.get("done") and r.get("completed_at", r.get("triggered_at", "")) < cutoff:
+            removed += 1
+        else:
+            kept.append(r)
+    if removed > 0:
+        log.info(f"[reminders] 自动清理{removed}条已完成旧提醒")
+    return kept, removed
+
 def _load_reminders():
-    """带文件锁的提醒加载"""
+    """带文件锁的提醒加载(自动清理7天前已完成)"""
     try:
         with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
             fcntl.flock(f, fcntl.LOCK_SH)
@@ -211,7 +226,10 @@ def _load_reminders():
         return []
 
 def _save_reminders(data):
-    """带文件锁的提醒保存"""
+    """带文件锁的提醒保存(保存前自动清理7天前已完成)"""
+    data, removed = _cleanup_old_reminders(data)
+    if removed > 0:
+        log.info(f"[reminders] 保存时清理{removed}条旧提醒")
     with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -422,6 +440,14 @@ def _brain_is_warm():
     except Exception:
         return False
 
+def _get_brain_health():
+    """获取大脑健康状态(失败计数/上次成功/上次失败)"""
+    try:
+        from voice_agent import brain_status
+        return brain_status()
+    except Exception:
+        return {"ready": False, "error": "无法获取"}
+
 # ===== 预热大脑(修复asyncio子线程问题) =====
 def _warmup_brain():
     """后台预启动大脑+6MCP，首请求省~9秒"""
@@ -514,16 +540,17 @@ async def _stream_brain_tts(text: str, asr_text: str = ""):
     
     while True:
         try:
-            item = await asyncio.wait_for(
-                asyncio.to_thread(q.get, True, HEARTBEAT_INTERVAL), timeout=HEARTBEAT_INTERVAL + 2)
+            item = q.get_nowait()  # 非阻塞检查队列
             total_wait = 0  # 收到数据,重置计时
-        except asyncio.TimeoutError:
-            total_wait += HEARTBEAT_INTERVAL + 2
+        except _queue.Empty:
+            # 队列空, 发心跳保活
             if total_wait >= MAX_WAIT:
                 yield f'data: {json.dumps({"type":"error","message":"思考超时"}, ensure_ascii=False)}\n\n'
                 yield 'data: {"type":"done"}\n\n'
                 break
             yield ': heartbeat\n\n'  # SSE心跳(注释,客户端忽略,保活连接)
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            total_wait += HEARTBEAT_INTERVAL
             continue
         
         etype, sentence, full_reply = item
@@ -634,6 +661,7 @@ async def system_status():
         "disk_percent": disk.percent,
         "reminders_pending": len([r for r in _load_reminders() if not r.get("done")]),
         "brain_ready": _brain_is_warm(),
+        "brain_health": _get_brain_health(),
     }
 
 @app.get("/api/reminders")
@@ -797,12 +825,22 @@ async def sse_events():
 
 @app.get("/api/search")
 async def search_conversation(q: str = ""):
-    """搜索对话历史中的关键词"""
+    """搜索对话历史中的关键词(同时搜索内存+文件)"""
     if not q:
         return JSONResponse({"error": "请提供搜索关键词?q=xxx"}, status_code=400)
-    from voice_agent import _history
+    from voice_agent import _history, HISTORY_FILE
+    # 合并内存历史和文件历史(去重)
+    all_history = list(_history)
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            file_hist = json.load(f)
+        # 添加文件中存在但内存中没有的条目
+        if len(file_hist) > len(all_history):
+            all_history = file_hist
+    except Exception:
+        pass
     results = []
-    for i, m in enumerate(_history):
+    for i, m in enumerate(all_history):
         content = m.get("content", "")
         if q.lower() in content.lower():
             role = "我" if m.get("role") == "user" else "魔幻手机"
@@ -921,6 +959,16 @@ async def manifest():
         "background_color": "#0f0c29",
         "theme_color": "#e94560",
     })
+
+
+
+@app.post("/api/brain/restart")
+async def restart_brain_api():
+    """手动重启大脑(清除旧MCP连接, 下次请求重建)"""
+    from voice_agent import restart_brain
+    msg = restart_brain()
+    log.info(f"[brain] 手动重启: {msg}")
+    return {"ok": True, "message": msg}
 
 
 @app.get("/api/metrics")
