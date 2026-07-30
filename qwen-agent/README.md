@@ -177,3 +177,15 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 - [ ] 流式响应降延迟(当前同步ASR→大脑→TTS约5-15s，可改并行)
 - [ ] 开发板多端(树莓派直接跑/ESP32瘦客户端)
 - [ ] 外卖购物商品搜索(京东union API需授权认证)
+
+
+## 请求指标
+GET /api/metrics  : 实时性能监控(请求数/错误率/缓存命中/p50/p95响应时间/各端点明细)
+
+## 流式语音闭环 (v3.0 新增)
+POST /api/chat/stream   : 流式文字对话(SSE: text→audio→done, 大脑逐句产出)
+POST /api/voice/stream  : 流式语音对话(SSE: asr→text→audio→done, 逐句播报)
+- 首文本延迟: 1.7s (原5s)
+- 首音频延迟: 3.5s (原8s)
+- TTS批量50字/块, 自动去Markdown
+- 自动监听: 声音检测→自动录音→静默停止→防回声cooldown

@@ -137,6 +137,15 @@ def t_stream_chat():
     ok = has_text and has_done
     return ok, "流式对话 %.1fs (text=%s done=%s)" % (elapsed, "Y" if has_text else "N", "Y" if has_done else "N")
 
+
+def t_metrics():
+    """请求指标端点"""
+    r = requests.get(f"{HOST}/api/metrics", timeout=5)
+    d = r.json()
+    has_total = "total_requests" in d
+    has_endpoints = "endpoints" in d
+    return has_total and has_endpoints, f"总请求{d.get('total_requests',0)} 错误{d.get('total_errors',0)}"
+
 def main():
     print("=" * 50)
     print("  魔幻手机 · 系统自测")
@@ -159,6 +168,7 @@ def main():
         ("PWA Manifest", t_manifest),
         ("对话搜索", t_search),
         ("流式对话", t_stream_chat),
+        ("请求指标", t_metrics),
     ]
     passed = sum(1 for _, fn in tests if test(_, fn))
     print("=" * 50)
