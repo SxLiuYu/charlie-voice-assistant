@@ -18,7 +18,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
     from dotenv import load_dotenv; load_dotenv()
 except ImportError: pass
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 import requests
@@ -142,6 +142,31 @@ app.add_middleware(CORSMiddleware,
     allow_methods=["*"],
     allow_headers=["*"])
 
+# ===== 限流中间件(防滥用, 每IP每分钟60次普通+10次语音) =====
+_rate_buckets = {}  # {ip: {"voice": [timestamps], "general": [timestamps]}}
+_RATE_GENERAL = 60   # 每分钟普通请求上限
+_RATE_VOICE = 10      # 每分钟语音请求上限(更重)
+_RATE_WINDOW = 60     # 窗口60秒
+
+def _client_ip(request: Request) -> str:
+    """获取客户端IP(支持代理转发)"""
+    return request.headers.get("x-forwarded-for", "").split(",")[0].strip() or            request.headers.get("x-real-ip", "") or            request.client.host if request.client else "unknown"
+
+def _check_rate(ip: str, bucket_type: str, limit: int) -> tuple:
+    """检查速率, 返回(allowed, remaining, retry_after)"""
+    import time as _t
+    now = _t.time()
+    if ip not in _rate_buckets:
+        _rate_buckets[ip] = {}
+    bucket = _rate_buckets[ip].setdefault(bucket_type, [])
+    # 清除过期记录
+    bucket[:] = [ts for ts in bucket if now - ts < _RATE_WINDOW]
+    if len(bucket) >= limit:
+        retry_after = int(_RATE_WINDOW - (now - bucket[0])) + 1
+        return False, 0, retry_after
+    bucket.append(now)
+    return True, limit - len(bucket), 0
+
 # 请求日志中间件
 @app.middleware("http")
 async def request_logger(request: Request, call_next):
@@ -149,6 +174,20 @@ async def request_logger(request: Request, call_next):
     rid = str(uuid.uuid4())[:8]
     start = _t.time()
     log.info(f"[{rid}] {request.method} {request.url.path}")
+    # 限流检查
+    ip = _client_ip(request)
+    path = request.url.path
+    is_voice = "/api/voice" in path or "/api/tts" in path or "/api/asr" in path
+    bucket_type = "voice" if is_voice else "general"
+    limit = _RATE_VOICE if is_voice else _RATE_GENERAL
+    allowed, remaining, retry_after = _check_rate(ip, bucket_type, limit)
+    if not allowed:
+        log.warning(f"[{rid}] 限流 {ip} {path} (超过{limit}/min)")
+        return JSONResponse(
+            {"error": f"请求过于频繁, 请{retry_after}秒后重试"},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)}
+        )
     try:
         response = await call_next(request)
     except Exception as e:
@@ -641,6 +680,8 @@ async def chat_api(req: Request):
     except Exception:
         return JSONResponse({"error": "请求格式错误,需要JSON"}, status_code=400)
     text = body.get("message", "")
+    if not text.strip():
+        return JSONResponse({"error": "消息不能为空"}, status_code=400)
     if len(text) > MAX_TEXT_LENGTH:
         return JSONResponse({"error": f"输入过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
     from voice_agent import brain
@@ -839,6 +880,208 @@ async def sse_events():
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
+
+
+# ===== WebSocket 双向通信(实时语音/文字, 支持打断TTS) =====
+_ws_clients = {}  # {ws_id: {"ws": ws, "interrupt": False}}
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    """WebSocket双向通信端点
+    
+    客户端发送:
+      {"type":"text","message":"你好"}          → 文字对话
+      {"type":"audio","data":"base64...","format":"wav"} → 语音对话
+      {"type":"interrupt"}                       → 打断当前TTS播放
+      {"type":"ping"}                            → 心跳
+    
+    服务端返回:
+      {"type":"asr","text":"识别结果"}            → ASR结果
+      {"type":"text","text":"回复文字"}          → 大脑回复(逐句)
+      {"type":"audio","data":"base64..."}        → TTS音频(MP3)
+      {"type":"done"}                            → 回复完成
+      {"type":"error","message":"..."}           → 错误
+      {"type":"pong"}                            → 心跳回复
+    """
+    await ws.accept()
+    ws_id = id(ws)
+    _ws_clients[ws_id] = {"ws": ws, "interrupt": False}
+    log.info(f"[ws] 客户端已连接 (id={ws_id}), 共{len(_ws_clients)}个连接")
+    
+    # 发送连接确认
+    await ws.send_json({"type": "connect", "text": "魔幻手机已连接", 
+                        "time": datetime.datetime.now().isoformat()})
+    
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=120)
+            except asyncio.TimeoutError:
+                # 2分钟无消息, 发心跳检测
+                await ws.send_json({"type": "ping"})
+                continue
+            
+            try:
+                data = json.loads(msg)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "message": "消息格式错误,需要JSON"})
+                continue
+            
+            mtype = data.get("type", "")
+            
+            if mtype == "ping":
+                await ws.send_json({"type": "pong", "time": datetime.datetime.now().isoformat()})
+                continue
+            
+            if mtype == "interrupt":
+                # 设置打断标志, 流式生成器会检查
+                _ws_clients[ws_id]["interrupt"] = True
+                log.info(f"[ws] 客户端请求打断TTS (id={ws_id})")
+                await ws.send_json({"type": "interrupted"})
+                continue
+            
+            if mtype == "text":
+                text = data.get("message", "").strip()
+                if not text:
+                    await ws.send_json({"type": "error", "message": "消息不能为空"})
+                    continue
+                if len(text) > MAX_TEXT_LENGTH:
+                    await ws.send_json({"type": "error", "message": f"输入过长(上限{MAX_TEXT_LENGTH}字)"})
+                    continue
+                # 重置打断标志
+                _ws_clients[ws_id]["interrupt"] = False
+                log.info(f"[ws] 文字对话: {text[:40]}")
+                
+                # 流式处理大脑回复
+                async for event in _ws_stream_brain(ws_id, text, ""):
+                    await ws.send_json(event)
+                    # 检查打断
+                    if _ws_clients[ws_id]["interrupt"]:
+                        await ws.send_json({"type": "interrupted"})
+                        break
+                continue
+            
+            if mtype == "audio":
+                audio_b64 = data.get("data", "")
+                fmt = data.get("format", "wav")
+                if not audio_b64:
+                    await ws.send_json({"type": "error", "message": "音频数据为空"})
+                    continue
+                try:
+                    raw = _b64enc.b64decode(audio_b64)
+                except Exception:
+                    await ws.send_json({"type": "error", "message": "base64解码失败"})
+                    continue
+                if len(raw) > MAX_AUDIO_SIZE:
+                    await ws.send_json({"type": "error", "message": "音频过大"})
+                    continue
+                # 重置打断标志
+                _ws_clients[ws_id]["interrupt"] = False
+                log.info(f"[ws] 语音对话: {len(raw)}字节, 格式={fmt}")
+                
+                # ASR
+                wav = to_wav(raw, fmt)
+                from voice_agent import asr
+                try:
+                    asr_text = await asyncio.wait_for(asyncio.to_thread(asr, wav, "wav"), timeout=30)
+                except asyncio.TimeoutError:
+                    await ws.send_json({"type": "error", "message": "语音识别超时"})
+                    continue
+                if not asr_text:
+                    asr_text = "(未识别到语音)"
+                await ws.send_json({"type": "asr", "text": asr_text})
+                
+                # 流式大脑回复
+                async for event in _ws_stream_brain(ws_id, asr_text, asr_text):
+                    await ws.send_json(event)
+                    if _ws_clients[ws_id]["interrupt"]:
+                        await ws.send_json({"type": "interrupted"})
+                        break
+                continue
+            
+            # 未知类型
+            await ws.send_json({"type": "error", "message": f"未知消息类型: {mtype}"})
+    
+    except WebSocketDisconnect:
+        log.info(f"[ws] 客户端断开 (id={ws_id})")
+    except Exception as e:
+        log.error(f"[ws] 异常 (id={ws_id}): {e}")
+    finally:
+        _ws_clients.pop(ws_id, None)
+        log.info(f"[ws] 连接清理完成 (id={ws_id}), 剩余{len(_ws_clients)}个")
+
+async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = ""):
+    """WebSocket专用流式大脑+TTS生成器(检查打断标志)"""
+    from voice_agent import brain_stream_sentences, _clean_for_tts
+    
+    q = _queue.Queue()
+    
+    def brain_worker():
+        try:
+            for sentence, full_reply in brain_stream_sentences(text):
+                q.put(("sentence", sentence, full_reply))
+        except Exception as e:
+            q.put(("error", str(e)[:60], None))
+        finally:
+            q.put(("done", None, None))
+    
+    threading.Thread(target=brain_worker, daemon=True).start()
+    
+    # 如果有ASR结果, 先推送
+    if asr_text:
+        yield {"type": "asr", "text": asr_text}
+    
+    tts_buffer = ""
+    total_wait = 0
+    
+    while True:
+        # 检查打断标志
+        if _ws_clients.get(ws_id, {}).get("interrupt"):
+            break
+        
+        try:
+            item = q.get_nowait()
+            total_wait = 0
+        except _queue.Empty:
+            if total_wait >= 120:
+                yield {"type": "error", "message": "思考超时"}
+                yield {"type": "done"}
+                break
+            await asyncio.sleep(0.1)
+            total_wait += 0.1
+            continue
+        
+        etype, sentence, full_reply = item
+        if etype == "done":
+            # 推送剩余TTS
+            if tts_buffer.strip():
+                audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
+                if audio_b64:
+                    yield {"type": "audio", "data": audio_b64}
+            yield {"type": "done"}
+            break
+        elif etype == "error":
+            yield {"type": "error", "message": sentence}
+            yield {"type": "done"}
+            break
+        elif etype == "sentence":
+            # 检查打断
+            if _ws_clients.get(ws_id, {}).get("interrupt"):
+                break
+            yield {"type": "text", "text": sentence}
+            cleaned = _clean_for_tts(sentence)
+            if cleaned and len(cleaned) >= 2:
+                tts_buffer = (tts_buffer + "，" + cleaned) if tts_buffer else cleaned
+                if len(tts_buffer) >= _TTS_BATCH_SIZE:
+                    audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
+                    tts_buffer = ""
+                    if audio_b64:
+                        yield {"type": "audio", "data": audio_b64}
+                        # 检查打断
+                        if _ws_clients.get(ws_id, {}).get("interrupt"):
+                            break
+
+
 @app.get("/api/search")
 async def search_conversation(q: str = ""):
     """搜索对话历史中的关键词(同时搜索内存+文件)"""
@@ -872,16 +1115,18 @@ async def search_conversation(q: str = ""):
 async def version():
     return {
         "name": "魔幻手机",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "brain": "GLM-5.2 + Qwen-Agent + 4 MCP (可配置)",
         "voice": "qwen3-asr/tts-flash (finna)",
         "features": ["流式语音对话", "流式文字对话", "大脑逐句产出", "TTS批量推送",
                      "语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
-                     "SSE实时推送", "CORS", "PWA移动端", "响应缓存", "看门狗", "MP3压缩", "线程池",
-                     "Markdown清理TTS", "逗号软分割", "连接重试", "文件锁"],
+                     "SSE实时推送", "WebSocket双向通信", "TTS打断", "限流防护", "CORS", "PWA移动端",
+                     "响应缓存", "看门狗", "MP3压缩", "线程池", "Markdown清理TTS", "逗号软分割",
+                     "连接重试", "文件锁", "大脑断路器"],
         "streaming": {
             "chat": "/api/chat/stream (SSE: text+audio+done)",
             "voice": "/api/voice/stream (SSE: asr+text+audio+done)",
+            "websocket": "/ws (双向: text/audio/interrupt)",
             "tts_batch_size": "50字/块",
         }
     }
@@ -943,7 +1188,7 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 {"".join(f'<div class="rem">📌 {r["text"]} <span style="color:#888">⏰{r.get("due","")[:16].replace("T"," ")}</span></div>' for r in pending[:5]) or '<div class="rem" style="color:#666">暂无待办</div>'}
 <a href="/api/reminders" style="font-size:12px">查看全部 →</a>
 </div>
-<div class="card"><h3>🔧 API 端点 (22个)</h3>
+<div class="card"><h3>🔧 API 端点 (24个 + WS)</h3>
 <div class="metric"><span>语音</span><span class="val">/api/voice /api/voice/stream</span></div>
 <div class="metric"><span>TTS/ASR</span><span class="val">/api/tts /api/asr</span></div>
 <div class="metric"><span>对话</span><span class="val">/api/chat /api/chat/stream</span></div>

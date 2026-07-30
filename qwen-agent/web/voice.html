@@ -64,7 +64,7 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 <div id="volwrap"><div id="volbarbg"><div id="volbar"></div></div></div>
 <div id="volnum">音量 0.0</div>
 <div id="controls">
-<button id="autobtn" onclick="toggleAuto()">自动监听 ON</button>
+<button id="stopbtn" onclick="interruptTTS()" style="padding:10px 18px;border:2px solid #f5a623;border-radius:28px;background:rgba(245,166,35,.1);color:#f5a623;font-size:13px;cursor:pointer;display:none">⏹️打断</button><button id="autobtn" onclick="toggleAuto()">自动监听 ON</button>
 <button id="holdbtn" onmousedown="holdStart()" onmouseup="holdEnd()" onmouseleave="holdEnd()" ontouchstart="holdStart()" ontouchend="holdEnd()">按住说话</button>
 </div>
 <div id="conv"></div>
@@ -93,8 +93,8 @@ function finishReply(){if(streamingMsg){streamingMsg.classList.remove('streaming
 let audioQueue=[],isPlaying=false;
 function enqueueAudio(b64mp3){audioQueue.push(base64ToBlob(b64mp3,'audio/mpeg'));if(!isPlaying)playNextAudio();}
 function playNextAudio(){
-  if(audioQueue.length===0){isPlaying=false;setState('idle','🎙️','在听…');startCooldown();return;}
-  isPlaying=true;setState('speaking','🔊','朗读中…');
+  if(audioQueue.length===0){isPlaying=false;setState('idle','🎙️','在听…');const sb=document.getElementById('stopbtn');if(sb)sb.style.display='none';startCooldown();return;}
+  isPlaying=true;setState('speaking','🔊','朗读中…');const sb=document.getElementById('stopbtn');if(sb)sb.style.display='inline-block';
   const blob=audioQueue.shift();const audio=new Audio(URL.createObjectURL(blob));
   audio.onended=playNextAudio;audio.onerror=playNextAudio;
   audio.play().catch(()=>{setState('idle','🎙️','在听…');isPlaying=false;startCooldown();});
@@ -119,11 +119,14 @@ function handleStreamEvent(data){
 }
 function startCooldown(){if(cooldownTimer)clearTimeout(cooldownTimer);cooldownTimer=setTimeout(()=>{cooldownTimer=null;},COOLDOWN);}
 
-// ===== 流式文字对话 =====
+// ===== 流式文字对话(WebSocket优先, SSE降级) =====
 async function sendText(){
   const m=document.getElementById('msginput').value.trim();if(!m)return;
-  document.getElementById('msginput').value='';addMsg('u',m);
-  setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
+  document.getElementById('msginput').value='';
+  // 优先使用WebSocket
+  if(await sendTextWS(m))return;
+  // 降级到SSE
+  addMsg('u',m);setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
   try{const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});
     if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
     await streamSSE(r,handleStreamEvent);
@@ -246,5 +249,56 @@ function initSSE(){
     evtSource.onerror=function(){evtSource.close();setTimeout(initSSE,5000);};
   }catch(e){}
 }
-loadConv();loadRems();initSSE();setInterval(loadRems,30000);
+// ===== WebSocket双向通信 =====
+let wsConn=null,wsReady=false;
+function wsConnect(){
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  try{
+    wsConn=new WebSocket(proto+'//'+location.host+'/ws');
+    wsConn.onopen=()=>{wsReady=true;
+      const oldDiag=diag.textContent;
+      diag.textContent='✅ 实时连接已建立 · '+(oldDiag.replace(/^[✅📡❌].*?· /,''));
+      // 重连后恢复SSE通知
+      if(evtSource&&!evtSource.readyState||!evtSource)initSSE();
+    };
+    wsConn.onclose=()=>{wsReady=false;diag.textContent='📡 实时连接断开,5秒后重连…';setTimeout(wsConnect,5000);};
+    wsConn.onerror=()=>{wsReady=false;};
+    wsConn.onmessage=(e)=>{
+      try{const data=JSON.parse(e.data);
+        switch(data.type){
+          case'connect':diag.textContent='✅ '+data.text+' · 自动监听已'+(autoListen?'开启':'关闭');break;
+          case'pong':break; // 心跳回复
+          case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','思考中(流式)…');break;
+          case'text':addReplyChunk(data.text);break;
+          case'audio':if(data.data)enqueueAudio(data.data);break;
+          case'done':finishReply();if(!isPlaying&&audioQueue.length===0){setState('idle','🎙️','在听…');startCooldown();}break;
+          case'error':addMsg('sys','⚠️ '+(data.message||'错误'));setState('idle','🎙️','在听…');startCooldown();break;
+          case'interrupted':audioQueue=[];if(isPlaying){isPlaying=false;}finishReply();
+            setState('idle','🎙️','已打断,在听…');startCooldown();break;
+        }
+      }catch(err){}
+    };
+  }catch(e){setTimeout(wsConnect,5000);}
+}
+// WebSocket发送文字对话(优先WebSocket, 降级SSE)
+async function sendTextWS(msg){
+  if(wsReady&&wsConn&&wsConn.readyState===1){
+    addMsg('u',msg);setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
+    wsConn.send(JSON.stringify({type:'text',message:msg}));
+    return true;
+  }
+  return false; // 降级到SSE
+}
+// 打断TTS播放
+function interruptTTS(){
+  if(wsReady&&wsConn&&wsConn.readyState===1){
+    wsConn.send(JSON.stringify({type:'interrupt'}));
+  }
+  audioQueue=[];if(isPlaying){isPlaying=false;}
+  finishReply();
+}
+// 心跳保活
+setInterval(()=>{if(wsReady&&wsConn&&wsConn.readyState===1)wsConn.send(JSON.stringify({type:'ping'}));},30000);
+
+loadConv();loadRems();wsConnect();initSSE();setInterval(loadRems,30000);
 </script></body></html>
