@@ -550,6 +550,38 @@ def _proactive_suggestions():
                 log.warning(f"[suggest] 系统健康告警: {msg}")
                 threading.Thread(target=_play_reminder_audio, args=(msg,), daemon=True).start()
 
+            # 4. 基于用户偏好的主动建议(每天最多一次/偏好)
+            try:
+                from voice_agent import list_preferences
+                prefs = list_preferences()
+                for pkey, pval in prefs.items():
+                    pref_suggest_key = today + f"_pref_{pkey[:10]}"
+                    if SUGGESTIONS_STATE.get(f"last_pref_{pkey[:10]}", "") == pref_suggest_key:
+                        continue
+                    # 根据偏好类型和时间生成建议
+                    suggestion = None
+                    if "下班" in pkey or "下班" in pval:
+                        if 17 <= hour < 19:  # 下午5-7点
+                            suggestion = f"主人，快到下班时间了({pval})，需要我帮你查查路况或叫个车吗？"
+                    elif "食物" in pkey or "喜欢吃" in pkey:
+                        if 11 <= hour < 13 or 17 <= hour < 19:  # 饭点
+                            suggestion = f"主人，到饭点了，我记得你喜欢{pval}，要不要我帮你找附近的餐厅？"
+                    elif "运动" in pkey or "锻炼" in pkey:
+                        if 6 <= hour < 8 or 18 <= hour < 20:  # 运动时间
+                            suggestion = f"主人，是你平时的运动时间，今天别忘了{pval}哦。"
+                    elif "睡" in pkey or "休息" in pkey:
+                        if 22 <= hour < 24:  # 晚上10-12点
+                            suggestion = f"主人，你设定了{pkey}为{pval}，该准备休息了。"
+                    if suggestion:
+                        SUGGESTIONS_STATE[f"last_pref_{pkey[:10]}"] = pref_suggest_key
+                        _save_suggest_state()
+                        _add_notification(suggestion, "preference")
+                        log.info(f"[suggest] 偏好建议({pkey}): {suggestion}")
+                        threading.Thread(target=_play_reminder_audio, args=(suggestion,), daemon=True).start()
+                        break  # 每次只推一条
+            except Exception as e:
+                log.debug(f"[suggest] 偏好建议检查异常: {e}")
+
         except Exception as e:
             log.error(f"[suggest] 主动建议异常: {e}")
         time.sleep(60)  # 每分钟检查一次时间条件
