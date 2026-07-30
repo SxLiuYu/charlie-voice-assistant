@@ -58,6 +58,7 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 #remadd button{padding:8px 14px;border:none;border-radius:16px;background:#f5a623;color:#222;font-size:13px;cursor:pointer}
 </style></head><body>
 <h1>魔幻手机</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
+<div id="tunnelurl" style="display:none;font-size:11px;color:#4e9;margin-bottom:4px;text-align:center;cursor:pointer" onclick="copyTunnelURL()"></div>
 <div id="diag">📡 点击球授权麦克风，开启自动监听…</div>
 <div id="orb" onclick="init()">🎙️</div>
 <div id="status">点击球授权麦克风</div>
@@ -297,8 +298,25 @@ function interruptTTS(){
   audioQueue=[];if(isPlaying){isPlaying=false;}
   finishReply();
 }
+// ===== Tunnel URL (public access) =====
+async function loadTunnelURL(){
+  try{
+    const r=await fetch('/api/tunnel');const d=await r.json();
+    if(d.active&&d.url){
+      const el=document.getElementById('tunnelurl');
+      if(el){el.innerHTML='\u{1F310} \u516C\u7F51: '+d.url.replace('https://','');el.style.display='block';}
+    }
+  }catch(e){}
+}
+function copyTunnelURL(){
+  const el=document.getElementById('tunnelurl');
+  if(!el)return;const t=el.textContent;const url=t.replace(/^[^:]+: /,'');
+  navigator.clipboard.writeText('https://'+url).then(()=>{
+    el.innerHTML+=' \u2705\u5DF2\u590D\u5236';setTimeout(loadTunnelURL,2000);
+  });
+}
 // 心跳保活
 setInterval(()=>{if(wsReady&&wsConn&&wsConn.readyState===1)wsConn.send(JSON.stringify({type:'ping'}));},30000);
 
-loadConv();loadRems();wsConnect();initSSE();setInterval(loadRems,30000);
+loadConv();loadRems();wsConnect();initSSE();loadTunnelURL();setInterval(loadRems,30000);setInterval(loadTunnelURL,60000);
 </script></body></html>
