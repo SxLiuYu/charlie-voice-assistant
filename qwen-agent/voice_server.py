@@ -1283,7 +1283,7 @@ async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = "", session_id
 
 
 @app.get("/api/search")
-async def search_conversation(q: str = "", session_id: str = "default"):
+async def search_conversation(q: str = "", session_id: str = "default", limit: int = 20, offset: int = 0):
     """搜索对话历史中的关键词(同时搜索内存+文件)"""
     if not q:
         return JSONResponse({"error": "请提供搜索关键词?q=xxx"}, status_code=400)
@@ -1310,15 +1310,41 @@ async def search_conversation(q: str = "", session_id: str = "default"):
     results = []
     for i, m in enumerate(all_history):
         content = m.get("content", "")
-        if q.lower() in content.lower():
-            role = "我" if m.get("role") == "user" else "魔幻手机"
-            # 提取匹配上下文
-            idx = content.lower().find(q.lower())
-            start = max(0, idx - 20)
-            end = min(len(content), idx + len(q) + 20)
-            ctx = ("..." if start > 0 else "") + content[start:end] + ("..." if end < len(content) else "")
-            results.append({"role": role, "context": ctx, "full": content[:200]})
-    return {"query": q, "count": len(results), "results": results}
+        content_lower = content.lower()
+        q_lower = q.lower()
+        if q_lower not in content_lower:
+            continue
+        role = "我" if m.get("role") == "user" else "魔幻手机"
+        # Relevance scoring: exact match > word boundary > substring
+        score = 1  # base score
+        if content_lower == q_lower:
+            score = 100  # exact match
+        elif q_lower in content_lower:
+            # count occurrences for scoring
+            count = content_lower.count(q_lower)
+            score = min(50, 10 * count)
+            # bonus for match at start
+            if content_lower.startswith(q_lower):
+                score += 20
+        # Extract matched context with highlighting
+        idx = content_lower.find(q_lower)
+        start = max(0, idx - 25)
+        end = min(len(content), idx + len(q) + 25)
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(content) else ""
+        ctx = prefix + content[start:idx] + "[" + content[idx:idx+len(q)] + "]" + content[idx+len(q):end] + suffix
+        ts = m.get("ts", "")[:19].replace("T", " ") if m.get("ts") else ""
+        results.append({
+            "role": role, "context": ctx, "full": content[:200],
+            "score": score, "index": i, "timestamp": ts
+        })
+    # Sort by relevance score (descending)
+    results.sort(key=lambda r: r["score"], reverse=True)
+    # Pagination
+    total = len(results)
+    paginated = results[offset:offset+limit]
+    return {"query": q, "count": len(paginated), "total": total,
+            "offset": offset, "limit": limit, "results": paginated}
 
 @app.get("/api/version")
 async def version():
