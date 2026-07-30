@@ -57,23 +57,9 @@ def _load():
 def _save(d):
     with open(STORE, "w") as f: json.dump(d, f, ensure_ascii=False, indent=2)
 def _parse_time(s):
-    if not s: return None
-    t = datetime.datetime.now(); tg = t; ok = False
-    import re
-    mm = re.search(r"(\d+)\s*分(?:钟)?后", s)
-    if mm: tg += datetime.timedelta(minutes=int(mm.group(1))); ok = True
-    hh = re.search(r"(\d+)\s*(?:小时|个小时)后", s)
-    if hh: tg += datetime.timedelta(hours=int(hh.group(1))); ok = True
-    dd = re.search(r"(\d+)\s*天后", s)
-    if dd: tg += datetime.timedelta(days=int(dd.group(1))); ok = True
-    for w, n in [("大后天",3),("后天",2),("明天",1),("今天",0)]:
-        if w in s: tg += datetime.timedelta(days=n); ok = True; break
-    tm = re.search(r"(\d{1,2})\s*[点时:：]\s*(\d{0,2})", s)
-    if tm:
-        h = int(tm.group(1)); mi = int(tm.group(2)) if tm.group(2) else (30 if "半" in s else 0)
-        if ("下午" in s or "晚上" in s) and h < 12: h += 12
-        tg = tg.replace(hour=h, minute=mi, second=0, microsecond=0); ok = True
-    return tg.isoformat() if ok else None
+    """时间解析(复用utils.parse_time_str)"""
+    from utils import parse_time_str
+    return parse_time_str(s)
 
 @mcp.tool()
 def add_reminder(text: str, time: str = "") -> str:

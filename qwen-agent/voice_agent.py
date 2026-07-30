@@ -205,7 +205,7 @@ def _build_brain():
             "args": ["baize_skills_mcp.py"], "cwd": os.getcwd(),
             "env": {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", ""),
                     "ALIYUN_API_KEY": os.getenv("ALIYUN_API_KEY", "")}},
-        "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/sxliuyu/orca/projects/傻妞"]},
+        "filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", os.getenv("FS_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))]},
         "memory": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]},
         "sequential-thinking": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]},
     }

@@ -87,6 +87,10 @@ async def lifespan(app):
     else:
         global _main_loop
         _main_loop = asyncio.get_event_loop()
+        # 启动时清理临时文件 + 截断历史
+        from utils import cleanup_temp_files, truncate_history_file
+        cleanup_temp_files()
+        truncate_history_file(REMINDERS_FILE.replace("reminders.json", "conversation_history.json"), 100)
         _start_scheduler()
         _start_proactive()
         _warmup_brain()
@@ -290,8 +294,15 @@ def _play_reminder_audio(text: str):
 def _reminder_scheduler():
     """后台守护线程：每30s检查到期提醒，自动播报"""
     log.info("[reminder] 提醒调度器已启动，每30秒检查一次")
+    cleanup_counter = 0
     while True:
         try:
+            cleanup_counter += 1
+            if cleanup_counter >= 20:
+                cleanup_counter = 0
+                from utils import cleanup_temp_files, truncate_history_file
+                cleanup_temp_files()
+                truncate_history_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation_history.json"), 100)
             reminders = _load_reminders()
             now = datetime.datetime.now()
             changed = False
@@ -492,7 +503,8 @@ async def voice_api(file: UploadFile = File(...)):
         return JSONResponse({"error": "处理超时，请重试"}, status_code=504)
     except Exception as e:
         log.error(f"/api/voice 异常: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        from utils import sanitize_error
+        return JSONResponse({"error": sanitize_error(str(e))}, status_code=500)
 
 # ===== 流式端点: 大脑逐句产出 → TTS批量推送(SSE) =====
 _TTS_BATCH_SIZE = 50  # TTS批量大小(字符数)，平衡延迟与效率
@@ -635,7 +647,8 @@ async def chat_api(req: Request):
         return JSONResponse({"error": "思考超时，请重试"}, status_code=504)
     except Exception as e:
         log.error(f"/api/chat 异常: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        from utils import sanitize_error
+        return JSONResponse({"error": sanitize_error(str(e))}, status_code=500)
 
 @app.post("/api/reset")
 async def reset_conversation():
@@ -679,40 +692,11 @@ async def add_reminder(req: Request):
         raise HTTPException(400, "text不能为空")
     if len(text) > 200:
         raise HTTPException(400, "提醒内容过长(上限200字)")
-    # 复用baize_skills的时间解析
+    # 复用共享时间解析工具
     due = None
     if time_str:
-        import re
-        t = datetime.datetime.now()
-        tg = t
-        ok = False
-        mm = re.search(r"(\d+)\s*分(?:钟)?后", time_str)
-        if mm:
-            tg += datetime.timedelta(minutes=int(mm.group(1)))
-            ok = True
-        hh = re.search(r"(\d+)\s*(?:小时|个小时)后", time_str)
-        if hh:
-            tg += datetime.timedelta(hours=int(hh.group(1)))
-            ok = True
-        dd = re.search(r"(\d+)\s*天后", time_str)
-        if dd:
-            tg += datetime.timedelta(days=int(dd.group(1)))
-            ok = True
-        for w, n in [("大后天", 3), ("后天", 2), ("明天", 1), ("今天", 0)]:
-            if w in time_str:
-                tg += datetime.timedelta(days=n)
-                ok = True
-                break
-        tm = re.search(r"(\d{1,2})\s*[点时:：]\s*(\d{0,2})", time_str)
-        if tm:
-            h = int(tm.group(1))
-            mi = int(tm.group(2)) if tm.group(2) else (30 if "半" in time_str else 0)
-            if ("下午" in time_str or "晚上" in time_str) and h < 12:
-                h += 12
-            tg = tg.replace(hour=h, minute=mi, second=0, microsecond=0)
-            ok = True
-        if ok:
-            due = tg.isoformat()
+        from utils import parse_time_str
+        due = parse_time_str(time_str)
     data = _load_reminders()
     rid = int(datetime.datetime.now().timestamp())
     data.append({"id": rid, "text": text, "time": time_str, "due": due, "done": False})
