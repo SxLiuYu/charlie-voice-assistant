@@ -1308,6 +1308,19 @@ async def metrics():
     return _metrics.summary()
 
 
+@app.get("/api/sessions")
+async def list_sessions():
+    """列出所有活跃会话(多用户监控)"""
+    from voice_agent import _sessions
+    sessions = []
+    for sid, hist in _sessions.items():
+        sessions.append({
+            "session_id": sid[:16] + "..." if len(sid) > 16 else sid,
+            "message_count": len(hist),
+            "last_message": hist[-1].get("content", "")[:50] if hist else "",
+        })
+    return {"total": len(sessions), "sessions": sessions}
+
 @app.get("/api/tunnel")
 async def tunnel_status():
     """获取Cloudflare Tunnel公网访问地址"""

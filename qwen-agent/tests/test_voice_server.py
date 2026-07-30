@@ -190,6 +190,18 @@ class TestTTS:
         assert r.content == b"fake_mp3_data"
 
 
+class TestSessions:
+    """多用户会话监控API"""
+
+    def test_list_sessions(self, client):
+        r = client.get("/api/sessions")
+        assert r.status_code == 200
+        data = r.json()
+        assert "total" in data
+        assert "sessions" in data
+        assert isinstance(data["sessions"], list)
+
+
 class TestRateLimiting:
     """限流测试"""
 
