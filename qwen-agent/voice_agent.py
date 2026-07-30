@@ -16,7 +16,27 @@ log = logging.getLogger("magic")
 FINNA = os.getenv("FINNA_BASE", "https://www.finna.com.cn/v1")
 TTS_KEY = os.getenv("TTS_KEY", "REDACTED")
 ASR_KEY = os.getenv("ASR_KEY", "REDACTED")
-GLM_KEY = os.getenv("GLM_KEY", "app-Egtyx0Fytauhxkr6rWBLZyZl")
+# 支持多GLM密钥故障转移(GLM_KEY, GLM_KEY_2, GLM_KEY_3...)
+_glm_keys = [os.getenv("GLM_KEY", "app-Egtyx0Fytauhxkr6rWBLZyZl")]
+for i in range(2, 6):
+    k = os.getenv(f"GLM_KEY_{i}", "")
+    if k:
+        _glm_keys.append(k)
+_glm_key_idx = 0  # 当前使用的密钥索引
+_glm_key_failures = {}  # {key_prefix: failure_count}
+
+def _get_glm_key() -> str:
+    """获取当前GLM密钥(支持故障转移)"""
+    return _glm_keys[_glm_key_idx] if _glm_key_idx < len(_glm_keys) else _glm_keys[0]
+
+def _rotate_glm_key() -> bool:
+    """轮换到下一个可用的GLM密钥, 返回是否成功"""
+    global _glm_key_idx
+    if len(_glm_keys) <= 1:
+        return False  # 只有一个密钥,无法轮换
+    _glm_key_idx = (_glm_key_idx + 1) % len(_glm_keys)
+    log.warning(f"[glm] 密钥故障转移: 切换到密钥#{_glm_key_idx + 1}")
+    return True
 TTS_VOICE = os.getenv("TTS_VOICE", "Cherry")
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 3, 5]  # 秒，逐次递增
@@ -282,7 +302,7 @@ def _build_brain():
     from qwen_agent.agents import Assistant
     llm_cfg = {
         'model': os.getenv('GLM_MODEL', 'glm-5.2'), 'model_type': 'oai',
-        'api_base': FINNA, 'api_key': GLM_KEY,
+        'api_base': FINNA, 'api_key': _get_glm_key(),
         'generate_cfg': {'use_raw_api': True},
     }
     # MCP服务器配置(可通过MCP_SERVERS环境变量控制启用哪些, 逗号分隔)

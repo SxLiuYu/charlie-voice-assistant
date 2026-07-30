@@ -201,6 +201,46 @@ class TestRetry:
 
 
 
+
+class TestApiKeyFailover:
+    """GLM密钥故障转移测试"""
+
+    def test_single_key(self):
+        """单密钥场景"""
+        voice_agent._glm_keys = ["test-key-1"]
+        voice_agent._glm_key_idx = 0
+        assert voice_agent._get_glm_key() == "test-key-1"
+
+    def test_rotate_single_key_fails(self):
+        """单密钥无法轮换"""
+        voice_agent._glm_keys = ["test-key-1"]
+        voice_agent._glm_key_idx = 0
+        result = voice_agent._rotate_glm_key()
+        assert result is False
+
+    def test_rotate_multiple_keys(self):
+        """多密钥可轮换"""
+        voice_agent._glm_keys = ["key-a", "key-b", "key-c"]
+        voice_agent._glm_key_idx = 0
+        assert voice_agent._get_glm_key() == "key-a"
+        assert voice_agent._rotate_glm_key() is True
+        assert voice_agent._get_glm_key() == "key-b"
+        assert voice_agent._rotate_glm_key() is True
+        assert voice_agent._get_glm_key() == "key-c"
+        # 循环回到第一个
+        assert voice_agent._rotate_glm_key() is True
+        assert voice_agent._get_glm_key() == "key-a"
+
+    def test_rotate_wraps_around(self):
+        """密钥轮换循环"""
+        voice_agent._glm_keys = ["key-1", "key-2"]
+        voice_agent._glm_key_idx = 0
+        voice_agent._rotate_glm_key()  # -> 1
+        assert voice_agent._glm_key_idx == 1
+        voice_agent._rotate_glm_key()  # -> 0 (wrap)
+        assert voice_agent._glm_key_idx == 0
+
+
 class TestContextManagement:
     """测试对话上下文管理(token感知截断)"""
 

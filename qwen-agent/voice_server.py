@@ -25,8 +25,32 @@ import requests
 import fcntl
 from pydantic import BaseModel, Field, field_validator
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("magic")
+# ===== 结构化日志(JSON或文本格式, 通过LOG_FORMAT环境变量控制) =====
+import logging as _logging
+LOG_FORMAT = os.getenv("LOG_FORMAT", "text")  # "text" 或 "json"
+
+class JsonFormatter(_logging.Formatter):
+    """JSON格式日志(便于日志聚合系统收集)"""
+    def format(self, record):
+        import json as _j
+        entry = {
+            "ts": _logging.Formatter.formatTime(self, record),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+            "module": record.module,
+            "line": record.lineno,
+        }
+        if record.exc_info and record.exc_info[1]:
+            entry["exception"] = str(record.exc_info[1])[:200]
+        return _j.dumps(entry, ensure_ascii=False)
+
+if LOG_FORMAT == "json":
+    _handler = _logging.StreamHandler()
+    _handler.setFormatter(JsonFormatter())
+    _logging.basicConfig(level=_logging.INFO, handlers=[_handler])
+else:
+    _logging.basicConfig(level=_logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = _logging.getLogger("magic")
 
 # ===== 请求指标追踪 =====
 class Metrics:
@@ -669,7 +693,7 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
 @app.post("/api/chat/stream")
 async def chat_stream_api(req: ChatRequest):
     """流式文字对话: 文字进 → 大脑逐句产出 → TTS批量推送(SSE)"""
-    text = req.message
+    text = _sanitize_text(req.message, MAX_TEXT_LENGTH)
     session_id = req.session_id
     log.info(f"/api/chat/stream 流式对话: {text[:40]} (session={session_id[:8]})")
     return StreamingResponse(_stream_brain_tts(text, session_id=session_id), media_type="text/event-stream",
@@ -702,7 +726,7 @@ async def voice_stream_api(file: UploadFile = File(...), session_id: str = "defa
 
 @app.post("/api/chat")
 async def chat_api(req: ChatRequest):
-    text = req.message
+    text = _sanitize_text(req.message, MAX_TEXT_LENGTH)
     from voice_agent import brain
     try:
         reply = await asyncio.wait_for(
@@ -757,8 +781,8 @@ async def list_reminders():
 
 @app.post("/api/reminders")
 async def add_reminder(req: ReminderRequest):
-    text = req.text.strip()
-    time_str = req.time.strip()
+    text = _sanitize_text(req.text, 200)
+    time_str = _sanitize_text(req.time, 50)
     # 复用共享时间解析工具
     due = None
     if time_str:
@@ -810,7 +834,7 @@ async def get_conversation(page: int = 1, limit: int = 50, session_id: str = "de
 @app.post("/api/tts")
 async def tts_api(req: TTSRequest):
     """文字 → 语音(MP3)"""
-    text = req.text
+    text = _sanitize_text(req.text, MAX_TEXT_LENGTH)
     from voice_agent import tts
     try:
         audio = await asyncio.wait_for(
@@ -845,7 +869,7 @@ async def export_conversation(format: str = "txt"):
     
     if format == "json":
         import json as _j
-        return Response(content=_j.dumps(_history, ensure_ascii=False, indent=2).encode("utf-8"),
+        return Response(content=_j.dumps(hist, ensure_ascii=False, indent=2).encode("utf-8"),
                        media_type="application/json",
                        headers={"Content-Disposition": "attachment; filename=conversation.json"})
     
@@ -854,14 +878,14 @@ async def export_conversation(format: str = "txt"):
         for m in _history:
             role = "🙋 我" if m.get("role") == "user" else "🤖 魔幻手机"
             lines.append(f"### {role}\n\n{m.get('content', '')}\n")
-        lines.append(f"\n---\n*共{len(_history)}条消息 · {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}导出*")
+        lines.append(f"\n---\n*共{len(hist)}条消息 · {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}导出*")
         text = "\n".join(lines)
         return Response(content=text.encode("utf-8"), media_type="text/markdown",
                        headers={"Content-Disposition": "attachment; filename=conversation.md"})
     
     # 默认txt格式
     lines = []
-    for m in _history:
+    for m in hist:
         role = "我" if m.get("role") == "user" else "魔幻手机"
         lines.append(f"[{role}] {m.get('content', '')}")
     text = "\n\n".join(lines)
@@ -905,6 +929,24 @@ async def sse_events():
                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 
+
+# ===== 输入清洗(防XSS/注入) =====
+def _sanitize_text(text: str, max_len: int = 500) -> str:
+    """清洗用户输入: 去除HTML标签、脚本、控制字符"""
+    if not text:
+        return ""
+    import re as _re
+    # 截断超长输入
+    text = text[:max_len]
+    # 去除HTML标签
+    text = _re.sub(r'<[^>]+>', '', text)
+    # 去除脚本相关内容
+    text = _re.sub(r'javascript:', '', text, flags=_re.IGNORECASE)
+    text = _re.sub(r'on\w+\s*=', '', text, flags=_re.IGNORECASE)
+    # 去除控制字符(保留换行和制表符)
+    text = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # 去除首尾空白
+    return text.strip()
 
 # ===== WebSocket 双向通信(实时语音/文字, 支持打断TTS) =====
 _ws_clients = {}  # {ws_id: {"ws": ws, "interrupt": False, "last_active": time.time()}}

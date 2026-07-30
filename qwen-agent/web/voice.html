@@ -33,6 +33,10 @@ font-size:14px;user-select:none;touch-action:none}
 #autobtn{padding:10px 18px;border:2px solid #4e9;border-radius:28px;background:rgba(78,255,153,.1);
 color:#4e9;font-size:13px;cursor:pointer;user-select:none}
 #autobtn.off{border-color:#555;color:#555;background:transparent}
+#wakebtn{padding:10px 18px;border:2px solid #f5a623;border-radius:28px;background:rgba(245,166,35,.1);color:#f5a623;font-size:13px;cursor:pointer;user-select:none}
+#wakebtn.off{border-color:#555;color:#555;background:transparent}
+#wakebtn.active{animation:wk 1.5s infinite}
+@keyframes wk{0%,100%{box-shadow:0 0 0 rgba(245,166,35,0)}50%{box-shadow:0 0 12px rgba(245,166,35,.5)}}
 #conv{width:90%;max-width:520px;max-height:24vh;overflow-y:auto;background:rgba(255,255,255,.04);
 border-radius:12px;padding:10px}
 .msg{margin:5px 0;padding:7px 11px;border-radius:10px;font-size:13px;line-height:1.5;word-break:break-word}
@@ -65,7 +69,7 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 <div id="volwrap"><div id="volbarbg"><div id="volbar"></div></div></div>
 <div id="volnum">音量 0.0</div>
 <div id="controls">
-<button id="stopbtn" onclick="interruptTTS()" style="padding:10px 18px;border:2px solid #f5a623;border-radius:28px;background:rgba(245,166,35,.1);color:#f5a623;font-size:13px;cursor:pointer;display:none">⏹️打断</button><button id="autobtn" onclick="toggleAuto()">自动监听 ON</button>
+<button id="stopbtn" onclick="interruptTTS()" style="padding:10px 18px;border:2px solid #f5a623;border-radius:28px;background:rgba(245,166,35,.1);color:#f5a623;font-size:13px;cursor:pointer;display:none">⏹️打断</button><button id="wakebtn" class="off" onclick="toggleWake()">唤醒词 OFF</button><button id="autobtn" onclick="toggleAuto()">自动监听 ON</button>
 <button id="holdbtn" onmousedown="holdStart()" onmouseup="holdEnd()" onmouseleave="holdEnd()" ontouchstart="holdStart()" ontouchend="holdEnd()">按住说话</button>
 </div>
 <div id="conv"></div>
@@ -319,6 +323,62 @@ function copyTunnelURL(){
   navigator.clipboard.writeText('https://'+url).then(()=>{
     el.innerHTML+=' \u2705\u5DF2\u590D\u5236';setTimeout(loadTunnelURL,2000);
   });
+}
+// ===== 唤醒词检测(魔幻手机) =====
+let wakeMode=false,wakeRec=null;
+const WAKE_WORDS=["魔幻手机","magic phone","magicphone","魔法手机"];
+function toggleWake(){
+  wakeMode=!wakeMode;
+  const btn=document.getElementById('wakebtn');
+  if(wakeMode){
+    btn.textContent='唤醒词 ON';btn.className='active';
+    if(!mic){diag.textContent='⚠️ 请先点击球授权麦克风';wakeMode=false;btn.textContent='唤醒词 OFF';btn.className='off';return;}
+    startWakeListener();
+    diag.textContent='🎤 唤醒词已开启,说"魔幻手机"激活对话';
+  }else{
+    btn.textContent='唤醒词 OFF';btn.className='off';
+    stopWakeListener();
+    diag.textContent='🎤 唤醒词已关闭';
+  }
+}
+function startWakeListener(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){diag.textContent='⚠️ 浏览器不支持语音识别,请用Chrome';wakeMode=false;return;}
+  wakeRec=new SR();
+  wakeRec.lang='zh-CN';wakeRec.continuous=true;wakeRec.interimResults=true;
+  wakeRec.onresult=function(e){
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const t=e.results[i][0].transcript.toLowerCase().trim();
+      // 检测唤醒词
+      for(const w of WAKE_WORDS){
+        if(t.includes(w.toLowerCase())){
+          // 唤醒成功!
+          stopWakeListener();
+          diag.textContent='✅ 唤醒成功! 正在聆听...';
+          setState('listening','👂','唤醒中...');
+          // 如果自动监听关闭,临时启动一次录音
+          if(!autoListen){startAutoRecord();}
+          // 唤醒后3秒自动恢复监听
+          setTimeout(()=>{if(wakeMode)startWakeListener();},3000);
+          return;
+        }
+      }
+    }
+  };
+  wakeRec.onerror=function(e){
+    if(e.error==='no-speech')return; // 无语音,继续
+    if(e.error==='aborted')return;   // 手动停止
+    log_err('wake error:'+e.error);
+    setTimeout(()=>{if(wakeMode)startWakeListener();},1000);
+  };
+  wakeRec.onend=function(){
+    // 自动重启(浏览器会因静默停止)
+    if(wakeMode)setTimeout(()=>{try{wakeRec.start();}catch(e){}},200);
+  };
+  try{wakeRec.start();}catch(e){}
+}
+function stopWakeListener(){
+  if(wakeRec){try{wakeRec.onend=null;wakeRec.stop();wakeRec=null;}catch(e){}}
 }
 // 心跳保活
 setInterval(()=>{if(wsReady&&wsConn&&wsConn.readyState===1)wsConn.send(JSON.stringify({type:'ping'}));},30000);

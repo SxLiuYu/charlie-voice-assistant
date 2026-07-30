@@ -190,6 +190,76 @@ class TestTTS:
         assert r.content == b"fake_mp3_data"
 
 
+class TestInputSanitization:
+    """输入清洗测试(防XSS)"""
+
+    def test_sanitize_strips_html(self, client):
+        """HTML标签被去除(内容保留为纯文本)"""
+        import voice_server
+        result = voice_server._sanitize_text("<script>alert(1)</script>你好")
+        assert "<script>" not in result  # 标签被去除
+        assert "</script>" not in result
+        assert "你好" in result  # 正常文本保留
+
+    def test_sanitize_strips_javascript(self, client):
+        """javascript:协议被去除"""
+        import voice_server
+        result = voice_server._sanitize_text("javascript:alert(1) 点击这里")
+        assert "javascript:" not in result.lower()
+
+    def test_sanitize_strips_event_handlers(self, client):
+        """事件处理器被去除"""
+        import voice_server
+        result = voice_server._sanitize_text('<div onclick="evil()">test</div>正常文字')
+        assert "onclick" not in result.lower()
+        assert "正常文字" in result
+
+    def test_sanitize_strips_control_chars(self, client):
+        """控制字符被去除"""
+        import voice_server
+        result = voice_server._sanitize_text("hello\x00\x01world")
+        assert "\x00" not in result
+        assert "hello" in result
+
+    def test_sanitize_preserves_normal_text(self, client):
+        """正常文本不被修改"""
+        import voice_server
+        result = voice_server._sanitize_text("你好，今天天气怎么样？")
+        assert result == "你好，今天天气怎么样？"
+
+    def test_sanitize_truncates_long_input(self, client):
+        """超长输入被截断"""
+        import voice_server
+        result = voice_server._sanitize_text("x" * 1000, max_len=100)
+        assert len(result) <= 100
+
+
+class TestExport:
+    """对话导出测试"""
+
+    def test_export_txt(self, client):
+        r = client.get("/api/export?format=txt")
+        assert r.status_code == 200
+
+    def test_export_markdown(self, client):
+        r = client.get("/api/export?format=markdown")
+        assert r.status_code == 200
+
+    def test_export_json(self, client):
+        r = client.get("/api/export?format=json")
+        assert r.status_code == 200
+
+    def test_export_with_session(self, client):
+        """按会话导出"""
+        r = client.get("/api/export?session_id=test_export_session")
+        assert r.status_code == 200
+
+    def test_export_with_date_filter(self, client):
+        """带日期过滤的导出"""
+        r = client.get("/api/export?from_date=2026-01-01&to_date=2026-12-31")
+        assert r.status_code == 200
+
+
 class TestSessions:
     """多用户会话监控API"""
 
