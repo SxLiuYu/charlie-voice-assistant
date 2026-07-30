@@ -66,6 +66,9 @@ python https_server.py           # https://sxliuyudeMac-mini.local:8443
 pkill -9 -f "voice_server\|https_server"; sleep 2
 screen -dmS voice bash -c 'source .venv/bin/activate && python voice_server.py'
 screen -dmS voice-https bash -c 'source .venv/bin/activate && python https_server.py'
+
+# 启动看门狗(60秒健康检查+自动重启+日志轮转)
+screen -dmS watchdog bash watchdog.sh
 ```
 
 ## API 端点 (12个, Swagger文档: /docs)
@@ -139,6 +142,9 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 - ✅ MP3压缩: WAV→MP3(32kbps), 8-10x更小, 减少网络传输
 - ✅ 通知队列: 主动通知(提醒/天气/晨报)存入队列, Web客户端15s轮询获取
 - ✅ 动态上下文: 系统提示词含今日待办数, 大脑知道用户日程
+- ✅ 响应缓存: 60s TTL, 重复查询170x加速(2.6s→0.015s)
+- ✅ 自动重启: 看门狗60s检查, 服务挂了自动重启
+- ✅ 日志轮转: >10MB自动截断5000行, 防止无限增长
 
 ## 关键文件
 | 文件 | 说明 |
