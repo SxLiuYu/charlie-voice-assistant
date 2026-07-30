@@ -156,6 +156,13 @@ def _check_rate(ip: str, bucket_type: str, limit: int) -> tuple:
     """检查速率, 返回(allowed, remaining, retry_after)"""
     import time as _t
     now = _t.time()
+    # 定期清理过期IP桶(防内存泄漏, 每5分钟)
+    if len(_rate_buckets) > 1000:
+        expired = [k for k, v in _rate_buckets.items()
+                   if all(not v.get(bt) or now - v[bt][-1] > _RATE_WINDOW
+                          for bt in ("voice", "general"))]
+        for k in expired:
+            del _rate_buckets[k]
     if ip not in _rate_buckets:
         _rate_buckets[ip] = {}
     bucket = _rate_buckets[ip].setdefault(bucket_type, [])
@@ -166,6 +173,10 @@ def _check_rate(ip: str, bucket_type: str, limit: int) -> tuple:
         return False, 0, retry_after
     bucket.append(now)
     return True, limit - len(bucket), 0
+
+def _ws_client_count() -> int:
+    """当前活跃WebSocket连接数"""
+    return len(_ws_clients)
 
 # 请求日志中间件
 @app.middleware("http")
@@ -722,6 +733,12 @@ async def system_status():
         "reminders_pending": len([r for r in _load_reminders() if not r.get("done")]),
         "brain_ready": _brain_is_warm(),
         "brain_health": _get_brain_health(),
+        "websocket_connections": _ws_client_count(),
+        "rate_limit": {
+            "tracked_ips": len(_rate_buckets),
+            "general_limit": _RATE_GENERAL,
+            "voice_limit": _RATE_VOICE,
+        },
     }
 
 @app.get("/api/reminders")
@@ -1194,6 +1211,13 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 <div class="metric"><span>对话</span><span class="val">/api/chat /api/chat/stream</span></div>
 <div class="metric"><span>提醒/搜索</span><span class="val">/api/reminders /api/search /api/export</span></div>
 <div class="metric"><span>实时/系统</span><span class="val">/api/events /api/metrics /api/status</span></div>
+<div class="metric"><span>WebSocket</span><span class="val">/ws (双向通信)</span></div>
+</div>
+<div class="card"><h3>🔌 实时连接</h3>
+<div class="metric"><span>WebSocket</span><span class="val">{len(_ws_clients)} 个连接</span></div>
+<div class="metric"><span>SSE通知</span><span class="val">{len(_sse_clients)} 个连接</span></div>
+<div class="metric"><span>限流IP</span><span class="val">{len(_rate_buckets)} 个</span></div>
+<div class="metric"><span>限流策略</span><span class="val">普通{_RATE_GENERAL}/min 语音{_RATE_VOICE}/min</span></div>
 </div>
 <div class="card"><h3>📊 请求指标</h3>
 <div class="metric"><span>总请求</span><span class="val">{m["total_requests"]}</span></div>
