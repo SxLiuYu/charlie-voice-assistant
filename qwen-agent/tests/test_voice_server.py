@@ -143,6 +143,33 @@ class TestSearch:
         assert "results" in data
 
 
+    def test_search_relevance_scoring(self, client):
+        """搜索结果包含相关性评分"""
+        r = client.get("/api/search?q=test")
+        assert r.status_code == 200
+        data = r.json()
+        assert "total" in data
+        assert "offset" in data
+        for result in data.get("results", []):
+            assert "score" in result
+
+    def test_search_pagination(self, client):
+        """搜索分页"""
+        r = client.get("/api/search?q=test&limit=5&offset=0")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["limit"] == 5
+        assert data["offset"] == 0
+        assert len(data["results"]) <= 5
+
+    def test_search_highlight(self, client):
+        """搜索结果包含context字段"""
+        r = client.get("/api/search?q=test")
+        assert r.status_code == 200
+        data = r.json()
+        for result in data.get("results", []):
+            assert isinstance(result.get("context", ""), str)
+
 class TestChat:
     """文字对话API(使用mock)"""
 
