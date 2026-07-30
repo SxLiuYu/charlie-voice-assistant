@@ -13,7 +13,7 @@ h1{font-size:24px;margin-bottom:4px;background:linear-gradient(90deg,#e94560,#f5
 -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .sub{color:#888;margin-bottom:14px;font-size:12px}
 #diag{width:90%;max-width:480px;background:rgba(0,0,0,.3);border-radius:10px;padding:10px;
-margin-bottom:12px;font-size:12px;line-height:1.6;max-height:100px;overflow-y:auto;color:#8f8}
+margin-bottom:12px;font-size:12px;line-height:1.6;max-height:80px;overflow-y:auto;color:#8f8}
 #orb{width:120px;height:120px;border-radius:50%;background:radial-gradient(circle,#e94560,#302b63);
 box-shadow:0 0 36px rgba(233,69,96,.45);transition:box-shadow .3s;margin-bottom:12px;
 display:flex;align-items:center;justify-content:center;font-size:40px;cursor:pointer}
@@ -29,32 +29,32 @@ display:flex;align-items:center;justify-content:center;font-size:40px;cursor:poi
 #holdbtn{padding:12px 30px;border:2px solid #e94560;border-radius:28px;background:transparent;color:#e94560;
 font-size:14px;margin-bottom:10px;user-select:none;touch-action:none}
 #holdbtn:active{background:rgba(233,69,96,.2)}
-#conv{width:90%;max-width:520px;max-height:22vh;overflow-y:auto;background:rgba(255,255,255,.04);
+#conv{width:90%;max-width:520px;max-height:24vh;overflow-y:auto;background:rgba(255,255,255,.04);
 border-radius:12px;padding:10px}
 .msg{margin:5px 0;padding:7px 11px;border-radius:10px;font-size:13px;line-height:1.5;word-break:break-word}
 .msg.u{background:rgba(233,69,96,.15);text-align:right}
 .msg.b{background:rgba(100,200,255,.12)}
+.msg.b.streaming{border-left:2px solid #64c8ff;animation:flash 1s ease-out}
+@keyframes flash{0%{background:rgba(100,200,255,.25)}100%{background:rgba(100,200,255,.12)}}
 .msg.sys{color:#666;font-style:italic;font-size:12px}
 #textinput{display:flex;gap:8px;width:90%;max-width:520px;margin-top:8px;margin-bottom:12px}
 #textinput input{flex:1;padding:10px 14px;border-radius:20px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:14px}
 #textinput button{padding:10px 18px;border:none;border-radius:20px;background:#e94560;color:#fff;font-size:14px;cursor:pointer}
-/* 提醒面板 */
 #rempanel{width:90%;max-width:520px;margin-top:8px}
 #rempanel h3{color:#f5a623;font-size:14px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
 #rempanel h3 span{font-size:11px;color:#666;cursor:pointer}
-#remlist{max-height:180px;overflow-y:auto;margin-bottom:8px}
+#remlist{max-height:160px;overflow-y:auto;margin-bottom:8px}
 .remitem{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;margin:4px 0;
 background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
-.remitem .rtxt{flex:1}
-.remitem .rtime{color:#888;font-size:11px;margin-left:8px}
+.remitem .rtxt{flex:1}.remitem .rtime{color:#888;font-size:11px;margin-left:8px}
 .remitem .rdel{color:#e94560;cursor:pointer;font-size:16px;margin-left:8px;flex-shrink:0}
 .remitem.done{opacity:.4;text-decoration:line-through}
 #remadd{display:flex;gap:6px;margin-top:6px}
 #remadd input{flex:1;padding:8px 12px;border-radius:16px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:13px}
 #remadd button{padding:8px 14px;border:none;border-radius:16px;background:#f5a623;color:#222;font-size:13px;cursor:pointer}
 </style></head><body>
-<h1>魔幻手机</h1><div class="sub">自动监听 · 或按住按钮说话 · 提醒自动播报</div>
-<div id="diag">📡 诊断：点击下方球，开始检测麦克风…</div>
+<h1>魔幻手机</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
+<div id="diag">📡 点击下方球，授权麦克风开始…</div>
 <div id="orb" onclick="init()">🎙️</div>
 <div id="status">点击球授权麦克风</div>
 <div id="volwrap"><div id="volbarbg"><div id="volbar"></div></div></div>
@@ -62,209 +62,175 @@ background:rgba(255,255,255,.05);border-radius:8px;font-size:13px}
 <button id="holdbtn" onmousedown="holdStart()" onmouseup="holdEnd()" onmouseleave="holdEnd()" ontouchstart="holdStart()" ontouchend="holdEnd()">按住说话</button>
 <div id="conv"></div>
 <div id="textinput">
-<input id="msginput" placeholder="麦克风不行就打字… 调6个MCP大脑">
+<input id="msginput" placeholder="打字也行… 6个MCP大脑流式回复">
 <button onclick="sendText()">发送</button>
-<button onclick="resetChat()" style="background:#4CAF50;color:#fff;padding:10px 14px;border:none;border-radius:20px;font-size:14px;cursor:pointer">新对话</button>
+<button onclick="resetChat()" style="background:#4CAF50;color:#fff;padding:10px 14px;border:none;border-radius:20px;font-size:14px;cursor:pointer">重置</button>
 </div>
-<div id="rempanel">
-<h3>⏰ 提醒 <span onclick="loadRems()">🔄刷新</span></h3>
-<div id="remlist">加载中…</div>
-<div id="remadd">
-<input id="remtext" placeholder="提醒内容，如：取快递">
-<input id="remtime" placeholder="时间，如：30分钟后" style="flex:0.5">
-<button onclick="addRem()">添加</button>
-</div>
-</div>
+<div id="rempanel"><h3>⏰ 提醒 <span onclick="loadRems()">刷新</span></h3><div id="remlist"></div>
+<div id="remadd"><input id="remtext" placeholder="提醒内容…"><input id="remtime" placeholder="时间(如明天9点)" style="max-width:120px"><button onclick="addRem()">+</button></div></div>
 <script>
-const orb=document.getElementById('orb'),st=document.getElementById('status'),conv=document.getElementById('conv'),
-  vbar=document.getElementById('volbar'),vnum=document.getElementById('volnum'),holdbtn=document.getElementById('holdbtn'),diag=document.getElementById('diag');
-let ctx,analyzer,mic,rec,chunks=[],state='pre',silenceT=null,peakVol=0,recStart=0,quietT=0;
-const START=6,STOP_MS=1200,MIN_DUR=500;
-function log(m){diag.innerHTML='📡 '+m;console.log(m);}
-function addMsg(t,c){const d=document.createElement('div');d.className='msg '+t;d.textContent=c;conv.appendChild(d);conv.scrollTop=conv.scrollHeight;}
-function setState(s,icon,txt){state=s;orb.className=s;orb.textContent=icon||'🎙️';st.textContent=txt;}
-async function init(){
-  log('检测 navigator.mediaDevices…');
-  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){log('❌ 当前非安全上下文(可能用了IP而非localhost)，麦克风不可用！请用 http://localhost:8000 访问');st.textContent='错误：用localhost访问';return;}
-  log('请求麦克风权限(AirPods)…');
-  try{mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});}
-  catch(e){
-    let hint='未知错误';
-    if(e.name==='NotAllowedError'||e.name==='PermissionDeniedError')hint='❌ 麦克风被拒绝！系统设置→隐私与安全性→麦克风→打开浏览器';
-    else if(e.name==='NotFoundError')hint='❌ 没找到麦克风设备';
-    else if(e.name==='NotReadableError')hint='❌ 麦克风被其他程序占用';
-    else hint='❌ '+e.name+': '+e.message;
-    log(hint);st.textContent='麦克风失败，可打字交流';return;
+const st=document.getElementById('status'),diag=document.getElementById('diag'),conv=document.getElementById('conv');
+const orb=document.getElementById('orb'),volbar=document.getElementById('volbar'),volnum=document.getElementById('volnum');
+let mic=false,rec,state='idle',peakVol=0,recStart=0,streamingMsg=null;
+
+function setState(s,icon,txt){state=s;orb.textContent=icon;orb.className=s;st.textContent=txt;}
+function addMsg(cls,txt){const d=document.createElement('div');d.className='msg '+cls;d.textContent=txt;conv.appendChild(d);conv.scrollTop=conv.scrollHeight;return d;}
+function addReplyChunk(txt){
+  if(!streamingMsg){streamingMsg=addMsg('b streaming','');}
+  streamingMsg.textContent+=txt;
+  conv.scrollTop=conv.scrollHeight;
+}
+function finishReply(){if(streamingMsg){streamingMsg.classList.remove('streaming');streamingMsg=null;}}
+
+// ===== 音频队列(顺序播放) =====
+let audioQueue=[],isPlaying=false;
+function enqueueAudio(b64mp3){
+  const blob=base64ToBlob(b64mp3,'audio/mpeg');
+  audioQueue.push(blob);
+  if(!isPlaying)playNextAudio();
+}
+function playNextAudio(){
+  if(audioQueue.length===0){isPlaying=false;setState('idle','🎙️','在听…');return;}
+  isPlaying=true;setState('speaking','🔊','朗读中…');
+  const blob=audioQueue.shift();
+  const audio=new Audio(URL.createObjectURL(blob));
+  audio.onended=playNextAudio;
+  audio.onerror=playNextAudio;
+  audio.play().catch(()=>{setState('idle','🎙️','在听…');isPlaying=false;});
+}
+function base64ToBlob(b64,mime){const bin=atob(b64);const arr=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i);return new Blob([arr],{type:mime});}
+
+// ===== SSE流解析 =====
+async function streamSSE(response, onEvent){
+  const reader=response.body.getReader();
+  const decoder=new TextDecoder();
+  let buffer='';
+  while(true){
+    const{done,value}=await reader.read();
+    if(done)break;
+    buffer+=decoder.decode(value,{stream:true});
+    const lines=buffer.split('\n');
+    buffer=lines.pop();
+    for(const line of lines){
+      if(line.startsWith('data: ')){
+        try{onEvent(JSON.parse(line.slice(6)));}catch(e){}
+      }
+    }
   }
-  const trk=mic.getAudioTracks()[0];
-  if(trk.muted){log('⚠️ 麦克风被系统静音(track.muted=true)！系统设置→隐私与安全性→麦克风→打开浏览器→退出重开');st.textContent='麦克风被静音，可打字';}
-  else{log('✅ 麦克风已连接: '+(trk.label||'默认设备'));}
-  ctx=new(window.AudioContext||window.webkitAudioContext)();
-  if(ctx.state==='suspended')await ctx.resume();
-  const src=ctx.createMediaStreamSource(mic);
-  analyzer=ctx.createAnalyser();analyzer.fftSize=1024;src.connect(analyzer);
-  setState('idle','🎙️','在听…说话或按住按钮');
-  monitor();
 }
-function vol(){const a=new Uint8Array(analyzer.frequencyBinCount);analyzer.getByteTimeDomainData(a);
-  let s=0;for(let i=0;i<a.length;i++){const v=(a[i]-128)/128;s+=v*v;}return Math.sqrt(s/a.length)*100;}
-function monitor(){
-  const v=vol();
-  vbar.style.width=Math.min(100,v*4)+'%';
-  vnum.textContent='音量 '+v.toFixed(1)+(state==='listening'?' 🔴':'');
-  if(state==='idle'){
-    if(v>START){setState('listening','👂','聆听中…');peakVol=v;recStart=Date.now();startRec();quietT=0;}
-  } else if(state==='listening'){
-    peakVol=Math.max(peakVol,v);
-    if(v<Math.max(2,peakVol*0.3)){if(!silenceT)silenceT=setTimeout(()=>stopSend(),STOP_MS);}
-    else if(silenceT){clearTimeout(silenceT);silenceT=null;}
-  }
-  if(state==='idle'&&v<0.5){quietT++;if(quietT>300)log('⚠️ 一直没声音，检查AirPods是否连着');}
-  if(state!=='speaking')requestAnimationFrame(monitor);
-  else setTimeout(()=>{if(state==='speaking')requestAnimationFrame(monitor);},100);
-}
-function startRec(){chunks=[];try{rec=new MediaRecorder(mic);}catch(e){log('录音不支持:'+e.message);return;}
-  rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};rec.start();}
-async function stopSend(){
-  if(silenceT){clearTimeout(silenceT);silenceT=null;}
-  if(!rec||rec.state==='inactive'){setState('idle','🎙️','在听…');return;}
-  rec.onstop=async()=>{
-    const dur=Date.now()-recStart;
-    const blob=new Blob(chunks,{type:'audio/webm'});
-    log('录到 '+blob.size+'字节 / '+(dur/1000).toFixed(1)+'秒');
-    if(blob.size<2500||dur<MIN_DUR){addMsg('sys','(没听清，再说一次)');setState('idle','🎙️','在听…');return;}
-    setState('thinking','👂','语音识别中…');
-    const fd=new FormData();fd.append('file',blob,'speech.webm');
-    const ctrl=new AbortController();const to=setTimeout(()=>ctrl.abort(),90000);
-    try{
-      // 1. ASR先返回文字(1-2秒)
-      const ar=await fetch('/api/asr',{method:'POST',body:fd,signal:ctrl.signal});
-      if(!ar.ok){st.textContent='ASR错误:'+ar.status;setState('idle','🎙️','在听…');return;}
-      const ad=await ar.json();
-      const text=ad.text||'(未识别到语音)';
-      addMsg('u',text);
-      // 2. 大脑思考(2-8秒)
-      setState('thinking','🧠','思考中(调MCP)…');
-      const cr=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({message:text}),signal:ctrl.signal});
-      const cd=await cr.json();
-      const reply=cd.reply||'无回复';
-      addMsg('b',reply);
-      // 3. TTS语音(1-3秒)
-      setState('speaking','🔊','朗读中…');
-      const tr=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({text:reply}),signal:ctrl.signal});clearTimeout(to);
-      if(tr.ok){
-        const buf=await tr.arrayBuffer();
-        const au=new Audio(URL.createObjectURL(new Blob([buf],{type:'audio/mpeg'})));
-        au.onended=()=>{setState('idle','🎙️','在听…');requestAnimationFrame(monitor);};
-        au.onerror=()=>setState('idle','🎙️','在听…');
-        await au.play().catch(()=>setState('idle','🎙️','在听…'));
-      }else{setState('idle','🎙️','在听…');requestAnimationFrame(monitor);}
-    }catch(e){clearTimeout(to);const msg=e.name==='AbortError'?'超时':'网络错误:'+e.message;st.textContent=msg;addMsg('sys','('+msg+'，再说一次)');setState('idle','🎙️','在听…');}
-  };rec.stop();
-}
-function holdStart(){if(state!=='idle'||!mic)return;setState('listening','👂','聆听中…');peakVol=vol();recStart=Date.now();startRec();}
-function holdEnd(){if(state==='listening')stopSend();}
+
+// ===== 流式文字对话 =====
 async function sendText(){
   const m=document.getElementById('msginput').value.trim();if(!m)return;
   document.getElementById('msginput').value='';addMsg('u',m);
-  setState('thinking','🧠','思考中(调MCP)…');
+  setState('thinking','🧠','思考中(流式)…');
+  streamingMsg=null;
   try{
-    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});
-    const d=await r.json();const reply=d.reply||'无回复';
-    addMsg('b',reply);
-    setState('speaking','🔊','朗读中…');
-    // 异步获取TTS语音播放
-    try{
-      const tr=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:reply})});
-      if(tr.ok){
-        const buf=await tr.arrayBuffer();
-        const au=new Audio(URL.createObjectURL(new Blob([buf],{type:'audio/mpeg'})));
-        au.onended=()=>setState('idle','🎙️','在听…');
-        await au.play().catch(()=>setState('idle','🎙️','在听…'));
-      }else{setState('idle','🎙️','在听…');}
-    }catch(e){setState('idle','🎙️','在听…');}
+    const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});
+    if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
+    await streamSSE(r,handleStreamEvent);
   }catch(e){st.textContent='网络错误';setState('idle','🎙️','在听…');}
 }
+function handleStreamEvent(data){
+  switch(data.type){
+    case'text':addReplyChunk(data.text);break;
+    case'audio':enqueueAudio(data.audio);break;
+    case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','思考中(流式)…');break;
+    case'done':finishReply();if(!isPlaying&&audioQueue.length===0)setState('idle','🎙️','在听…');break;
+    case'error':addMsg('sys','⚠️ '+(data.message||'错误'));setState('idle','🎙️','在听…');break;
+  }
+}
 document.getElementById('msginput').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
+
+// ===== 麦克风初始化 + 自动监听 =====
+async function init(){
+  if(mic)return;
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});
+    mic=true;diag.textContent='✅ 麦克风就绪';
+    const ctx=new(window.AudioContext||window.webkitAudioContext)();
+    const src=ctx.createMediaStreamSource(s);
+    const an=ctx.createAnalyser();an.fftSize=512;an.smoothingTimeConstant=0.6;
+    src.connect(an);
+    function upd(){
+      const d=new Uint8Array(an.frequencyBinCount);an.getByteFrequencyData(d);
+      let v=0;for(let i=0;i<d.length;i++)v+=d[i];v=v/d.length/255*3;
+      volbar.style.width=Math.min(100,v*40)+'%';volnum.textContent='音量 '+v.toFixed(1);
+      if(state==='idle'&&v>0.8)setState('listening','👂','检测到声音…');
+      if(state==='listening'&&v<0.3){volbar.style.width='0%';volnum.textContent='音量 0.0';}
+      requestAnimationFrame(upd);
+    }upd();setState('idle','🎙️','在听… 自动监听中');
+  }catch(e){diag.textContent='❌ 麦克风错误:'+e.message+' — 可用打字';}
+}
+// ===== 录音+流式发送 =====
+function startRec(){
+  if(!mic)return;
+  rec=new MediaRecorder(mic?navigator.mediaDevices.stream:null,{mimeType:'audio/webm'});
+  // 重新获取stream用于录制
+  navigator.mediaDevices.getUserMedia({audio:true}).then(s=>{
+    const chunks=[];rec=new MediaRecorder(s,{mimeType:'audio/webm'});
+    rec.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
+    rec.onstop=async()=>{
+      const dur=Date.now()-recStart;
+      if(dur<500){setState('idle','🎙️','在听…');return;}
+      const blob=new Blob(chunks,{type:'audio/webm'});
+      diag.textContent='📤 发送语音('+blob.size+'字节)…';
+      setState('thinking','🧠','识别+思考中(流式)…');
+      streamingMsg=null;
+      try{
+        const fd=new FormData();fd.append('file',blob,'audio.webm');
+        const r=await fetch('/api/voice/stream',{method:'POST',body:fd});
+        if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
+        await streamSSE(r,handleStreamEvent);
+      }catch(e){st.textContent='发送失败:'+e.message;setState('idle','🎙️','在听…');}
+    };
+    rec.start();peakVol=0;recStart=Date.now();
+  });
+}
+function holdStart(){if(state!=='idle'||!mic)return;setState('listening','👂','聆听中…');startRec();}
+function holdEnd(){if(state==='listening'&&rec&&rec.state==='recording')rec.stop();}
+
 // ===== 提醒管理 =====
 async function loadRems(){
-  try{
-    const r=await fetch('/api/reminders');const d=await r.json();
-    const el=document.getElementById('remlist');
-    if(!d.reminders||d.reminders.length===0){el.innerHTML='<div style="color:#666;font-size:13px;padding:8px">暂无提醒</div>';return;}
-    el.innerHTML=d.reminders.map(r=>{
-      const cls=r.done?'remitem done':'remitem';
+  try{const r=await fetch('/api/reminders');const d=await r.json();const el=document.getElementById('remlist');
+    if(!d.reminders||!d.reminders.length){el.innerHTML='<div style="color:#666;font-size:13px;padding:8px">暂无提醒</div>';return;}
+    el.innerHTML=d.reminders.map(r=>{const c=r.done?'remitem done':'remitem';
       const t=r.due?'<span class="rtime">'+r.due.replace('T',' ').slice(0,16)+'</span>':'';
-      return `<div class="${cls}"><span class="rtxt">${r.text}</span>${t}<span class="rdel" onclick="delRem(${r.id})">✓</span></div>`;
+      return '<div class="'+c+'"><span class="rtxt">'+r.text+'</span>'+t+'<span class="rdel" onclick="delRem('+r.id+')">✓</span></div>';
     }).join('');
   }catch(e){document.getElementById('remlist').innerHTML='<div style="color:#e94560">加载失败</div>';}
 }
 async function addRem(){
-  const t=document.getElementById('remtext').value.trim();
-  const tm=document.getElementById('remtime').value.trim();
-  if(!t)return;
-  document.getElementById('remtext').value='';document.getElementById('remtime').value='';
-  try{
-    const r=await fetch('/api/reminders',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:t,time:tm})});
+  const t=document.getElementById('remtext').value.trim();const tm=document.getElementById('remtime').value.trim();
+  if(!t)return;document.getElementById('remtext').value='';document.getElementById('remtime').value='';
+  try{const r=await fetch('/api/reminders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t,time:tm})});
     const d=await r.json();addMsg('sys',d.message||'已添加');loadRems();
   }catch(e){addMsg('sys','添加失败');}
 }
-async function delRem(id){
-  try{await fetch('/api/reminders/'+id,{method:'DELETE'});loadRems();}catch(e){}
-}
+async function delRem(id){try{await fetch('/api/reminders/'+id,{method:'DELETE'});loadRems();}catch(e){}}
 async function resetChat(){
-  try{
-    const r=await fetch('/api/reset',{method:'POST'});
-    const d=await r.json();
-    conv.innerHTML='';
-    addMsg('sys','🔄 '+d.message);
-    setState('idle','🎙️','新对话已开始，在听…');
+  try{const r=await fetch('/api/reset',{method:'POST'});const d=await r.json();
+    conv.innerHTML='';addMsg('sys','🔄 '+d.message);setState('idle','🎙️','新对话，在听…');
   }catch(e){addMsg('sys','重置失败');}
 }
-// 加载历史对话
 async function loadConv(){
-  try{
-    const r=await fetch('/api/conversation');const d=await r.json();
-    if(d.history&&d.history.length>0){
-      d.history.forEach(m=>{if(m.role==='user'||m.role==='assistant')addMsg(m.role==='user'?'u':'b',m.content);});
-      addMsg('sys','📂 已加载'+d.count+'条历史对话');
-    }
-  }catch(e){}
+  try{const r=await fetch('/api/conversation');const d=await r.json();
+    if(d.history&&d.history.length){d.history.forEach(m=>{if(m.role==='user'||m.role==='assistant')addMsg(m.role==='user'?'u':'b',m.content);});
+      addMsg('sys','📂 已加载'+d.count+'条历史');}}catch(e){}
 }
-// SSE实时通知(EventSource, 免轮询)
+// ===== SSE通知 =====
 let evtSource=null;
 function initSSE(){
-  if(evtSource) evtSource.close();
-  try{
-    evtSource=new EventSource('/api/events');
-    evtSource.onmessage=function(e){
-      try{
-        const n=JSON.parse(e.data);
-        if(n.type==='heartbeat'||n.type==='connect')return;
-        const icon=n.type==='weather'?'🌦️':n.type==='morning'?'☀️':n.type==='bedtime'?'🌙':n.type==='health'?'⚠️':'⏰';
-        addMsg('b',icon+' '+n.text);
-        if(window.speechSynthesis){const u=new SpeechSynthesisUtterance(n.text.replace(/[\n#*]/g,' '));u.lang='zh-CN';u.rate=1.05;speechSynthesis.speak(u);}
-      }catch(err){}
-    };
-    evtSource.onerror=function(){ evtSource.close(); setTimeout(initSSE,5000); };
-  }catch(e){ console.log('SSE不支持,回退轮询'); initPolling(); }
+  if(evtSource)evtSource.close();
+  try{evtSource=new EventSource('/api/events');
+    evtSource.onmessage=function(e){try{const n=JSON.parse(e.data);
+      if(n.type==='heartbeat'||n.type==='connect')return;
+      const icon=n.type==='weather'?'🌦️':n.type==='morning'?'☀️':n.type==='bedtime'?'🌙':n.type==='health'?'⚠️':'⏰';
+      addMsg('b',icon+' '+n.text);
+      if(window.speechSynthesis){const u=new SpeechSynthesisUtterance(n.text.replace(/[\n#*]/g,' '));u.lang='zh-CN';u.rate=1.05;speechSynthesis.speak(u);}
+    }catch(err){}};
+    evtSource.onerror=function(){evtSource.close();setTimeout(initSSE,5000);};
+  }catch(e){}
 }
-// 轮询回退(如果SSE不支持)
-function initPolling(){
-  setInterval(async()=>{
-    try{
-      const r=await fetch('/api/notifications');const d=await r.json();
-      if(d.count>0){d.notifications.forEach(n=>{
-        addMsg('b','⏰ '+n.text);
-        if(window.speechSynthesis){const u=new SpeechSynthesisUtterance(n.text.replace(/[\n#*]/g,' '));u.lang='zh-CN';u.rate=1.05;speechSynthesis.speak(u);}
-      });}
-    }catch(e){}
-  },15000);
-}
-// 初始加载
-loadConv();loadRems();initSSE();
-setInterval(loadRems,30000);
+loadConv();loadRems();initSSE();setInterval(loadRems,30000);
 </script></body></html>

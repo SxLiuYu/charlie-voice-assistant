@@ -4,7 +4,7 @@
 连接韧性: Session复用 + 自动重试 + 异常降级
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
 """
-import os, json, base64, requests, datetime, time, logging, asyncio
+import os, json, base64, requests, datetime, time, logging, asyncio, re
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
     from dotenv import load_dotenv; load_dotenv()
@@ -257,6 +257,166 @@ def brain(text: str) -> str:
     _save_history()
     _cache_set(text, reply)
     return reply
+
+
+# ===== 流式大脑: 逐句产出，支持TTS流水线 =====
+import queue as _queue
+_SENTENCE_END = re.compile(r'[。！？；\n]')
+_COMMA_SOFT = re.compile(r'[，,]')
+_MIN_CHUNK = 35  # 逗号处至少积累35字才切割(避免过短TTS碎片)
+_MAX_CHUNK = 80  # 超过80字强制在下一个标点处切割
+
+def _extract_assistant_text(rsp) -> str:
+    """从brain.run()的中间响应中提取assistant文本(累积)"""
+    if not isinstance(rsp, list):
+        return ""
+    for m in reversed(rsp):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c.strip():
+            return c
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("text"):
+                    return part["text"]
+    return ""
+
+def _clean_for_tts(text: str) -> str:
+    """清理文本供TTS使用: 去除markdown符号、表格管道符、引用符等"""
+    import re as _re
+    t = text
+    t = _re.sub(r'\*{1,3}', '', t)          # **粗体** *斜体*
+    t = _re.sub(r'^#{1,6}\s*', '', t)        # # 标题
+    t = _re.sub(r'^>\s*', '', t)             # > 引用
+    t = _re.sub(r'\|', ' ', t)              # 表格管道符
+    t = _re.sub(r'```[\s\S]*?```', '', t)  # 代码块
+    t = _re.sub(r'`[^`]*`', '', t)           # 行内代码
+    t = _re.sub(r'^[-*+]\s+', '', t)        # 列表标记
+    t = _re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', t)  # [text](url) → text
+    t = _re.sub(r'\s{2,}', ' ', t)          # 多余空格
+    return t.strip()
+
+def brain_stream_sentences(text: str):
+    """
+    流式大脑: 逐句yield完整句子，供TTS流水线使用。
+    brain.run()增量产出token → 检测句子边界 → yield完整句。
+    最后更新对话历史+缓存。
+    yield: (sentence:str, full_reply:str)
+    最后一次yield后，full_reply是完整回复。
+    """
+    global _brain, _history
+    # 缓存命中直接返回
+    cached = _cache_get(text)
+    if cached is not None:
+        yield (cached, cached)
+        return
+    _ensure_event_loop()
+    if _brain is None:
+        try:
+            _brain = _build_brain()
+        except Exception as e:
+            log.error(f"流式大脑构建失败: {e}")
+            yield (f"大脑启动失败: {str(e)[:40]}", f"大脑启动失败: {str(e)[:40]}")
+            return
+
+    messages = list(_history) + [{"role": "user", "content": text}]
+    sent_len = 0       # 已yield的字符数
+    full_reply = ""
+
+    try:
+        for rsp in _brain.run(messages):
+            t = _extract_assistant_text(rsp)
+            if not t or len(t) <= sent_len:
+                continue
+            full_reply = t
+            unsent = full_reply[sent_len:]
+            while True:
+                # 优先在句末标点处切割
+                m = _SENTENCE_END.search(unsent)
+                if m:
+                    sentence = unsent[:m.end()].strip()
+                    unsent = unsent[m.end():]
+                    if sentence:
+                        sent_len = len(full_reply) - len(unsent)
+                        yield (_clean_for_tts(sentence), full_reply)
+                    continue
+                # 句末无标点但已积累较长 → 在逗号处软切割
+                if len(unsent) >= _MIN_CHUNK:
+                    cm = _COMMA_SOFT.search(unsent)
+                    if cm:
+                        sentence = unsent[:cm.end()].strip()
+                        unsent = unsent[cm.end():]
+                        if sentence:
+                            sent_len = len(full_reply) - len(unsent)
+                            yield (_clean_for_tts(sentence), full_reply)
+                        continue
+                break
+            sent_len = len(full_reply) - len(unsent)
+    except Exception as e:
+        log.error(f"流式大脑推理异常: {e}")
+        if not full_reply:
+            full_reply = f"抱歉，处理时出错了：{str(e)[:40]}"
+
+    # 剩余文本作为最后一句
+    if full_reply and len(full_reply) > sent_len:
+        remaining = full_reply[sent_len:].strip()
+        if remaining:
+            yield (_clean_for_tts(remaining), full_reply)
+    elif not full_reply:
+        full_reply = "我没听明白"
+        yield (full_reply, full_reply)
+
+    # 更新历史+缓存(与brain()保持一致)
+    _history.append({"role": "user", "content": text})
+    _history.append({"role": "assistant", "content": full_reply})
+    if len(_history) > MAX_HISTORY * 2:
+        _history = _history[-(MAX_HISTORY * 2):]
+    _save_history()
+    _cache_set(text, full_reply)
+
+def tts_to_mp3(text: str) -> bytes:
+    """TTS生成 + WAV转MP3 (供流式端点使用)"""
+    audio = tts(text)
+    if not audio or len(audio) < 100:
+        return b""
+    # 内联wav_to_mp3逻辑(避免循环导入voice_server)
+    import subprocess, tempfile, os as _os
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(audio)
+        inp = f.name
+    out = inp.replace(".wav", ".mp3")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-i", inp, "-b:a", "32k", "-ac", "1", out],
+                       capture_output=True, timeout=10)
+        with open(out, "rb") as f:
+            return f.read()
+    except Exception:
+        return audio  # 失败返回原始WAV
+    finally:
+        for p in (inp, out):
+            try:
+                _os.unlink(p)
+            except Exception:
+                pass
+
+def stream_voice_pipeline(text: str):
+    """
+    流式语音流水线生成器: 大脑逐句产出 → TTS → yield (type, sentence, mp3)。
+    type: "sentence"(文字+音频), "error"(错误信息), "done"(完成)
+    大脑流式产出减少了整体等待时间。
+    服务器端可在此基础上实现更细粒度的并行(见 voice_server SSE端点)。
+    """
+    try:
+        for sentence, full_reply in brain_stream_sentences(text):
+            mp3 = tts_to_mp3(sentence)
+            yield ("sentence", sentence, mp3)
+    except Exception as e:
+        log.error(f"流式流水线异常: {e}")
+        yield ("error", str(e)[:60], b"")
+    yield ("done", None, b"")
+
+
 
 # ===== 完整语音闭环 =====
 def voice_loop(audio_in: bytes, fmt="mp3") -> tuple:

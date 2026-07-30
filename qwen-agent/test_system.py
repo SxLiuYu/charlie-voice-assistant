@@ -110,6 +110,33 @@ def t_search():
     d = r.json()
     return d.get("count", 0) >= 1, f"找到{d.get('count',0)}条匹配"
 
+
+def t_stream_chat():
+    """流式文字对话: SSE流应返回text+done事件"""
+    t0 = time.time()
+    r = requests.post(f"{HOST}/api/chat/stream",
+        json={"message": "1+1等于几"}, stream=True, timeout=60)
+    if r.status_code != 200:
+        return False, "HTTP %d" % r.status_code
+    has_text = False
+    has_done = False
+    for line in r.iter_lines():
+        if not line:
+            continue
+        line = line.decode("utf-8", "ignore")
+        if line.startswith("data: "):
+            try:
+                d = json.loads(line[6:])
+                if d.get("type") == "text":
+                    has_text = True
+                elif d.get("type") == "done":
+                    has_done = True
+            except:
+                pass
+    elapsed = time.time() - t0
+    ok = has_text and has_done
+    return ok, "流式对话 %.1fs (text=%s done=%s)" % (elapsed, "Y" if has_text else "N", "Y" if has_done else "N")
+
 def main():
     print("=" * 50)
     print("  魔幻手机 · 系统自测")
@@ -131,6 +158,7 @@ def main():
         ("通知队列", t_notifications),
         ("PWA Manifest", t_manifest),
         ("对话搜索", t_search),
+        ("流式对话", t_stream_chat),
     ]
     passed = sum(1 for _, fn in tests if test(_, fn))
     print("=" * 50)

@@ -11,13 +11,15 @@ GET  /health        : 健康检查
 后台调度器: 每30s检查reminders.json，到期提醒自动TTS+afplay播报
 """
 import os, sys, subprocess, tempfile, json, threading, time, datetime, logging, asyncio
+import queue as _queue
+import base64 as _b64enc
 from contextlib import asynccontextmanager
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
     from dotenv import load_dotenv; load_dotenv()
 except ImportError: pass
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException
-from fastapi.responses import Response, HTMLResponse, JSONResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 import requests
 import fcntl
@@ -407,6 +409,122 @@ async def voice_api(file: UploadFile = File(...)):
         log.error(f"/api/voice 异常: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
+# ===== 流式端点: 大脑逐句产出 → TTS批量推送(SSE) =====
+_TTS_BATCH_SIZE = 50  # TTS批量大小(字符数)，平衡延迟与效率
+
+def _flush_tts_buffer(tts_buffer: str) -> str:
+    """清理并生成TTS音频，返回base64 MP3(空则返回'')"""
+    from voice_agent import tts_to_mp3, _clean_for_tts
+    cleaned = _clean_for_tts(tts_buffer)
+    if not cleaned or len(cleaned) < 2:
+        return ""
+    mp3 = tts_to_mp3(cleaned)
+    if not mp3 or len(mp3) < 100:
+        return ""
+    return _b64enc.b64encode(mp3).decode()
+
+async def _stream_brain_tts(text: str, asr_text: str = ""):
+    """
+    流式大脑+TTS生成器(SSE事件流)。
+    大脑在后台线程逐句产出 → 文本事件即时推送(显示) → TTS批量推送(音频)。
+    yield: SSE格式的data行。
+    """
+    from voice_agent import brain_stream_sentences
+    
+    q = _queue.Queue()
+    
+    def brain_worker():
+        try:
+            for sentence, full_reply in brain_stream_sentences(text):
+                q.put(("sentence", sentence, full_reply))
+        except Exception as e:
+            q.put(("error", str(e)[:60], None))
+        finally:
+            q.put(("done", None, None))
+    
+    threading.Thread(target=brain_worker, daemon=True).start()
+    
+    # 如果有ASR结果，先推送
+    if asr_text:
+        yield f'data: {json.dumps({"type":"asr","text":asr_text}, ensure_ascii=False)}\n\n'
+    
+    tts_buffer = ""
+    
+    while True:
+        try:
+            item = await asyncio.wait_for(
+                asyncio.to_thread(q.get, True, 60), timeout=65)
+        except asyncio.TimeoutError:
+            yield f'data: {json.dumps({"type":"error","message":"思考超时"}, ensure_ascii=False)}\n\n'
+            yield 'data: {"type":"done"}\n\n'
+            break
+        
+        etype, sentence, full_reply = item
+        if etype == "done":
+            # 推送剩余TTS
+            if tts_buffer.strip():
+                audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
+                if audio_b64:
+                    yield f'data: {json.dumps({"type":"audio","audio":audio_b64}, ensure_ascii=False)}\n\n'
+            yield 'data: {"type":"done"}\n\n'
+            break
+        elif etype == "error":
+            yield f'data: {json.dumps({"type":"error","message":sentence}, ensure_ascii=False)}\n\n'
+            yield 'data: {"type":"done"}\n\n'
+            break
+        elif etype == "sentence":
+            # 文本事件即时推送(用于显示)
+            yield f'data: {json.dumps({"type":"text","text":sentence}, ensure_ascii=False)}\n\n'
+            # 积累TTS缓冲区
+            from voice_agent import _clean_for_tts
+            cleaned = _clean_for_tts(sentence)
+            if cleaned and len(cleaned) >= 2:
+                tts_buffer = (tts_buffer + "，" + cleaned) if tts_buffer else cleaned
+                # 缓冲区达到阈值 → 生成TTS推送
+                if len(tts_buffer) >= _TTS_BATCH_SIZE:
+                    audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
+                    tts_buffer = ""
+                    if audio_b64:
+                        yield f'data: {json.dumps({"type":"audio","audio":audio_b64}, ensure_ascii=False)}\n\n'
+
+@app.post("/api/chat/stream")
+async def chat_stream_api(req: Request):
+    """流式文字对话: 文字进 → 大脑逐句产出 → TTS批量推送(SSE)"""
+    body = await req.json()
+    text = body.get("message", "")
+    if len(text) > MAX_TEXT_LENGTH:
+        return JSONResponse({"error": f"输入过长({len(text)}字), 上限{MAX_TEXT_LENGTH}字"}, status_code=413)
+    if not text.strip():
+        return JSONResponse({"error": "消息不能为空"}, status_code=400)
+    log.info(f"/api/chat/stream 流式对话: {text[:40]}")
+    return StreamingResponse(_stream_brain_tts(text), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.post("/api/voice/stream")
+async def voice_stream_api(file: UploadFile = File(...)):
+    """流式语音对话: 音频进 → ASR → 大脑逐句 → TTS批量(SSE)"""
+    data = await file.read()
+    ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
+    if len(data) > MAX_AUDIO_SIZE:
+        return JSONResponse({"error": f"音频过大", "status_code": 413}, status_code=413)
+    log.info(f"/api/voice/stream 收到音频: {len(data)}字节, 格式={ext}")
+    
+    wav = to_wav(data, ext)
+    from voice_agent import asr
+    try:
+        asr_text = await asyncio.wait_for(asyncio.to_thread(asr, wav, "wav"), timeout=30)
+    except asyncio.TimeoutError:
+        return JSONResponse({"error": "语音识别超时"}, status_code=504)
+    except Exception as e:
+        return JSONResponse({"error": f"识别失败: {e}"}, status_code=500)
+    
+    if not asr_text:
+        asr_text = "(未识别到语音)"
+    
+    return StreamingResponse(_stream_brain_tts(asr_text, asr_text), 
+                             media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 @app.post("/api/chat")
 async def chat_api(req: Request):
     body = await req.json()
@@ -633,11 +751,18 @@ async def search_conversation(q: str = ""):
 async def version():
     return {
         "name": "魔幻手机",
-        "version": "2.1.0",
+        "version": "3.0.0",
         "brain": "GLM-5.2 + Qwen-Agent + 6 MCP",
         "voice": "qwen3-asr/tts-flash (finna)",
-        "features": ["语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
-                     "SSE实时推送", "CORS", "PWA移动端", "响应缓存", "看门狗", "MP3压缩", "线程池"],
+        "features": ["流式语音对话", "流式文字对话", "大脑逐句产出", "TTS批量推送",
+                     "语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
+                     "SSE实时推送", "CORS", "PWA移动端", "响应缓存", "看门狗", "MP3压缩", "线程池",
+                     "Markdown清理TTS", "逗号软分割", "连接重试", "文件锁"],
+        "streaming": {
+            "chat": "/api/chat/stream (SSE: text+audio+done)",
+            "voice": "/api/voice/stream (SSE: asr+text+audio+done)",
+            "tts_batch_size": "50字/块",
+        }
     }
 
 
@@ -696,9 +821,10 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 {"".join(f'<div class="rem">📌 {r["text"]} <span style="color:#888">⏰{r.get("due","")[:16].replace("T"," ")}</span></div>' for r in pending[:5]) or '<div class="rem" style="color:#666">暂无待办</div>'}
 <a href="/api/reminders" style="font-size:12px">查看全部 →</a>
 </div>
-<div class="card"><h3>🔧 API 端点 (13个)</h3>
-<div class="metric"><span>语音</span><span class="val">/api/voice /api/tts /api/asr</span></div>
-<div class="metric"><span>对话</span><span class="val">/api/chat /api/reset /api/conversation /api/export</span></div>
+<div class="card"><h3>🔧 API 端点 (20个)</h3>
+<div class="metric"><span>语音</span><span class="val">/api/voice /api/voice/stream</span></div>
+<div class="metric"><span>TTS/ASR</span><span class="val">/api/tts /api/asr</span></div>
+<div class="metric"><span>对话</span><span class="val">/api/chat /api/chat/stream /api/reset /api/conversation /api/export</span></div>
 <div class="metric"><span>提醒</span><span class="val">/api/reminders (GET/POST/DELETE)</span></div>
 <div class="metric"><span>系统</span><span class="val">/api/status /api/version /health</span></div>
 </div>
