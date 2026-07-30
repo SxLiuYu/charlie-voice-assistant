@@ -85,6 +85,8 @@ screen -dmS watchdog bash watchdog.sh
 | GET | `/api/version` | 版本信息+功能列表 |
 | GET | `/api/export` | 导出对话历史(文本) |
 | GET | `/api/notifications` | 获取并清空通知队列(Web轮询用) |
+| GET | `/api/search?q=xxx` | 搜索对话历史 |
+| GET | `/manifest.json` | PWA移动端manifest |
 | GET | `/api/reminders` | 提醒列表 |
 | POST | `/api/reminders` | 添加提醒 |
 | DELETE | `/api/reminders/{id}` | 标记提醒完成 |
@@ -93,7 +95,7 @@ screen -dmS watchdog bash watchdog.sh
 
 ## 自测
 ```bash
-python test_system.py          # 13项测试, 45秒完成(含35s通知队列测试)
+python test_system.py          # 15项测试, 45秒完成(含35s通知队列测试)
 python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 ```

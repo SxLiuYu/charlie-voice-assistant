@@ -636,7 +636,8 @@ async def version():
         "version": "2.1.0",
         "brain": "GLM-5.2 + Qwen-Agent + 6 MCP",
         "voice": "qwen3-asr/tts-flash (finna)",
-        "features": ["语音对话", "对话记忆", "主动提醒", "天气告警", "每日晨报", "系统监控", "CORS"],
+        "features": ["语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
+                     "SSE实时推送", "CORS", "PWA移动端", "响应缓存", "看门狗", "MP3压缩", "线程池"],
     }
 
 
