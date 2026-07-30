@@ -5,6 +5,7 @@
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
 """
 import os, json, base64, requests, datetime, time, logging, asyncio, re
+from typing import Optional, Generator, Tuple, List, Dict, Any
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
     from dotenv import load_dotenv; load_dotenv()
@@ -29,7 +30,7 @@ _cache = {}
 _CACHE_TTL = 60  # 秒
 _CACHE_MAX = 50
 
-def _cache_get(text: str):
+def _cache_get(text: str) -> Optional[str]:
     """获取缓存响应(60秒内有效)"""
     key = text.strip().lower()
     if key in _cache:
@@ -39,7 +40,7 @@ def _cache_get(text: str):
         del _cache[key]
     return None
 
-def _cache_set(text: str, reply: str):
+def _cache_set(text: str, reply: str) -> None:
     """设置缓存响应"""
     if len(_cache) >= _CACHE_MAX:
         _cache.pop(next(iter(_cache)))  # 移除最旧的
@@ -50,14 +51,14 @@ _history = []
 MAX_HISTORY = 20  # 保留最近20轮对话(40条消息)
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation_history.json")
 
-def _save_history():
+def _save_history() -> None:
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(_history, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-def _load_history():
+def _load_history() -> None:
     global _history
     try:
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -65,14 +66,14 @@ def _load_history():
     except Exception:
         _history = []
 
-def reset_history():
+def reset_history() -> None:
     global _history
     _history = []
     _save_history()
 
 _load_history()
 
-def _build_system_msg():
+def _build_system_msg() -> str:
     now = datetime.datetime.now()
     weekdays = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
     h = now.hour
@@ -107,7 +108,7 @@ def _build_system_msg():
             "7. 用户问'今天有什么安排'时，如果有提醒会主动列出")
 
 # ===== 带重试的请求封装 =====
-def _retry(fn, name="请求"):
+def _retry(fn, name: str = "请求") -> Any:
     """带重试的函数调用封装"""
     last_err = None
     for attempt in range(MAX_RETRIES):
@@ -128,6 +129,7 @@ def _retry(fn, name="请求"):
 
 # ===== TTS: 文字 → 音频bytes =====
 def tts(text: str) -> bytes:
+    """文字→语音(WAV bytes), 带重试"""
     def _do():
         r = _session.post(f"{FINNA}/audio/speech",
             headers={"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json"},
@@ -151,7 +153,7 @@ def tts(text: str) -> bytes:
         return b""
 
 # ===== ASR: 音频bytes → 文字 =====
-def asr(audio_bytes: bytes, fmt="mp3") -> str:
+def asr(audio_bytes: bytes, fmt: str = "mp3") -> str:
     def _do():
         r = _session.post(f"{FINNA}/audio/transcriptions",
             headers={"Authorization": f"Bearer {ASR_KEY}"},
@@ -211,6 +213,7 @@ def _ensure_event_loop():
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 def brain(text: str) -> str:
+    """大脑推理: 文字→GLM-5.2+MCP→回复文字"""
     global _brain, _history
     # 缓存命中(60秒内相同查询直接返回)
     cached = _cache_get(text)
@@ -266,7 +269,7 @@ _COMMA_SOFT = re.compile(r'[，,]')
 _MIN_CHUNK = 35  # 逗号处至少积累35字才切割(避免过短TTS碎片)
 _MAX_CHUNK = 80  # 超过80字强制在下一个标点处切割
 
-def _extract_assistant_text(rsp) -> str:
+def _extract_assistant_text(rsp: Any) -> str:
     """从brain.run()的中间响应中提取assistant文本(累积)"""
     if not isinstance(rsp, list):
         return ""
@@ -297,7 +300,7 @@ def _clean_for_tts(text: str) -> str:
     t = _re.sub(r'\s{2,}', ' ', t)          # 多余空格
     return t.strip()
 
-def brain_stream_sentences(text: str):
+def brain_stream_sentences(text: str) -> Generator[Tuple[str, str], None, None]:
     """
     流式大脑: 逐句yield完整句子，供TTS流水线使用。
     brain.run()增量产出token → 检测句子边界 → yield完整句。
@@ -400,7 +403,7 @@ def tts_to_mp3(text: str) -> bytes:
             except Exception:
                 pass
 
-def stream_voice_pipeline(text: str):
+def stream_voice_pipeline(text: str) -> Generator[Tuple[str, str, bytes], None, None]:
     """
     流式语音流水线生成器: 大脑逐句产出 → TTS → yield (type, sentence, mp3)。
     type: "sentence"(文字+音频), "error"(错误信息), "done"(完成)
@@ -419,7 +422,7 @@ def stream_voice_pipeline(text: str):
 
 
 # ===== 完整语音闭环 =====
-def voice_loop(audio_in: bytes, fmt="mp3") -> tuple:
+def voice_loop(audio_in: bytes, fmt: str = "mp3") -> Tuple[str, str, bytes]:
     """语音进 → ASR → 大脑(含MCP) → TTS → 语音出"""
     text = asr(audio_in, fmt)
     if not text:

@@ -27,6 +27,57 @@ import fcntl
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("magic")
 
+# ===== 请求指标追踪 =====
+class Metrics:
+    """轻量级请求指标追踪"""
+    def __init__(self):
+        self.requests: dict = {}
+        self.errors = 0
+        self.cache_hits = 0
+        self.total_requests = 0
+        self.response_times: list = []
+
+    def record(self, endpoint: str, duration_ms: float, ok: bool = True):
+        self.total_requests += 1
+        if not ok:
+            self.errors += 1
+        if endpoint not in self.requests:
+            self.requests[endpoint] = {"count": 0, "total_ms": 0, "errors": 0}
+        self.requests[endpoint]["count"] += 1
+        self.requests[endpoint]["total_ms"] += duration_ms
+        if not ok:
+            self.requests[endpoint]["errors"] += 1
+        self.response_times.append(duration_ms)
+        if len(self.response_times) > 100:
+            self.response_times = self.response_times[-100:]
+
+    def cache_hit(self):
+        self.cache_hits += 1
+
+    def summary(self) -> dict:
+        import statistics
+        times = self.response_times
+        avg_ms = statistics.mean(times) if times else 0
+        p95 = sorted(times)[int(len(times) * 0.95)] if len(times) >= 20 else 0
+        endpoints = {}
+        for ep, d in self.requests.items():
+            endpoints[ep] = {
+                "count": d["count"],
+                "avg_ms": round(d["total_ms"] / d["count"], 1) if d["count"] else 0,
+                "errors": d["errors"],
+            }
+        return {
+            "total_requests": self.total_requests,
+            "total_errors": self.errors,
+            "cache_hits": self.cache_hits,
+            "avg_response_ms": round(avg_ms, 1),
+            "p95_response_ms": round(p95, 1),
+            "endpoints": endpoints,
+        }
+
+_metrics = Metrics()
+
+
 @asynccontextmanager
 async def lifespan(app):
     """启动+关闭生命周期"""
@@ -94,8 +145,16 @@ async def request_logger(request: Request, call_next):
     rid = str(uuid.uuid4())[:8]
     start = _t.time()
     log.info(f"[{rid}] {request.method} {request.url.path}")
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        dur = (_t.time() - start) * 1000
+        _metrics.record(request.url.path, dur, ok=False)
+        log.error(f"[{rid}] 异常: {e} ({dur:.0f}ms)")
+        raise
     dur = (_t.time() - start) * 1000
+    ok = response.status_code < 500
+    _metrics.record(request.url.path, dur, ok=ok)
     log.info(f"[{rid}] {request.method} {request.url.path} → {response.status_code} {dur:.0f}ms")
     response.headers["X-Request-ID"] = rid
     return response
@@ -845,6 +904,13 @@ async def manifest():
         "background_color": "#0f0c29",
         "theme_color": "#e94560",
     })
+
+
+@app.get("/api/metrics")
+async def metrics():
+    """请求指标: 请求数/错误率/缓存命中/响应时间(p50/p95)"""
+    return _metrics.summary()
+
 
 @app.get("/health")
 def health():
