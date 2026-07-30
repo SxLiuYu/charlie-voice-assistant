@@ -95,7 +95,11 @@ let curVolume=0;
 const SOUND_THRESHOLD=0.8,SILENCE_THRESHOLD=0.3,SOUND_DELAY=300,SILENCE_DELAY=1200,COOLDOWN=800;
 
 function setState(s,icon,txt){state=s;orb.textContent=icon;orb.className=s;st.textContent=txt;}
-function addMsg(cls,txt){const d=document.createElement('div');d.className='msg '+cls;d.textContent=txt;conv.appendChild(d);conv.scrollTop=conv.scrollHeight;return d;}
+function addMsg(cls,txt,ts){
+  const d=document.createElement('div');d.className='msg '+cls;
+  if(ts){const t=document.createElement('span');t.style.cssText='font-size:10px;color:#666;margin-right:6px';t.textContent=ts.slice(11,16);d.appendChild(t);}
+  const s=document.createElement('span');s.textContent=txt;d.appendChild(s);
+  conv.appendChild(d);conv.scrollTop=conv.scrollHeight;return d;}
 function addReplyChunk(txt){if(!streamingMsg)streamingMsg=addMsg('b streaming','');streamingMsg.textContent+=txt;conv.scrollTop=conv.scrollHeight;}
 function finishReply(){if(streamingMsg){streamingMsg.classList.remove('streaming');streamingMsg=null;}}
 
@@ -242,7 +246,7 @@ async function resetChat(){
 }
 async function loadConv(){
   try{const r=await fetch('/api/conversation?session_id='+SESSION_ID);const d=await r.json();
-    if(d.history&&d.history.length){d.history.forEach(m=>{if(m.role==='user'||m.role==='assistant')addMsg(m.role==='user'?'u':'b',m.content);});
+    if(d.history&&d.history.length){d.history.forEach(m=>{if(m.role==='user'||m.role==='assistant')addMsg(m.role==='user'?'u':'b',m.content,m.ts);});
       addMsg('sys','📂 已加载'+d.count+'条历史');}}catch(e){}
 }
 // ===== SSE通知 =====

@@ -1252,9 +1252,11 @@ async def version():
         "voice": "qwen3-asr/tts-flash (finna)",
         "features": ["流式语音对话", "流式文字对话", "大脑逐句产出", "TTS批量推送",
                      "语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
-                     "SSE实时推送", "WebSocket双向通信", "TTS打断", "限流防护", "CORS", "PWA移动端",
+                     "SSE实时推送", "WebSocket双向通信", "TTS打断", "限流防护", "CORS加固", "PWA移动端",
                      "响应缓存", "看门狗", "MP3压缩", "线程池", "Markdown清理TTS", "逗号软分割",
-                     "连接重试", "文件锁", "大脑断路器"],
+                     "连接重试", "文件锁", "大脑断路器", "多用户会话隔离", "唤醒词检测",
+                     "API密钥故障转移", "输入清洗XSS防护", "结构化日志", "优雅降级",
+                     "对话时间戳", "Token感知截断", "连接池调优", "对话导出分页"],
         "streaming": {
             "chat": "/api/chat/stream (SSE: text+audio+done)",
             "voice": "/api/voice/stream (SSE: asr+text+audio+done)",
