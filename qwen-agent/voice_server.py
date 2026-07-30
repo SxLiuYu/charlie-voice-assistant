@@ -46,6 +46,36 @@ async def lifespan(app):
     except Exception:
         pass
 
+def _validate_env():
+    """启动时检查必需的API密钥，缺失的会警告"""
+    required = [
+        ("GLM_KEY", "GLM-5.2大脑"),
+        ("TTS_KEY", "TTS语音合成"),
+        ("ASR_KEY", "ASR语音识别"),
+        ("AMAP_KEY", "高德地图"),
+    ]
+    optional = [
+        ("TAVILY_API_KEY", "Tavily搜索"),
+        ("ALIYUN_API_KEY", "阿里云(购物分析)"),
+    ]
+    missing = []
+    for key, desc in required:
+        val = os.getenv(key, "")
+        if not val:
+            missing.append(f"❌ {key} ({desc})")
+            log.error(f"缺少必需密钥: {key} ({desc})")
+        else:
+            log.info(f"✅ {key} ({desc})")
+    for key, desc in optional:
+        val = os.getenv(key, "")
+        if not val:
+            log.warning(f"⚠️ 可选密钥缺失: {key} ({desc})")
+    if missing:
+        log.error(f"缺少{len(missing)}个必需密钥！请检查.env文件")
+        log.error("复制 .env.example 为 .env 并填入密钥")
+    return len(missing) == 0
+
+_validate_env()
 app = FastAPI(title="魔幻手机语音服务", lifespan=lifespan)
 
 # CORS: 允许跨域访问(手机/其他设备)
@@ -580,6 +610,25 @@ async def sse_events():
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
+@app.get("/api/search")
+async def search_conversation(q: str = ""):
+    """搜索对话历史中的关键词"""
+    if not q:
+        return JSONResponse({"error": "请提供搜索关键词?q=xxx"}, status_code=400)
+    from voice_agent import _history
+    results = []
+    for i, m in enumerate(_history):
+        content = m.get("content", "")
+        if q.lower() in content.lower():
+            role = "我" if m.get("role") == "user" else "魔幻手机"
+            # 提取匹配上下文
+            idx = content.lower().find(q.lower())
+            start = max(0, idx - 20)
+            end = min(len(content), idx + len(q) + 20)
+            ctx = ("..." if start > 0 else "") + content[start:end] + ("..." if end < len(content) else "")
+            results.append({"role": role, "context": ctx, "full": content[:200]})
+    return {"query": q, "count": len(results), "results": results}
+
 @app.get("/api/version")
 async def version():
     return {
@@ -654,6 +703,21 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 </div>
 </div>
 </body></html>"""
+
+@app.get("/manifest.json")
+async def manifest():
+    """PWA manifest for mobile install"""
+    from fastapi.responses import JSONResponse
+    return JSONResponse({
+        "name": "魔幻手机",
+        "short_name": "魔幻手机",
+        "description": "中国版贾维斯 - AI语音助理",
+        "start_url": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#0f0c29",
+        "theme_color": "#e94560",
+    })
 
 @app.get("/health")
 def health():
