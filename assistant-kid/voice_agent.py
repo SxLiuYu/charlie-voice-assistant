@@ -1,6 +1,6 @@
 """
-助手小子 - 语音Agent核心
-语音闭环: ASR(qwen3-asr) → 大脑(GLM-5.2+Qwen-Agent+MCP) → TTS(qwen3-tts)
+Charlie - 语音Agent核心
+语音闭环: ASR(qwen3-asr) → 大脑(deepseek-v4-flash+Qwen-Agent+MCP) → TTS(qwen3-tts)
 连接韧性: Session复用 + 自动重试 + 异常降级
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
 """
@@ -269,7 +269,7 @@ def _build_system_msg() -> str:
         prefs_ctx = f"\n用户偏好(请主动应用)：{'，'.join(prefs_items)}。"
     summary = _context_summaries.get("default", "")
     summary_ctx = f"\n之前对话过的内容: {summary}。" if summary else ""
-    return (f"你是助手小子，中国版贾维斯——用户的私人AI助理。{ctx}{prefs_ctx}\n"
+    return (f"你是Charlie，中国版贾维斯——用户的私人AI助理。{ctx}{prefs_ctx}\n"
             "你的性格：高效、主动、偶尔幽默，像老朋友一样亲切。\n"
             "你有多个MCP工具：高德地图(天气/POI/路线)、充电桩搜索、购物推荐、翻译、"
             "提醒管理(add_reminder可设提醒,list_reminders可查待办)、文件读写等。\n"
@@ -353,7 +353,7 @@ def asr(audio_bytes: bytes, fmt: str = "mp3") -> str:
         log.error(f"ASR最终失败: {e}")
         return ""
 
-# ===== 大脑: GLM-5.2 + Qwen-Agent + MCP =====
+# ===== 大脑: deepseek-v4-flash + Qwen-Agent + MCP =====
 def _build_brain():
     # 内存检查: 防止OOM崩溃
     try:
@@ -366,7 +366,7 @@ def _build_brain():
         pass
     from qwen_agent.agents import Assistant
     llm_cfg = {
-        'model': os.getenv('GLM_MODEL', 'glm-5.2'), 'model_type': 'oai',
+        'model': 'deepseek-v4-flash', 'model_type': 'oai',  # 写死: 直连finna deepseek-v4-flash, 不路由不切换
         'api_base': FINNA, 'api_key': _get_glm_key(),
         'generate_cfg': {'use_raw_api': True},
     }
@@ -390,7 +390,7 @@ def _build_brain():
     mcp_servers = {k: v for k, v in all_mcp.items() if k in enabled}
     log.info(f"[brain] 启用{len(mcp_servers)}个MCP: {list(mcp_servers.keys())}")
     tools = [{"mcpServers": mcp_servers}]
-    return Assistant(llm=llm_cfg, name='助手小子',
+    return Assistant(llm=llm_cfg, name='Charlie',
         system_message=_build_system_msg(),
         function_list=tools)
 
@@ -473,7 +473,7 @@ def brain_status() -> dict:
     }
 
 def brain(text: str, session_id: str = "default") -> str:
-    """大脑推理: 文字→GLM-5.2+MCP→回复文字"""
+    """大脑推理: 文字→deepseek-v4-flash+MCP→回复文字"""
     global _brain
     # 缓存命中(60秒内相同查询直接返回)
     cached = _cache_get(text)

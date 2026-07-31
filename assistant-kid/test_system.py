@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""助手小子 - 系统自测脚本
+"""Charlie - 系统自测脚本
 快速验证所有API端点和核心功能
 用法: python test_system.py [host]
 """
@@ -101,7 +101,7 @@ def t_notifications():
 def t_manifest():
     r = requests.get(f"{HOST}/manifest.json", timeout=5)
     d = r.json()
-    return d.get("name") == "助手小子" and d.get("display") == "standalone", f'{d.get("name","?")} {d.get("display","?")}'
+    return d.get("name") == "Charlie" and d.get("display") == "standalone", f'{d.get("name","?")} {d.get("display","?")}'
 
 def t_search():
     # 轻量级: 直接写对话历史(避免触发大脑,省内存)
@@ -182,7 +182,7 @@ def t_utils():
 
 def main():
     print("=" * 50)
-    print("  助手小子 · 系统自测")
+    print("  Charlie · 系统自测")
     print(f"  目标: {HOST}")
     print("=" * 50)
     tests = [

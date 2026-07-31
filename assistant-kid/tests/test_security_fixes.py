@@ -1,5 +1,5 @@
 """
-助手小子 - 安全修复与bug修复测试
+Charlie - 安全修复与bug修复测试
 测试: eval安全替代、MCP进程清理、brain_status无死代码、请求体大小限制
 """
 import pytest

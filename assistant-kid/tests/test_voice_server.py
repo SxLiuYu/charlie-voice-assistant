@@ -1,5 +1,5 @@
 """
-助手小子 - API服务端单元测试
+Charlie - API服务端单元测试
 使用FastAPI TestClient + mock测试所有API端点
 """
 import json, base64
@@ -52,7 +52,7 @@ class TestHealthAndStatus:
         data = r.json()
         assert "version" in data
         assert data["version"] == "3.1.0"
-        assert "GLM-5.2" in data.get("brain", "") or "glm" in data.get("brain", "").lower()
+        assert "deepseek" in data.get("brain", "").lower()
 
     def test_metrics(self, client):
         r = client.get("/api/metrics")
@@ -187,7 +187,7 @@ class TestChat:
 
     def test_chat_success(self, client):
         """使用mock测试成功对话"""
-        with patch("voice_agent.brain", return_value="你好！我是助手小子。"):
+        with patch("voice_agent.brain", return_value="你好！我是Charlie。"):
             r = client.post("/api/chat", json={"message": "你好"})
         assert r.status_code == 200
         data = r.json()

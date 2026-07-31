@@ -1,5 +1,5 @@
 """
-助手小子 - 工具模块单元测试
+Charlie - 工具模块单元测试
 测试: parse_time_str / sanitize_error / cleanup_temp_files / truncate_history_file
 """
 import os, json, tempfile, datetime

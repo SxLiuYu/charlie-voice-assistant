@@ -2,10 +2,10 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="助手小子">
+<meta name="apple-mobile-web-app-title" content="Charlie">
 <meta name="theme-color" content="#e94560">
 <link rel="manifest" href="/manifest.json">
-<title>助手小子 · 语音助理</title><style>
+<title>Charlie · 语音助理</title><style>
 *{margin:0;box-sizing:border-box}body{font-family:-apple-system,"PingFang SC",sans-serif;
 background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);color:#eee;min-height:100vh;
 display:flex;flex-direction:column;align-items:center;padding:12px}
@@ -13,7 +13,7 @@ h1{font-size:24px;margin-bottom:4px;background:linear-gradient(90deg,#e94560,#f5
 -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .sub{color:#888;margin-bottom:14px;font-size:12px}
 #diag{width:90%;max-width:480px;background:rgba(0,0,0,.3);border-radius:10px;padding:10px;
-margin-bottom:12px;font-size:12px;line-height:1.6;max-height:80px;overflow-y:auto;color:#8f8}
+margin-bottom:12px;font-size:12px;line-height:1.6;max-height:200px;overflow-y:auto;color:#8f8}
 #orb{width:120px;height:120px;border-radius:50%;background:radial-gradient(circle,#e94560,#302b63);
 box-shadow:0 0 36px rgba(233,69,96,.45);transition:box-shadow .3s;margin-bottom:12px;
 display:flex;align-items:center;justify-content:center;font-size:40px;cursor:pointer}
@@ -72,7 +72,7 @@ background:rgba(78,255,153,.06);border-radius:8px;font-size:13px}
 #prefadd input{flex:1;padding:8px 12px;border-radius:16px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:13px}
 #prefadd button{padding:8px 14px;border:none;border-radius:16px;background:#4e9;color:#222;font-size:13px;cursor:pointer}
 </style></head><body>
-<h1>助手小子</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
+<h1>Charlie</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
 <div id="tunnelurl" style="display:none;font-size:11px;color:#4e9;margin-bottom:4px;text-align:center;cursor:pointer" onclick="copyTunnelURL()"></div>
 <div id="diag">📡 点击球授权麦克风，开启自动监听…</div>
 <div id="orb" onclick="init()">🎙️</div>
@@ -112,7 +112,7 @@ let micStream=null,audioCtx=null,analyser=null,mediaRecorder=null;
 let state='idle',mic=false,autoListen=true,recChunks=[],recStart=0;
 let soundTimer=null,silenceTimer=null,cooldownTimer=null,streamingMsg=null;
 let curVolume=0;
-const SOUND_THRESHOLD=0.8,SILENCE_THRESHOLD=0.3,SOUND_DELAY=300,SILENCE_DELAY=1200,COOLDOWN=800;
+const SOUND_THRESHOLD=0.2,SILENCE_THRESHOLD=0.3,SOUND_DELAY=300,SILENCE_DELAY=1200,COOLDOWN=800;
 
 function setState(s,icon,txt){state=s;orb.textContent=icon;orb.className=s;st.textContent=txt;}
 function addMsg(cls,txt,ts){
@@ -186,7 +186,7 @@ function updateVolume(){
   let v=0;for(let i=0;i<d.length;i++)v+=d[i];v=v/d.length/255*3;curVolume=v;
   volbar.style.width=Math.min(100,v*40)+'%';volnum.textContent='音量 '+v.toFixed(1);
   // 自动监听逻辑: 仅在idle+自动开启+无cooldown时触发
-  if(autoListen&&state==='idle'&&!cooldownTimer){
+  if(autoListen&&state==='idle'&&!cooldownTimer&&!wakeMode){
     if(v>SOUND_THRESHOLD){
       if(!soundTimer)soundTimer=setTimeout(()=>{if(state==='idle'&&autoListen&&!cooldownTimer)startAutoRecord();},SOUND_DELAY);
     }else{clearTimeout(soundTimer);soundTimer=null;}
@@ -208,7 +208,7 @@ function toggleAuto(){
 // ===== 自动录音 =====
 function startAutoRecord(){
   if(!micStream||state!=='idle')return;
-  recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:'audio/webm'});
+  recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:MediaRecorder.isTypeSupported('audio/webm')?'audio/webm':MediaRecorder.isTypeSupported('audio/mp4')?'audio/mp4':''});
   mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recChunks.push(e.data);};
   mediaRecorder.onstop=onAutoRecordStop;
   mediaRecorder.start();recStart=Date.now();
@@ -233,7 +233,7 @@ async function onAutoRecordStop(){
 function holdStart(){
   if(state!=='idle'||!micStream)return;
   clearTimeout(soundTimer);clearTimeout(silenceTimer);
-  recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:'audio/webm'});
+  recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:MediaRecorder.isTypeSupported('audio/webm')?'audio/webm':MediaRecorder.isTypeSupported('audio/mp4')?'audio/mp4':''});
   mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recChunks.push(e.data);};
   mediaRecorder.onstop=onAutoRecordStop;
   mediaRecorder.start();recStart=Date.now();
@@ -348,9 +348,9 @@ function copyTunnelURL(){
     el.innerHTML+=' \u2705\u5DF2\u590D\u5236';setTimeout(loadTunnelURL,2000);
   });
 }
-// ===== 唤醒词检测(助手小子) =====
+// ===== 唤醒词检测(Charlie) =====
 let wakeMode=false,wakeRec=null;
-const WAKE_WORDS=["助手小子","assistant kid","assistantkid","魔法手机"];
+const WAKE_WORDS=["charlie","查理","查理查理","查莉","查利","cha li","cha r lie"];
 function toggleWake(){
   wakeMode=!wakeMode;
   const btn=document.getElementById('wakebtn');
@@ -358,7 +358,7 @@ function toggleWake(){
     btn.textContent='唤醒词 ON';btn.className='active';
     if(!mic){diag.textContent='⚠️ 请先点击球授权麦克风';wakeMode=false;btn.textContent='唤醒词 OFF';btn.className='off';return;}
     startWakeListener();
-    diag.textContent='🎤 唤醒词已开启,说"助手小子"激活对话';
+    diag.textContent='🎤 唤醒词已开启,说"Charlie"激活对话';
   }else{
     btn.textContent='唤醒词 OFF';btn.className='off';
     stopWakeListener();
@@ -373,6 +373,12 @@ function startWakeListener(){
   wakeRec.onresult=function(e){
     for(let i=e.resultIndex;i<e.results.length;i++){
       const t=e.results[i][0].transcript.toLowerCase().trim();
+      // 调试日志: 追加到诊断栏(保留最近5条)
+      const now=new Date();const ts=now.toLocaleTimeString('zh-CN',{hour12:false});
+      const logs=diag._logs||[];logs.unshift('['+ts+'] '+t);
+      if(logs.length>5)logs.pop();diag._logs=logs;
+      diag.innerHTML=logs.map(l=>l.startsWith('[')?'<div>'+l+'</div>':l).join('');
+      diag.scrollTop=0;
       // 检测唤醒词
       for(const w of WAKE_WORDS){
         if(t.includes(w.toLowerCase())){
@@ -380,8 +386,8 @@ function startWakeListener(){
           stopWakeListener();
           diag.textContent='✅ 唤醒成功! 正在聆听...';
           setState('listening','👂','唤醒中...');
-          // 如果自动监听关闭,临时启动一次录音
-          if(!autoListen){startAutoRecord();}
+          // 唤醒成功: 无论autoListen开关,都启动录音
+          startAutoRecord();
           // 唤醒后3秒自动恢复监听
           setTimeout(()=>{if(wakeMode)startWakeListener();},3000);
           return;

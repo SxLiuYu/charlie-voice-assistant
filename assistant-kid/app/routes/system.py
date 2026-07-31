@@ -22,9 +22,9 @@ def _pref_count() -> int:
 @system_router.get("/api/version")
 async def version():
     return {
-        "name": "助手小子",
+        "name": "Charlie",
         "version": "3.1.0",
-        "brain": "GLM-5.2 + Qwen-Agent + 4 MCP (可配置)",
+        "brain": "deepseek-v4-flash + Qwen-Agent + 4 MCP (可配置)",
         "voice": "qwen3-asr/tts-flash (finna)",
         "features": ["流式语音对话", "流式文字对话", "大脑逐句产出", "TTS批量推送",
                      "语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
@@ -83,7 +83,7 @@ async def dashboard():
     m = _metrics.summary()
     return f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>助手小子 · 监控面板</title><meta http-equiv="refresh" content="10">
+<title>Charlie · 监控面板</title><meta http-equiv="refresh" content="10">
 <style>*{{margin:0;box-sizing:border-box}}body{{font-family:-apple-system,sans-serif;
 background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);color:#eee;min-height:100vh;padding:20px}}
 h1{{font-size:22px;margin-bottom:4px;background:linear-gradient(90deg,#e94560,#f5a623);
@@ -102,7 +102,7 @@ h1{{font-size:22px;margin-bottom:4px;background:linear-gradient(90deg,#e94560,#f
 a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 .rem{{padding:6px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:13px}}
 </style></head><body>
-<h1>🎛️ 助手小子 · 监控面板</h1>
+<h1>🎛️ Charlie · 监控面板</h1>
 <div class="sub">自动刷新10秒 | <a href="/">语音客户端</a> | <a href="/docs">API文档</a> | <a href="/api/status">JSON状态</a></div>
 <div class="grid">
 <div class="card"><h3>🖥️ 系统</h3>
@@ -116,7 +116,7 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 <div class="bar"><div class="{'green' if disk.percent<80 else 'yellow' if disk.percent<90 else 'red'}" style="width:{disk.percent}%"></div></div>
 </div>
 <div class="card"><h3>🧠 大脑</h3>
-<div class="metric"><span>模型</span><span class="val">GLM-5.2 + 4 MCP (可配置)</span></div>
+<div class="metric"><span>模型</span><span class="val">deepseek-v4-flash + 4 MCP (可配置)</span></div>
 <div class="metric"><span>预热状态</span><span class="tag {'ok' if brain_warm else 'warn'}">{'✅ 已就绪' if brain_warm else '⏳ 预热中'}</span></div>
 <div class="metric"><span>对话历史</span><span class="val">{len(_history)} 条</span></div>
 <div class="metric"><span>语音引擎</span><span class="val">qwen3-asr/tts-flash</span></div>

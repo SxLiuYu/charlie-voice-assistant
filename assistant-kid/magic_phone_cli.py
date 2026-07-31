@@ -1,5 +1,5 @@
 """
-助手小子 · 交互式语音CLI
+Charlie · 交互式语音CLI
 绕过浏览器麦克风权限，命令行实时语音对话
 按回车开始录音，说完再按回车停止 → ASR→大脑(6MCP)→TTS → 播放
 """
@@ -37,10 +37,10 @@ def play(path):
 def main():
     dev, name = find_airpods()
     print("="*46)
-    print("  助手小子 · 交互式语音对话")
+    print("  Charlie · 交互式语音对话")
     print("="*46)
     print(f"🎤 麦克风: [{dev}] {name}")
-    print(f"🧠 大脑: GLM-5.2 + 6个MCP")
+    print(f"🧠 大脑: deepseek-v4-flash + MCP")
     print("操作: 按回车开始说话 → 说完按回车停止 → 白泽回答")
     print("退出: Ctrl+C\n")
     while True:

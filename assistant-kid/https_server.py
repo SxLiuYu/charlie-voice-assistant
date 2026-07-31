@@ -1,4 +1,4 @@
-"""助手小子 HTTPS 服务(手机访问用) - 复用voice_server的app，8443端口SSL
+"""Charlie HTTPS 服务(手机访问用) - 复用voice_server的app，8443端口SSL
 后台调度器(提醒/建议/预热)只在HTTP进程跑，HTTPS进程通过环境变量跳过"""
 import os, uvicorn
 os.environ["SKIP_BACKGROUND"] = "1"  # 关键：防止重复启动调度器/建议/预热

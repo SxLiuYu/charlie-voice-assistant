@@ -1,4 +1,4 @@
-"""迷你MCP服务器 - 模拟助手小子的部分能力"""
+"""迷你MCP服务器 - 模拟Charlie的部分能力"""
 from mcp.server.fastmcp import FastMCP
 from datetime import datetime
 import os

@@ -1,6 +1,6 @@
 """
-助手小子 - 实时语音服务
-POST /api/voice    : 音频进 → ASR → 大脑(GLM-5.2+MCP) → TTS → 音频出
+Charlie - 实时语音服务
+POST /api/voice    : 音频进 → ASR → 大脑(deepseek-v4-flash+MCP) → TTS → 音频出
 POST /api/chat     : 纯文字进 → 大脑 → 文字出
 GET  /api/reminders: 待办列表
 POST /api/reminders: 添加提醒
@@ -155,7 +155,7 @@ class BrainRestartRequest(BaseModel):
     """大脑重启请求(预留)"""
     force: bool = Field(default=False, description="强制重启")
 
-app = FastAPI(title="助手小子语音服务", lifespan=lifespan)
+app = FastAPI(title="Charlie语音服务", lifespan=lifespan)
 app.include_router(system_router)
 
 # ===== 全局异常处理: 捕获所有未处理异常, 记录完整堆栈到文件, 返回结构化JSON(而非裸500) =====
@@ -660,13 +660,14 @@ async def chat_stream_api(req: ChatRequest):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @app.post("/api/voice/stream")
-async def voice_stream_api(file: UploadFile = File(...), session_id: str = "default"):
+async def voice_stream_api(request: Request, file: UploadFile = File(...), session_id: str = "default"):
     """流式语音对话: 音频进 → ASR → 大脑逐句 → TTS批量(SSE)"""
     data = await file.read()
     ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
     if len(data) > MAX_AUDIO_SIZE:
         return JSONResponse({"error": f"音频过大", "status_code": 413}, status_code=413)
-    log.info(f"/api/voice/stream 收到音频: {len(data)}字节, 格式={ext}")
+    ua = request.headers.get("user-agent", "?")[:80]
+    log.info(f"/api/voice/stream 收到音频: {len(data)}字节, 格式={ext}, UA={ua}")
     
     wav = to_wav(data, ext)
     from voice_agent import asr
@@ -675,8 +676,10 @@ async def voice_stream_api(file: UploadFile = File(...), session_id: str = "defa
     except asyncio.TimeoutError:
         return JSONResponse({"error": "语音识别超时"}, status_code=504)
     except Exception as e:
+        log.error(f"/api/voice/stream ASR异常: {e}")
         return JSONResponse({"error": f"识别失败: {e}"}, status_code=500)
     
+    log.info(f"/api/voice/stream ASR结果: [{asr_text[:60]}] (len={len(asr_text or '')})")
     if not asr_text:
         asr_text = "(未识别到语音)"
     
@@ -816,9 +819,9 @@ async def export_conversation(format: str = "txt"):
                        headers={"Content-Disposition": "attachment; filename=conversation.json"})
     
     if format in ("markdown", "md"):
-        lines = ["# 助手小子 · 对话记录\n"]
+        lines = ["# Charlie · 对话记录\n"]
         for m in _history:
-            role = "🙋 我" if m.get("role") == "user" else "🤖 助手小子"
+            role = "🙋 我" if m.get("role") == "user" else "🤖 Charlie"
             lines.append(f"### {role}\n\n{m.get('content', '')}\n")
         lines.append(f"\n---\n*共{len(hist)}条消息 · {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}导出*")
         text = "\n".join(lines)
@@ -828,7 +831,7 @@ async def export_conversation(format: str = "txt"):
     # 默认txt格式(带时间戳)
     lines = []
     for m in hist:
-        role = "我" if m.get("role") == "user" else "助手小子"
+        role = "我" if m.get("role") == "user" else "Charlie"
         ts = m.get("ts", "")[:19].replace("T", " ") if m.get("ts") else ""
         ts_prefix = f"[{ts}] " if ts else ""
         lines.append(f"[{role}] {ts_prefix}{m.get('content', '')}")
@@ -942,7 +945,7 @@ async def websocket_endpoint(ws: WebSocket):
     log.info(f"[ws] 客户端已连接 (id={ws_id}), 共{len(_ws_clients)}个连接")
     
     # 发送连接确认
-    await ws.send_json({"type": "connect", "text": "助手小子已连接", 
+    await ws.send_json({"type": "connect", "text": "Charlie已连接", 
                         "time": datetime.datetime.now().isoformat()})
     
     try:
@@ -1153,7 +1156,7 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
         q_lower = q.lower()
         if q_lower not in content_lower:
             continue
-        role = "我" if m.get("role") == "user" else "助手小子"
+        role = "我" if m.get("role") == "user" else "Charlie"
         # Relevance scoring: exact match > word boundary > substring
         score = 1  # base score
         if content_lower == q_lower:
@@ -1194,8 +1197,8 @@ async def manifest():
     """PWA manifest for mobile install"""
     from fastapi.responses import JSONResponse
     return JSONResponse({
-        "name": "助手小子",
-        "short_name": "助手小子",
+        "name": "Charlie",
+        "short_name": "Charlie",
         "description": "中国版贾维斯 - AI语音助理",
         "start_url": "/",
         "display": "standalone",
@@ -1313,6 +1316,13 @@ def health():
 async def web_client():
     html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "voice.html")
     with open(html_path, encoding="utf-8") as f: return f.read()
+
+@app.get("/test", response_class=HTMLResponse)
+async def voice_test():
+    """语音对话测试台 - 调试用, 显示SSE事件流+延迟指标(首音频优化验证)"""
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "voice_test.html")
+    with open(html_path, encoding="utf-8") as f: return f.read()
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
