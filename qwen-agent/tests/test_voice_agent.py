@@ -1,5 +1,5 @@
 """
-魔幻手机 - 语音Agent核心单元测试
+助手小子 - 语音Agent核心单元测试
 使用mock测试: 缓存/对话历史/流式大脑生成/Markdown清理
 """
 import os, json, tempfile
@@ -119,7 +119,7 @@ class TestBuildSystemMsg:
     def test_contains_role(self):
         """包含角色定义"""
         msg = voice_agent._build_system_msg()
-        assert "魔幻手机" in msg
+        assert "助手小子" in msg
         assert "贾维斯" in msg
 
     def test_contains_tools(self):
@@ -137,7 +137,7 @@ class TestBrainStreamSentences:
         # brain.run()返回的是消息列表(list of dicts), _extract_assistant_text从中提取assistant文本
         mock_brain.run = MagicMock(return_value=[
             [{"role": "user", "content": "你好"},
-             {"role": "assistant", "content": "你好。我是魔幻手机，很高兴为你服务！"}]
+             {"role": "assistant", "content": "你好。我是助手小子，很高兴为你服务！"}]
         ])
 
         with patch.object(voice_agent, '_brain', mock_brain):
@@ -316,7 +316,7 @@ class TestPreferences:
         """无偏好时不崩溃"""
         voice_agent._preferences.clear()
         msg = voice_agent._build_system_msg()
-        assert "魔幻手机" in msg  # 系统提示词仍然正常
+        assert "助手小子" in msg  # 系统提示词仍然正常
 
 class TestTimestamps:
     """测试对话时间戳"""

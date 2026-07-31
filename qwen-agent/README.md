@@ -1,4 +1,4 @@
-# 魔幻手机 (Magic Phone) · Qwen-Agent 语音大脑
+# 助手小子 (Assistant Kid) · Qwen-Agent 语音大脑
 
 中国版贾维斯：GLM-5.2 大脑 + 原生 MCP + ASR/TTS 语音闭环，一句话跨多个 MCP 工具完成任务。
 
@@ -198,7 +198,7 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 - [x] ~~WebSocket双向实时通信~~ (v3.1: /ws端点, 文字/语音/打断TTS)
 - [x] ~~pytest单元测试~~ (v3.1: 139个测试全通过, mock GLM/TTS/ASR)
 - [x] ~~多用户会话管理~~ (v3.1: session_id全链路隔离, 最多10会话)
-- [x] ~~唤醒词检测~~ (v3.1: 浏览器端'魔幻手机'唤醒)
+- [x] ~~唤醒词检测~~ (v3.1: 浏览器端'助手小子'唤醒)
 - [x] ~~API密钥故障转移~~ (v3.1: GLM_KEY_1~5多密钥轮换)
 - [x] ~~输入清洗(XSS防护)~~ (v3.1: _sanitize_text全端点)
 - [x] ~~CORS加固~~ (v3.1: 动态来源+最小权限)
@@ -242,7 +242,7 @@ POST /api/voice/stream  : 流式语音对话(SSE: asr→text→audio→done, 逐
 - **对话上下文管理**: token感知截断(_trim_history_tokens)
   - 估算token数(中文1.5/英文1.3/符号0.5)
   - 保持在4000token预算内, 总保留最近2轮
-- **唤醒词检测**: 浏览器端'魔幻手机'唤醒(webkitSpeechRecognition)
+- **唤醒词检测**: 浏览器端'助手小子'唤醒(webkitSpeechRecognition)
   - 唤醒后自动启动录音, 无需点击
   - 支持中英文, Chrome/Safari兼容
 - **结构化日志**: LOG_FORMAT=json切换JSON格式(便于ELK/Fluentd收集)

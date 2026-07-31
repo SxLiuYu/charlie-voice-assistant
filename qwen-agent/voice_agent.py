@@ -1,5 +1,5 @@
 """
-魔幻手机 - 语音Agent核心
+助手小子 - 语音Agent核心
 语音闭环: ASR(qwen3-asr) → 大脑(GLM-5.2+Qwen-Agent+MCP) → TTS(qwen3-tts)
 连接韧性: Session复用 + 自动重试 + 异常降级
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
@@ -269,7 +269,7 @@ def _build_system_msg() -> str:
         prefs_ctx = f"\n用户偏好(请主动应用)：{'，'.join(prefs_items)}。"
     summary = _context_summaries.get("default", "")
     summary_ctx = f"\n之前对话过的内容: {summary}。" if summary else ""
-    return (f"你是魔幻手机，中国版贾维斯——用户的私人AI助理。{ctx}{prefs_ctx}\n"
+    return (f"你是助手小子，中国版贾维斯——用户的私人AI助理。{ctx}{prefs_ctx}\n"
             "你的性格：高效、主动、偶尔幽默，像老朋友一样亲切。\n"
             "你有多个MCP工具：高德地图(天气/POI/路线)、充电桩搜索、购物推荐、翻译、"
             "提醒管理(add_reminder可设提醒,list_reminders可查待办)、文件读写等。\n"
@@ -390,7 +390,7 @@ def _build_brain():
     mcp_servers = {k: v for k, v in all_mcp.items() if k in enabled}
     log.info(f"[brain] 启用{len(mcp_servers)}个MCP: {list(mcp_servers.keys())}")
     tools = [{"mcpServers": mcp_servers}]
-    return Assistant(llm=llm_cfg, name='魔幻手机',
+    return Assistant(llm=llm_cfg, name='助手小子',
         system_message=_build_system_msg(),
         function_list=tools)
 

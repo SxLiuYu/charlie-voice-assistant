@@ -1,6 +1,6 @@
 #!/bin/bash
-# 魔幻手机 - Cloudflare Tunnel 启动脚本
-# 创建公网访问隧道, 让用户从任何地方都能访问魔幻手机
+# 助手小子 - Cloudflare Tunnel 启动脚本
+# 创建公网访问隧道, 让用户从任何地方都能访问助手小子
 # 用法: bash start_tunnel.sh
 
 CF_BIN="${HOME}/.local/bin/cloudflared"

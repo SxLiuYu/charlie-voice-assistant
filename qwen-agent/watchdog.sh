@@ -1,5 +1,5 @@
 #!/bin/bash
-# 魔幻手机 - 自动重启看门狗 v2
+# 助手小子 - 自动重启看门狗 v2
 # 每60秒检查服务健康，挂了自动重启 + 文件日志 + 内存监控
 # 用法: screen -dmS watchdog bash watchdog.sh
 

@@ -1,5 +1,5 @@
 """
-魔幻手机 - 共享工具模块
+助手小子 - 共享工具模块
 提取重复逻辑: 时间解析、临时文件清理、错误脱敏
 """
 import os, re, datetime, tempfile, glob, logging

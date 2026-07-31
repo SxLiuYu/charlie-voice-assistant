@@ -1,5 +1,5 @@
 """
-魔幻手机 - API服务端单元测试
+助手小子 - API服务端单元测试
 使用FastAPI TestClient + mock测试所有API端点
 """
 import json, base64
@@ -187,7 +187,7 @@ class TestChat:
 
     def test_chat_success(self, client):
         """使用mock测试成功对话"""
-        with patch("voice_agent.brain", return_value="你好！我是魔幻手机。"):
+        with patch("voice_agent.brain", return_value="你好！我是助手小子。"):
             r = client.post("/api/chat", json={"message": "你好"})
         assert r.status_code == 200
         data = r.json()

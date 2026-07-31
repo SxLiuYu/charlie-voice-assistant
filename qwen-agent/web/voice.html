@@ -2,10 +2,10 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="魔幻手机">
+<meta name="apple-mobile-web-app-title" content="助手小子">
 <meta name="theme-color" content="#e94560">
 <link rel="manifest" href="/manifest.json">
-<title>魔幻手机 · 语音助理</title><style>
+<title>助手小子 · 语音助理</title><style>
 *{margin:0;box-sizing:border-box}body{font-family:-apple-system,"PingFang SC",sans-serif;
 background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);color:#eee;min-height:100vh;
 display:flex;flex-direction:column;align-items:center;padding:12px}
@@ -72,7 +72,7 @@ background:rgba(78,255,153,.06);border-radius:8px;font-size:13px}
 #prefadd input{flex:1;padding:8px 12px;border-radius:16px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:13px}
 #prefadd button{padding:8px 14px;border:none;border-radius:16px;background:#4e9;color:#222;font-size:13px;cursor:pointer}
 </style></head><body>
-<h1>魔幻手机</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
+<h1>助手小子</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
 <div id="tunnelurl" style="display:none;font-size:11px;color:#4e9;margin-bottom:4px;text-align:center;cursor:pointer" onclick="copyTunnelURL()"></div>
 <div id="diag">📡 点击球授权麦克风，开启自动监听…</div>
 <div id="orb" onclick="init()">🎙️</div>
@@ -348,9 +348,9 @@ function copyTunnelURL(){
     el.innerHTML+=' \u2705\u5DF2\u590D\u5236';setTimeout(loadTunnelURL,2000);
   });
 }
-// ===== 唤醒词检测(魔幻手机) =====
+// ===== 唤醒词检测(助手小子) =====
 let wakeMode=false,wakeRec=null;
-const WAKE_WORDS=["魔幻手机","magic phone","magicphone","魔法手机"];
+const WAKE_WORDS=["助手小子","assistant kid","assistantkid","魔法手机"];
 function toggleWake(){
   wakeMode=!wakeMode;
   const btn=document.getElementById('wakebtn');
@@ -358,7 +358,7 @@ function toggleWake(){
     btn.textContent='唤醒词 ON';btn.className='active';
     if(!mic){diag.textContent='⚠️ 请先点击球授权麦克风';wakeMode=false;btn.textContent='唤醒词 OFF';btn.className='off';return;}
     startWakeListener();
-    diag.textContent='🎤 唤醒词已开启,说"魔幻手机"激活对话';
+    diag.textContent='🎤 唤醒词已开启,说"助手小子"激活对话';
   }else{
     btn.textContent='唤醒词 OFF';btn.className='off';
     stopWakeListener();

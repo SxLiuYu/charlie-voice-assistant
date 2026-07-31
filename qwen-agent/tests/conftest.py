@@ -1,5 +1,5 @@
 """
-魔幻手机 - pytest配置
+助手小子 - pytest配置
 设置sys.path + 公共fixtures
 """
 import sys, os

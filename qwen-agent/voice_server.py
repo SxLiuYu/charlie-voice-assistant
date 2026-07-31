@@ -1,5 +1,5 @@
 """
-魔幻手机 - 实时语音服务
+助手小子 - 实时语音服务
 POST /api/voice    : 音频进 → ASR → 大脑(GLM-5.2+MCP) → TTS → 音频出
 POST /api/chat     : 纯文字进 → 大脑 → 文字出
 GET  /api/reminders: 待办列表
@@ -180,7 +180,7 @@ class BrainRestartRequest(BaseModel):
     """大脑重启请求(预留)"""
     force: bool = Field(default=False, description="强制重启")
 
-app = FastAPI(title="魔幻手机语音服务", lifespan=lifespan)
+app = FastAPI(title="助手小子语音服务", lifespan=lifespan)
 
 # ===== 请求体大小限制中间件 =====
 MAX_REQUEST_BODY = 15 * 1024 * 1024  # 15MB 请求体上限(含音频)
@@ -967,9 +967,9 @@ async def export_conversation(format: str = "txt"):
                        headers={"Content-Disposition": "attachment; filename=conversation.json"})
     
     if format in ("markdown", "md"):
-        lines = ["# 魔幻手机 · 对话记录\n"]
+        lines = ["# 助手小子 · 对话记录\n"]
         for m in _history:
-            role = "🙋 我" if m.get("role") == "user" else "🤖 魔幻手机"
+            role = "🙋 我" if m.get("role") == "user" else "🤖 助手小子"
             lines.append(f"### {role}\n\n{m.get('content', '')}\n")
         lines.append(f"\n---\n*共{len(hist)}条消息 · {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}导出*")
         text = "\n".join(lines)
@@ -979,7 +979,7 @@ async def export_conversation(format: str = "txt"):
     # 默认txt格式(带时间戳)
     lines = []
     for m in hist:
-        role = "我" if m.get("role") == "user" else "魔幻手机"
+        role = "我" if m.get("role") == "user" else "助手小子"
         ts = m.get("ts", "")[:19].replace("T", " ") if m.get("ts") else ""
         ts_prefix = f"[{ts}] " if ts else ""
         lines.append(f"[{role}] {ts_prefix}{m.get('content', '')}")
@@ -1121,7 +1121,7 @@ async def websocket_endpoint(ws: WebSocket):
     log.info(f"[ws] 客户端已连接 (id={ws_id}), 共{len(_ws_clients)}个连接")
     
     # 发送连接确认
-    await ws.send_json({"type": "connect", "text": "魔幻手机已连接", 
+    await ws.send_json({"type": "connect", "text": "助手小子已连接", 
                         "time": datetime.datetime.now().isoformat()})
     
     try:
@@ -1329,7 +1329,7 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
         q_lower = q.lower()
         if q_lower not in content_lower:
             continue
-        role = "我" if m.get("role") == "user" else "魔幻手机"
+        role = "我" if m.get("role") == "user" else "助手小子"
         # Relevance scoring: exact match > word boundary > substring
         score = 1  # base score
         if content_lower == q_lower:
@@ -1364,7 +1364,7 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
 @app.get("/api/version")
 async def version():
     return {
-        "name": "魔幻手机",
+        "name": "助手小子",
         "version": "3.1.0",
         "brain": "GLM-5.2 + Qwen-Agent + 4 MCP (可配置)",
         "voice": "qwen3-asr/tts-flash (finna)",
@@ -1406,7 +1406,7 @@ async def dashboard():
     m = _metrics.summary()
     return f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>魔幻手机 · 监控面板</title><meta http-equiv="refresh" content="10">
+<title>助手小子 · 监控面板</title><meta http-equiv="refresh" content="10">
 <style>*{{margin:0;box-sizing:border-box}}body{{font-family:-apple-system,sans-serif;
 background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);color:#eee;min-height:100vh;padding:20px}}
 h1{{font-size:22px;margin-bottom:4px;background:linear-gradient(90deg,#e94560,#f5a623);
@@ -1425,7 +1425,7 @@ h1{{font-size:22px;margin-bottom:4px;background:linear-gradient(90deg,#e94560,#f
 a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 .rem{{padding:6px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:13px}}
 </style></head><body>
-<h1>🎛️ 魔幻手机 · 监控面板</h1>
+<h1>🎛️ 助手小子 · 监控面板</h1>
 <div class="sub">自动刷新10秒 | <a href="/">语音客户端</a> | <a href="/docs">API文档</a> | <a href="/api/status">JSON状态</a></div>
 <div class="grid">
 <div class="card"><h3>🖥️ 系统</h3>
@@ -1479,8 +1479,8 @@ async def manifest():
     """PWA manifest for mobile install"""
     from fastapi.responses import JSONResponse
     return JSONResponse({
-        "name": "魔幻手机",
-        "short_name": "魔幻手机",
+        "name": "助手小子",
+        "short_name": "助手小子",
         "description": "中国版贾维斯 - AI语音助理",
         "start_url": "/",
         "display": "standalone",
