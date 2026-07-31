@@ -196,14 +196,14 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 - [ ] 开发板多端(树莓派直接跑/ESP32瘦客户端)
 - [ ] 外卖购物商品搜索(京东union API需授权认证)
 - [x] ~~WebSocket双向实时通信~~ (v3.1: /ws端点, 文字/语音/打断TTS)
-- [x] ~~pytest单元测试~~ (v3.1: 95个测试全通过, mock GLM/TTS/ASR)
+- [x] ~~pytest单元测试~~ (v3.1: 139个测试全通过, mock GLM/TTS/ASR)
 - [x] ~~多用户会话管理~~ (v3.1: session_id全链路隔离, 最多10会话)
 - [x] ~~唤醒词检测~~ (v3.1: 浏览器端'魔幻手机'唤醒)
 - [x] ~~API密钥故障转移~~ (v3.1: GLM_KEY_1~5多密钥轮换)
 - [x] ~~输入清洗(XSS防护)~~ (v3.1: _sanitize_text全端点)
 - [x] ~~CORS加固~~ (v3.1: 动态来源+最小权限)
 - [x] ~~优雅降级~~ (v3.1: 大脑失败时返回友好提示+密钥轮换)
-- [ ] 对话历史时间戳(消息带ts字段, 支持时间搜索)
+- [x] ~~对话历史时间戳~~ (v3.1: 每条消息庆ts, 导出日期过滤)
 
 
 ## 请求指标
@@ -228,7 +228,7 @@ POST /api/voice/stream  : 流式语音对话(SSE: asr→text→audio→done, 逐
   - 自动重连+SSE降级(Web客户端)
   - 支持多设备同时连接
 - **限流防护**: 每IP每分钟60次普通+10次语音请求, 超限429+Retry-After
-- **pytest单元测试**: 95个测试全通过(0.83s)
+- **pytest单元测试**: 139个测试全通过(0.83s)
   - test_utils.py(21): 时间解析/错误脱敏/文件清理/历史截断
   - test_voice_agent.py(21): 缓存/历史/流式大脑/Mock/重试逻辑
   - test_voice_server.py(25): API端点/WebSocket/限流/Mock TTS
@@ -251,4 +251,35 @@ POST /api/voice/stream  : 流式语音对话(SSE: asr→text→audio→done, 逐
 - **CORS加固**: 动态来源(localhost+tunnel) + 限制方法/头部 + credentials
 - **优雅降级**: 大脑失败时返回友好提示+自动密钥轮换, 非500错误
 - **连接池调优**: pool_connections=10, pool_maxsize=10, keep-alive
+
+
+## v3.2 安全加固与代码优化
+- **eval()安全修复**: baize_skills_mcp.py的calculate工具, 用AST安全求值器替代eval()
+  - 支持四则运算/幂/取模/整除, 拒绝字符串注入/属性访问/lambda
+  - 13个安全测试覆盖(注入攻击/无效语法/边界情况)
+- **MCP僵尸进程清理**: 大脑重建时自动清理旧MCP客户端连接
+  - restart_brain()和_record_brain_failure()都调用_cleanup_brain_processes()
+  - 防止反复重启导致子进程泄漏
+- **brain_status()死代码移除**: 删除return之后的不可达代码(含deprecated asyncio调用)
+- **brain()日志bug修复**: 移除引用未定义变量messages的日志语句
+- **重复_load_history()清理**: 移除模块级孤儿代码(原def缺失导致的裸代码块)
+- **asyncio.get_event_loop()修复**: 替换为get_running_loop(), 消除DeprecationWarning
+  - voice_agent.py _ensure_event_loop()
+  - voice_server.py lifespan() + WebSocket handler
+- **请求体大小限制中间件**: 15MB上限, 超限返回413(防OOM)
+- **.env.example完善**: 文档化全部环境变量(LOG_FORMAT/SKIP_BACKGROUND/GLM_KEY_2~5等)
+- **新增25个安全测试**: test_security_fixes.py(安全求值/MCP清理/死代码/请求限制/env文档)
+  - 总测试: 139个全通过(原114+25)
+
+## v3.1 第5轮优化
+- **对话上下文摘要**: 截断历史时自动提取关键信息(用户消息前15字/AI回复前10字)
+  - 摘要存储在_context_summaries, 包含在系统提示词中
+  - 保留最近5个话题, 最长200字, 累积合并
+  - GLM大脑知道之前聊过什么, 保持上下文连续性
+- **会话级限流**: 每会话每分钟30次(default会话不限)
+  - 防止多用户通过tunnel共享IP时互相影响
+- **对话搜索盳8关性评分**: 精确匹配100分 > 词边界 > 子串匹配(出现次数*10)
+  - 按评分降序排列, [高亮]匹配文本, 分页(limit/offset)
+- **/api/context调试端点**: 显示历史数/token估算/预算/摘要/偏好数
+- **API令牌认证**: AUTH_TOKEN环境变量, 本地免认证, 外部需Bearer令牌
 - **Web客户端WebSocket**: 自动重连+打断按钮+SSE降级

@@ -178,24 +178,6 @@ def _trim_history_tokens(hist: list, max_tokens: int = MAX_CONTEXT_TOKENS, sessi
         log.info(f"[context] {session_id[:8]} summary: {_context_summaries[session_id][:60]}")
     log.debug(f"[context] 截断至{len(hist)}条({total}tok, 预算{max_tokens})")
 
-# 替换原有的简单截断为token感知截断 -> None:
-    global _history, _sessions
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            # 新格式: 多会话
-            _sessions = data
-            _history = _sessions.get("default", [])
-            _sessions["default"] = _history
-        elif isinstance(data, list):
-            # 旧格式: 单一会话列表(向后兼容)
-            _history = data
-            _sessions = {"default": _history}
-    except Exception:
-        _history = []
-        _sessions = {"default": _history}
-
 def reset_history(session_id: str = "default") -> None:
     """重置指定会话的历史(原地清空, 保持引用有效)"""
     with _history_lock:
@@ -205,8 +187,6 @@ def reset_history(session_id: str = "default") -> None:
         else:
             _sessions[session_id] = []
     _save_history()
-
-_load_history()
 
 # ===== 用户偏好系统(越用越懂你) =====
 PREFS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preferences.json")
@@ -424,7 +404,7 @@ _brain_build_time = 0         # 大脑构建时间
 def _ensure_event_loop():
     """确保当前线程有event loop(Qwen-Agent MCP可能需要)"""
     try:
-        asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
@@ -436,6 +416,8 @@ def _record_brain_failure(error: str = ""):
     log.error(f"[brain] 失败#{_brain_failures}: {error}")
     if _brain_failures >= _MAX_BRAIN_FAILURES:
         log.warning(f"[brain] 连续失败{_brain_failures}次, 重建大脑+MCP...")
+        old_brain = _brain
+        _cleanup_brain_processes(old_brain)
         _brain = None  # 清除旧大脑, 下次请求自动重建
         _brain_failures = 0
 
@@ -445,9 +427,34 @@ def _record_brain_success():
     _brain_failures = 0
     _brain_last_success = time.time()
 
+def _cleanup_brain_processes(brain_instance):
+    """清理大脑实例关联的MCP子进程(防止僵尸进程)"""
+    if brain_instance is None:
+        return
+    try:
+        # Qwen-Agent的MCP服务器通过subprocess管理
+        # 清理function_list中的MCP server connections
+        if hasattr(brain_instance, '_function_list'):
+            for func in (brain_instance._function_list or []):
+                if isinstance(func, dict) and 'mcpServers' in func:
+                    for name, cfg in func['mcpServers'].items():
+                        # 尝试关闭MCP client连接
+                        try:
+                            if hasattr(brain_instance, '_mcp_clients') and name in (brain_instance._mcp_clients or {}):
+                                client = brain_instance._mcp_clients[name]
+                                if hasattr(client, 'close'):
+                                    client.close()
+                                log.info(f"[brain] MCP客户端已关闭: {name}")
+                        except Exception as e:
+                            log.debug(f"[brain] 关闭MCP客户端 {name} 失败: {e}")
+    except Exception as e:
+        log.debug(f"[brain] MCP清理异常: {e}")
+
 def restart_brain() -> str:
     """手动重启大脑(清除旧实例+MCP连接, 下次请求重建)"""
     global _brain, _brain_failures
+    old_brain = _brain
+    _cleanup_brain_processes(old_brain)
     _brain = None
     _brain_failures = 0
     log.info("[brain] 手动重启请求, 大脑将在下次请求时重建")
@@ -464,11 +471,6 @@ def brain_status() -> dict:
         "last_failure": _dt.datetime.fromtimestamp(_brain_last_failure).isoformat() if _brain_last_failure else None,
         "uptime_since": _dt.datetime.fromtimestamp(_brain_build_time).isoformat() if _brain_build_time else None,
     }
-    """确保当前线程有event loop(Qwen-Agent MCP可能需要)"""
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
 
 def brain(text: str, session_id: str = "default") -> str:
     """大脑推理: 文字→GLM-5.2+MCP→回复文字"""
@@ -484,7 +486,7 @@ def brain(text: str, session_id: str = "default") -> str:
             _brain = _build_brain()
             global _brain_build_time
             _brain_build_time = time.time()
-            log.info(f"[brain] 大脑构建完成, {len(messages) if 'messages' in dir() else '?'}消息")
+            log.info("[brain] 大脑构建完成")
         except Exception as e:
             log.error(f"大脑构建失败: {e}")
             return "大脑启动失败，请稍后重试"

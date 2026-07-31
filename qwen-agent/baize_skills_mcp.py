@@ -121,16 +121,55 @@ def open_lifestyle_app(intent: str, keyword: str = "") -> str:
     return f"已为'{keyword or intent}'生成App链接(手机点击唤起下单):\n" + "\n".join(f"• {k}: {v}" for k, v in links.items())
 
 # ===== 计算/换算 =====
+def _safe_math_eval(expr: str) -> float | None:
+    """安全的数学表达式求值(基于AST, 不使用eval)"""
+    import ast, operator
+    operators = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Pow: operator.pow,
+        ast.Mod: operator.mod,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+        ast.FloorDiv: operator.floordiv,
+    }
+    def _eval(node):
+        if isinstance(node, ast.Constant):  # Python 3.8+
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError(f"不允许的常量类型: {type(node.value)}")
+        elif isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            op_type = type(node.op)
+            if op_type in operators:
+                return operators[op_type](left, right)
+            raise ValueError(f"不允许的操作: {op_type.__name__}")
+        elif isinstance(node, ast.UnaryOp):
+            operand = _eval(node.operand)
+            op_type = type(node.op)
+            if op_type in operators:
+                return operators[op_type](operand)
+            raise ValueError(f"不允许的一元操作: {op_type.__name__}")
+        else:
+            raise ValueError(f"不允许的语法: {type(node).__name__}")
+    try:
+        tree = ast.parse(expr, mode='eval')
+        return _eval(tree.body)
+    except Exception:
+        return None
+
 @mcp.tool()
 def calculate(expression: str) -> str:
     """计算或单位换算。expression=算式如'123*456'或'5公里等于多少英里'"""
     import re
     e = expression.strip().rstrip("=＝")
     if re.fullmatch(r"[\d.\s+\-*/()%^]+", e):
-        try:
-            r = eval(e.replace("^", "**"))
-            return f"{e} = {r}"
-        except: pass
+        result = _safe_math_eval(e.replace("^", "**"))
+        if result is not None:
+            return f"{e} = {result}"
     return aliyun_chat([{"role":"system","content":"你是计算换算助手，直接给结果和一行过程"},
         {"role":"user","content":expression}], temperature=0)
 

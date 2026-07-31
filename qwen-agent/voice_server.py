@@ -112,7 +112,7 @@ async def lifespan(app):
         log.info("后台调度器跳过(SKIP_BACKGROUND=1，由HTTP进程管理)")
     else:
         global _main_loop
-        _main_loop = asyncio.get_event_loop()
+        _main_loop = asyncio.get_running_loop()
         # 启动时清理临时文件 + 截断历史
         from utils import cleanup_temp_files, truncate_history_file
         cleanup_temp_files()
@@ -181,6 +181,21 @@ class BrainRestartRequest(BaseModel):
     force: bool = Field(default=False, description="强制重启")
 
 app = FastAPI(title="魔幻手机语音服务", lifespan=lifespan)
+
+# ===== 请求体大小限制中间件 =====
+MAX_REQUEST_BODY = 15 * 1024 * 1024  # 15MB 请求体上限(含音频)
+
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    """限制请求体大小, 防止大文件上传导致OOM"""
+    if request.method in ("POST", "PUT", "PATCH"):
+        cl = request.headers.get("content-length")
+        if cl and int(cl) > MAX_REQUEST_BODY:
+            return JSONResponse(
+                {"error": f"请求体过大({int(cl)//1024//1024}MB), 上限{MAX_REQUEST_BODY//1024//1024}MB"},
+                status_code=413
+            )
+    return await call_next(request)
 
 # CORS: 允许跨域访问(手机/其他设备)
 from fastapi.middleware.cors import CORSMiddleware
@@ -1058,7 +1073,7 @@ def _ws_cleanup_stale():
             ws = _ws_clients[sid].get("ws")
             if ws:
                 import asyncio
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 loop.call_soon_threadsafe(asyncio.ensure_future, ws.close())
         except Exception:
             pass
