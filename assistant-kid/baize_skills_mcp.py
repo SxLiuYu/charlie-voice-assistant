@@ -10,8 +10,8 @@ try:
 except ImportError: pass
 
 mcp = FastMCP("baize-skills")
-TAVILY = os.getenv("TAVILY_API_KEY", "REDACTED")
-ALIYUN = os.getenv("ALIYUN_API_KEY", "sk-16cb5f2bc07a4984b43588a6f7e1c4c6")
+TAVILY = os.getenv("TAVILY_API_KEY", "")
+ALIYUN = os.getenv("ALIYUN_API_KEY", "")
 DASHSCOPE = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
 

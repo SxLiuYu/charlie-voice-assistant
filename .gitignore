@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Baize is an independent nested git repo — never track from parent
+/Baize/
+
+# Editor
+.vscode/
+.idea/

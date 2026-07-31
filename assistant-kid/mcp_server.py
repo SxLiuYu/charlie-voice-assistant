@@ -20,7 +20,7 @@ def get_current_time() -> str:
 def search_charging_stations(city: str = "北京", count: int = 3) -> str:
     """搜索附近的充电桩(真实高德数据)。参数: city-城市, count-数量"""
     import os, requests
-    AMAP = os.getenv("AMAP_KEY", os.getenv("AMAP_MAPS_API_KEY", "REDACTED"))
+    AMAP = os.getenv("AMAP_KEY", os.getenv("AMAP_MAPS_API_KEY", ""))
     try:
         r = requests.get("https://restapi.amap.com/v3/place/text",
             params={"keywords":"充电桩","city":city,"citylimit":"true","offset":min(count*3,20),

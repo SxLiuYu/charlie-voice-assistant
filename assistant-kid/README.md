@@ -79,27 +79,40 @@ screen -dmS voice-https bash -c 'source .venv/bin/activate && python https_serve
 screen -dmS watchdog bash watchdog.sh
 ```
 
-## API 端点 (12个, Swagger文档: /docs)
+## API 端点 (30个, Swagger文档: /docs)
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/` | Web客户端(语音VAD+文字+提醒+历史+新对话) |
 | POST | `/api/voice` | 音频进→ASR→大脑→TTS→JSON |
 | POST | `/api/chat` | 纯文字对话(带记忆) |
-| POST | `/api/tts` | 文字→WAV语音(独立TTS) |
+| POST | `/api/chat/stream` | 流式文字对话(SSE: text+audio+done) |
+| POST | `/api/voice/stream` | 流式语音对话(SSE: asr+text+audio+done) |
+| POST | `/api/tts` | 文字→MP3语音(独立TTS) |
 | POST | `/api/asr` | 音频→文字(独立ASR) |
 | POST | `/api/reset` | 清空对话历史 |
-| GET | `/api/conversation` | 获取对话历史 |
-| GET | `/api/status` | 系统状态(CPU/内存/磁盘/提醒) |
-| GET | `/api/version` | 版本信息+功能列表 |
-| GET | `/api/export` | 导出对话历史(文本) |
-| GET | `/api/notifications` | 获取并清空通知队列(Web轮询用) |
-| GET | `/api/search?q=xxx` | 搜索对话历史 |
-| GET | `/manifest.json` | PWA移动端manifest |
+| GET | `/api/conversation` | 获取对话历史(分页) |
+| GET | `/api/status` | 系统状态(CPU/内存/磁盘/提醒/大脑/WS) |
+| GET | `/api/version` | 版本信息+40项功能列表 |
+| GET | `/api/export` | 导出对话历史(txt/markdown/json) |
+| GET | `/api/notifications` | 获取并清空通知队列 |
+| GET | `/api/events` | SSE实时通知流(免轮询) |
+| GET | `/api/search?q=xxx` | 搜索对话历史(评分+分页+高亮) |
+| GET | `/api/metrics` | 请求指标(总数/错误率/p50/p95) |
+| GET | `/api/sessions` | 列出所有活跃会话(多用户监控) |
+| GET | `/api/context` | 对话上下文摘要(调试用) |
+| GET | `/api/tunnel` | Cloudflare Tunnel公网地址 |
+| GET | `/api/preferences` | 获取用户偏好 |
+| POST | `/api/preferences` | 设置用户偏好 |
+| DELETE | `/api/preferences/{key}` | 删除用户偏好 |
 | GET | `/api/reminders` | 提醒列表 |
 | POST | `/api/reminders` | 添加提醒 |
-| DELETE | `/api/reminders/{id}` | 标记提醒完成 |
-| GET | `/dashboard` | 监控面板(CPU/内存/提醒/大脑状态) |
-| GET | `/health` | 健康检查 |
+| DELETE | `/api/reminders/{rid}` | 标记提醒完成 |
+| POST | `/api/brain/restart` | 手动重启大脑(清除旧MCP) |
+| GET | `/manifest.json` | PWA移动端manifest |
+| GET | `/dashboard` | 监控面板(CPU/内存/提醒/大脑/指标) |
+| WS | `/ws` | WebSocket双向通信(文字/语音/打断) |
+| GET | `/health` | 健康检查(uptime/大脑/WS/SSE) |
+| GET | `/docs` | Swagger自动文档 |
 
 ## 自测
 ```bash

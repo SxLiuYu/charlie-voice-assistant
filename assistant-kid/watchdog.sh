@@ -18,9 +18,9 @@ log "看门狗v2启动 - 检查间隔60s"
 
 while true; do
     # 检查HTTP
-    HTTP_OK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost:8000/health 2>/dev/null)
+    HTTP_OK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost:8000/api/status 2>/dev/null)
     # 检查HTTPS
-    HTTPS_OK=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 https://localhost:8443/health 2>/dev/null)
+    HTTPS_OK=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 https://localhost:8443/api/status 2>/dev/null)
 
     NEED_RESTART=0
 

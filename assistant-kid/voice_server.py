@@ -52,55 +52,30 @@ else:
     _logging.basicConfig(level=_logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = _logging.getLogger("magic")
 
+# ===== 文件日志(持久化, 含uvicorn错误堆栈, 防止traceback丢失) =====
+import logging.handlers as _loghandlers
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_file_handler = _loghandlers.RotatingFileHandler(
+    os.path.join(_LOG_DIR, "app.log"), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+_file_handler.setFormatter(_logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+_file_handler.setLevel(_logging.INFO)
+# 挂到root + uvicorn子logger, 确保未捕获异常堆栈落盘
+for _lg in (_logging.getLogger(), _logging.getLogger("uvicorn"),
+            _logging.getLogger("uvicorn.error"), _logging.getLogger("uvicorn.access")):
+    _lg.addHandler(_file_handler)
+log.info(f"文件日志已启用: {os.path.join(_LOG_DIR, 'app.log')}")
+# ===== 抽取到app模块(Phase1: 纯函数) =====
+from app.audio import to_wav, _wav_to_mp3, MAX_AUDIO_SIZE
+from app.auth import _client_ip, _is_local_request, _check_auth, _sanitize_text, AUTH_TOKEN
+from app.brain_health import _brain_is_warm, _get_brain_health, _warmup_brain
+from app.state import (_metrics, _ws_clients, _sse_clients, _rate_buckets, _session_buckets,
+    _RATE_GENERAL, _RATE_VOICE, _RATE_WINDOW, _RATE_PER_SESSION, MAX_REQUEST_BODY, _ws_client_count)
+from app.reminders import REMINDERS_FILE, _load_reminders, _save_reminders, _cleanup_old_reminders
+from app.routes.system import system_router
+
 # ===== 请求指标追踪 =====
-class Metrics:
-    """轻量级请求指标追踪"""
-    def __init__(self):
-        self.requests: dict = {}
-        self.errors = 0
-        self.cache_hits = 0
-        self.total_requests = 0
-        self.response_times: list = []
 
-    def record(self, endpoint: str, duration_ms: float, ok: bool = True):
-        self.total_requests += 1
-        if not ok:
-            self.errors += 1
-        if endpoint not in self.requests:
-            self.requests[endpoint] = {"count": 0, "total_ms": 0, "errors": 0}
-        self.requests[endpoint]["count"] += 1
-        self.requests[endpoint]["total_ms"] += duration_ms
-        if not ok:
-            self.requests[endpoint]["errors"] += 1
-        self.response_times.append(duration_ms)
-        if len(self.response_times) > 100:
-            self.response_times = self.response_times[-100:]
-
-    def cache_hit(self):
-        self.cache_hits += 1
-
-    def summary(self) -> dict:
-        import statistics
-        times = self.response_times
-        avg_ms = statistics.mean(times) if times else 0
-        p95 = sorted(times)[int(len(times) * 0.95)] if len(times) >= 20 else 0
-        endpoints = {}
-        for ep, d in self.requests.items():
-            endpoints[ep] = {
-                "count": d["count"],
-                "avg_ms": round(d["total_ms"] / d["count"], 1) if d["count"] else 0,
-                "errors": d["errors"],
-            }
-        return {
-            "total_requests": self.total_requests,
-            "total_errors": self.errors,
-            "cache_hits": self.cache_hits,
-            "avg_response_ms": round(avg_ms, 1),
-            "p95_response_ms": round(p95, 1),
-            "endpoints": endpoints,
-        }
-
-_metrics = Metrics()
 _start_time = time.time()  # 服务启动时间(用于健康检查uptime)
 
 
@@ -181,9 +156,20 @@ class BrainRestartRequest(BaseModel):
     force: bool = Field(default=False, description="强制重启")
 
 app = FastAPI(title="助手小子语音服务", lifespan=lifespan)
+app.include_router(system_router)
+
+# ===== 全局异常处理: 捕获所有未处理异常, 记录完整堆栈到文件, 返回结构化JSON(而非裸500) =====
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    import traceback as _tb
+    tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+    log.error(f"[500] 未处理异常 {request.method} {request.url.path}: {exc}\n{tb}")
+    return JSONResponse(
+        {"error": "internal_server_error", "detail": str(exc), "path": request.url.path},
+        status_code=500,
+    )
 
 # ===== 请求体大小限制中间件 =====
-MAX_REQUEST_BODY = 15 * 1024 * 1024  # 15MB 请求体上限(含音频)
 
 @app.middleware("http")
 async def limit_request_size(request: Request, call_next):
@@ -223,16 +209,7 @@ app.add_middleware(CORSMiddleware,
     max_age=3600)
 
 # ===== 限流中间件(防滥用, 每IP每分钟60次普通+10次语音) =====
-_rate_buckets = {}  # {ip: {"voice": [timestamps], "general": [timestamps]}}
-_RATE_GENERAL = 60   # 每分钟普通请求上限
-_RATE_VOICE = 10      # 每分钟语音请求上限(更重)
-_RATE_WINDOW = 60     # 窗口60秒
-_RATE_PER_SESSION = 30  # 每会话每分钟请求上限
-_session_buckets = {}  # {session_id: [timestamps]}
 
-def _client_ip(request: Request) -> str:
-    """获取客户端IP(支持代理转发)"""
-    return request.headers.get("x-forwarded-for", "").split(",")[0].strip() or            request.headers.get("x-real-ip", "") or            request.client.host if request.client else "unknown"
 
 def _check_rate(ip: str, bucket_type: str, limit: int) -> tuple:
     """检查速率, 返回(allowed, remaining, retry_after)"""
@@ -270,9 +247,6 @@ def _check_session_rate(session_id: str) -> tuple:
     bucket.append(now)
     return True, _RATE_PER_SESSION - len(bucket), 0
 
-def _ws_client_count() -> int:
-    """当前活跃WebSocket连接数"""
-    return len(_ws_clients)
 
 # 请求日志中间件
 @app.middleware("http")
@@ -312,81 +286,14 @@ async def request_logger(request: Request, call_next):
     response.headers["X-Request-ID"] = rid
     return response
 
-REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
-MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB 音频上限
 MAX_TEXT_LENGTH = 500  # 文字输入上限
 
 # ===== 音频转wav =====
-def to_wav(data: bytes, ext: str) -> bytes:
-    if ext in ("wav", "wave"):
-        return data
-    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
-        f.write(data)
-        inp = f.name
-    out = inp + ".wav"
-    try:
-        subprocess.run(["ffmpeg", "-y", "-i", inp, "-ar", "16000", "-ac", "1", "-f", "wav", out],
-                       capture_output=True, timeout=15)
-        with open(out, "rb") as f: return f.read()
-    except Exception:
-        return data
-    finally:
-        for p in (inp, out):
-            try: os.unlink(p)
-            except: pass
 
-def _wav_to_mp3(wav_data: bytes, bitrate: str = "32k") -> bytes:
-    """WAV音频转MP3(语音级32kbps,约6x压缩), 减少网络传输"""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(wav_data); inp = f.name
-    out = inp.replace(".wav", ".mp3")
-    try:
-        subprocess.run(["ffmpeg", "-y", "-i", inp, "-b:a", bitrate, "-ac", "1", out],
-                       capture_output=True, timeout=10)
-        with open(out, "rb") as f: return f.read()
-    except Exception:
-        return wav_data  # 失败返回原始WAV
-    finally:
-        for p in (inp, out):
-            try: os.unlink(p)
-            except: pass
 
 # ===== 提醒管理 =====
-def _cleanup_old_reminders(reminders: list) -> tuple:
-    """清理已完成的旧提醒(7天前完成的), 返回(清理后列表, 删除数)"""
-    import datetime as _dt
-    cutoff = (_dt.datetime.now() - _dt.timedelta(days=7)).isoformat()
-    kept = []
-    removed = 0
-    for r in reminders:
-        if r.get("done") and r.get("completed_at", r.get("triggered_at", "")) < cutoff:
-            removed += 1
-        else:
-            kept.append(r)
-    if removed > 0:
-        log.info(f"[reminders] 自动清理{removed}条已完成旧提醒")
-    return kept, removed
 
-def _load_reminders():
-    """带文件锁的提醒加载(自动清理7天前已完成)"""
-    try:
-        with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_SH)
-            data = json.load(f)
-            fcntl.flock(f, fcntl.LOCK_UN)
-            return data
-    except Exception:
-        return []
 
-def _save_reminders(data):
-    """带文件锁的提醒保存(保存前自动清理7天前已完成)"""
-    data, removed = _cleanup_old_reminders(data)
-    if removed > 0:
-        log.info(f"[reminders] 保存时清理{removed}条旧提醒")
-    with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        fcntl.flock(f, fcntl.LOCK_UN)
 
 # ===== 通知队列(Web客户端可轮询获取主动通知) =====
 _notifications = []
@@ -403,7 +310,6 @@ def _add_notification(text: str, ntype: str = "reminder"):
     _push_notification_to_sse(text, ntype)  # SSE实时推送
 
 # ===== SSE实时通知推送 =====
-_sse_clients = []  # 已连接的SSE客户端队列列表
 _main_loop = None  # 主线程event loop(启动时捕获)
 
 def _push_notification_to_sse(text: str, ntype: str = "reminder"):
@@ -486,7 +392,7 @@ def _start_scheduler():
     t.start()
 
 # ===== 主动建议(天气/时间感知) =====
-AMAP_KEY = os.getenv("AMAP_KEY", "REDACTED")
+AMAP_KEY = os.getenv("AMAP_KEY", "")
 SUGGEST_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "suggestions_state.json")
 SUGGESTIONS_STATE = {"last_weather_check": 0, "last_rain_suggest": "", "last_time_suggest": "", "last_health_alert": ""}
 
@@ -624,41 +530,9 @@ def _start_proactive():
     t = threading.Thread(target=_proactive_suggestions, daemon=True)
     t.start()
 
-def _brain_is_warm():
-    """检查大脑是否已预热"""
-    try:
-        from voice_agent import _brain
-        return _brain is not None
-    except Exception:
-        return False
 
-def _get_brain_health():
-    """获取大脑健康状态(失败计数/上次成功/上次失败)"""
-    try:
-        from voice_agent import brain_status
-        return brain_status()
-    except Exception:
-        return {"ready": False, "error": "无法获取"}
 
 # ===== 预热大脑(修复asyncio子线程问题) =====
-def _warmup_brain():
-    """后台预启动大脑+6MCP，首请求省~9秒"""
-    def _w():
-        log.info("[warmup] 预启动大脑+6MCP...")
-        try:
-            # 为子线程创建独立event loop
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            from voice_agent import _build_brain
-            import voice_agent
-            voice_agent._brain = _build_brain()
-            # 跑一次简单请求预热
-            for rsp in voice_agent._brain.run([{'role': 'user', 'content': '你好'}]):
-                pass
-            log.info("[warmup] 大脑+6MCP预启动完成，首请求将更快")
-        except Exception as e:
-            log.warning(f"[warmup] 预热失败(不影响使用): {e}")
-    threading.Thread(target=_w, daemon=True).start()
 
 # ===== API 路由 =====
 
@@ -727,6 +601,7 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
         yield f'data: {json.dumps({"type":"asr","text":asr_text}, ensure_ascii=False)}\n\n'
     
     tts_buffer = ""
+    first_audio_sent = False  # 首段立即flush(降首音频延迟)
     total_wait = 0
     HEARTBEAT_INTERVAL = 5  # 每5秒发心跳
     MAX_WAIT = 120  # 总超时120秒
@@ -767,10 +642,11 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
             cleaned = _clean_for_tts(sentence)
             if cleaned and len(cleaned) >= 2:
                 tts_buffer = (tts_buffer + "，" + cleaned) if tts_buffer else cleaned
-                # 缓冲区达到阈值 → 生成TTS推送
-                if len(tts_buffer) >= _TTS_BATCH_SIZE:
+                # 首段立即flush(不等50字,降低首音频延迟); 后续按50字批
+                if (not first_audio_sent) or (len(tts_buffer) >= _TTS_BATCH_SIZE):
                     audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
                     tts_buffer = ""
+                    first_audio_sent = True
                     if audio_b64:
                         yield f'data: {json.dumps({"type":"audio","audio":audio_b64}, ensure_ascii=False)}\n\n'
 
@@ -838,33 +714,6 @@ async def reset_conversation(session_id: str = "default"):
     reset_history(session_id)
     return {"ok": True, "message": "对话已重置", "session_id": session_id}
 
-@app.get("/api/status")
-async def system_status():
-    """系统状态(设备+服务+提醒)"""
-    import psutil, socket, platform
-    vm = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    return {
-        "device": socket.gethostname(),
-        "os": f"{platform.system()} {platform.release()}",
-        "cpu_percent": psutil.cpu_percent(interval=0.5),
-        "cpu_cores": psutil.cpu_count(),
-        "memory_total_gb": round(vm.total / 1073741824, 1),
-        "memory_used_gb": round((vm.total - vm.available) / 1073741824, 1),
-        "memory_percent": vm.percent,
-        "disk_percent": disk.percent,
-        "reminders_pending": len([r for r in _load_reminders() if not r.get("done")]),
-        "brain_ready": _brain_is_warm(),
-        "brain_health": _get_brain_health(),
-        "websocket_connections": _ws_client_count(),
-        "rate_limit": {
-            "tracked_ips": len(_rate_buckets),
-            "tracked_sessions": len(_session_buckets),
-            "general_limit": _RATE_GENERAL,
-            "voice_limit": _RATE_VOICE,
-            "session_limit": _RATE_PER_SESSION,
-        },
-    }
 
 @app.get("/api/reminders")
 async def list_reminders():
@@ -1027,40 +876,12 @@ async def sse_events():
 
 
 # ===== API令牌认证(保护公网访问) =====
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 
-def _is_local_request(request):
-    ip = _client_ip(request)
-    return ip in ("127.0.0.1", "localhost", "::1", "")
 
-def _check_auth(request):
-    if not AUTH_TOKEN:
-        return True
-    if _is_local_request(request):
-        return True
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    return token == AUTH_TOKEN
 
 # ===== 输入清洗(防XSS/注入) =====
-def _sanitize_text(text: str, max_len: int = 500) -> str:
-    """清洗用户输入: 去除HTML标签、脚本、控制字符"""
-    if not text:
-        return ""
-    import re as _re
-    # 截断超长输入
-    text = text[:max_len]
-    # 去除HTML标签
-    text = _re.sub(r'<[^>]+>', '', text)
-    # 去除脚本相关内容
-    text = _re.sub(r'javascript:', '', text, flags=_re.IGNORECASE)
-    text = _re.sub(r'on\w+\s*=', '', text, flags=_re.IGNORECASE)
-    # 去除控制字符(保留换行和制表符)
-    text = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    # 去除首尾空白
-    return text.strip()
 
 # ===== WebSocket 双向通信(实时语音/文字, 支持打断TTS) =====
-_ws_clients = {}  # {ws_id: {"ws": ws, "interrupt": False, "last_active": time.time()}}
 _WS_STALE_TIMEOUT = 300  # 5分钟无活动视为过期
 
 def _ws_cleanup_stale():
@@ -1247,6 +1068,8 @@ async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = "", session_id
         yield {"type": "asr", "text": asr_text}
     
     tts_buffer = ""
+    first_audio_sent = False  # 首段立即flush(降首音频延迟)
+    total_wait = 0
     total_wait = 0
     
     while True:
@@ -1287,9 +1110,10 @@ async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = "", session_id
             cleaned = _clean_for_tts(sentence)
             if cleaned and len(cleaned) >= 2:
                 tts_buffer = (tts_buffer + "，" + cleaned) if tts_buffer else cleaned
-                if len(tts_buffer) >= _TTS_BATCH_SIZE:
+                if (not first_audio_sent) or (len(tts_buffer) >= _TTS_BATCH_SIZE):
                     audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
                     tts_buffer = ""
+                    first_audio_sent = True
                     if audio_b64:
                         yield {"type": "audio", "data": audio_b64}
                         # 检查打断
@@ -1361,118 +1185,9 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
     return {"query": q, "count": len(paginated), "total": total,
             "offset": offset, "limit": limit, "results": paginated}
 
-@app.get("/api/version")
-async def version():
-    return {
-        "name": "助手小子",
-        "version": "3.1.0",
-        "brain": "GLM-5.2 + Qwen-Agent + 4 MCP (可配置)",
-        "voice": "qwen3-asr/tts-flash (finna)",
-        "features": ["流式语音对话", "流式文字对话", "大脑逐句产出", "TTS批量推送",
-                     "语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
-                     "SSE实时推送", "WebSocket双向通信", "TTS打断", "限流防护", "CORS加固", "PWA移动端",
-                     "响应缓存", "看门狗", "MP3压缩", "线程池", "Markdown清理TTS", "逗号软分割",
-                     "连接重试", "文件锁", "大脑断路器", "多用户会话隔离", "唤醒词检测",
-                     "API密钥故障转移", "输入清洗XSS防护", "结构化日志", "优雅降级",
-                     "对话时间戳", "Token感知截断", "连接池调优", "对话导出分页", "用户偏好系统", "对话上下文摘要", "会话级限流", "API令牌认证"],
-        "streaming": {
-            "chat": "/api/chat/stream (SSE: text+audio+done)",
-            "voice": "/api/voice/stream (SSE: asr+text+audio+done)",
-            "websocket": "/ws (双向: text/audio/interrupt)",
-            "tts_batch_size": "50字/块",
-        }
-    }
 
 
-def _pref_count() -> int:
-    """获取用户偏好数量"""
-    try:
-        from voice_agent import list_preferences
-        return len(list_preferences())
-    except Exception:
-        return 0
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    """系统监控面板"""
-    import psutil, socket, platform
-    vm = psutil.virtual_memory()
-    disk = psutil.disk_usage('/')
-    cpu = psutil.cpu_percent(interval=0.5)
-    rems = _load_reminders()
-    pending = [r for r in rems if not r.get("done")]
-    brain_warm = _brain_is_warm()
-    from voice_agent import _history
-    m = _metrics.summary()
-    return f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>助手小子 · 监控面板</title><meta http-equiv="refresh" content="10">
-<style>*{{margin:0;box-sizing:border-box}}body{{font-family:-apple-system,sans-serif;
-background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);color:#eee;min-height:100vh;padding:20px}}
-h1{{font-size:22px;margin-bottom:4px;background:linear-gradient(90deg,#e94560,#f5a623);
--webkit-background-clip:text;-webkit-text-fill-color:transparent}}
-.sub{{color:#888;font-size:12px;margin-bottom:16px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;max-width:900px}}
-.card{{background:rgba(255,255,255,.05);border-radius:12px;padding:16px;border:1px solid rgba(255,255,255,.1)}}
-.card h3{{color:#f5a623;font-size:14px;margin-bottom:8px}}
-.metric{{display:flex;justify-content:space-between;margin:4px 0;font-size:13px}}
-.metric .val{{color:#4e9;font-weight:bold}}
-.bar{{height:8px;background:rgba(255,255,255,.1);border-radius:4px;margin:4px 0;overflow:hidden}}
-.bar div{{height:100%;border-radius:4px;transition:width .3s}}
-.green{{background:#4e9}}.yellow{{background:#f5a623}}.red{{background:#e94560}}
-.tag{{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;margin:2px}}
-.ok{{background:rgba(78,255,153,.2);color:#4e9}}.warn{{background:rgba(245,166,35,.2);color:#f5a623}}
-a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
-.rem{{padding:6px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:13px}}
-</style></head><body>
-<h1>🎛️ 助手小子 · 监控面板</h1>
-<div class="sub">自动刷新10秒 | <a href="/">语音客户端</a> | <a href="/docs">API文档</a> | <a href="/api/status">JSON状态</a></div>
-<div class="grid">
-<div class="card"><h3>🖥️ 系统</h3>
-<div class="metric"><span>设备</span><span class="val">{socket.gethostname()}</span></div>
-<div class="metric"><span>系统</span><span class="val">{platform.system()} {platform.release()}</span></div>
-<div class="metric"><span>CPU</span><span class="val">{cpu}%</span></div>
-<div class="bar"><div class="{'green' if cpu<70 else 'yellow' if cpu<90 else 'red'}" style="width:{cpu}%"></div></div>
-<div class="metric"><span>内存</span><span class="val">{(vm.total-vm.available)//1073741824:.1f}/{vm.total//1073741824:.0f}GB ({vm.percent}%)</span></div>
-<div class="bar"><div class="{'green' if vm.percent<80 else 'yellow' if vm.percent<90 else 'red'}" style="width:{vm.percent}%"></div></div>
-<div class="metric"><span>磁盘</span><span class="val">{disk.used//1073741824:.0f}/{disk.total//1073741824:.0f}GB ({disk.percent}%)</span></div>
-<div class="bar"><div class="{'green' if disk.percent<80 else 'yellow' if disk.percent<90 else 'red'}" style="width:{disk.percent}%"></div></div>
-</div>
-<div class="card"><h3>🧠 大脑</h3>
-<div class="metric"><span>模型</span><span class="val">GLM-5.2 + 4 MCP (可配置)</span></div>
-<div class="metric"><span>预热状态</span><span class="tag {'ok' if brain_warm else 'warn'}">{'✅ 已就绪' if brain_warm else '⏳ 预热中'}</span></div>
-<div class="metric"><span>对话历史</span><span class="val">{len(_history)} 条</span></div>
-<div class="metric"><span>语音引擎</span><span class="val">qwen3-asr/tts-flash</span></div>
-<div class="metric"><span>用户偏好</span><span class="val">{_pref_count()} 项</span></div>
-</div>
-<div class="card"><h3>⏰ 提醒 ({len(pending)} 待办)</h3>
-{"".join(f'<div class="rem">📌 {r["text"]} <span style="color:#888">⏰{r.get("due","")[:16].replace("T"," ")}</span></div>' for r in pending[:5]) or '<div class="rem" style="color:#666">暂无待办</div>'}
-<a href="/api/reminders" style="font-size:12px">查看全部 →</a>
-</div>
-<div class="card"><h3>🔧 API 端点 (27个 + WS)</h3>
-<div class="metric"><span>语音</span><span class="val">/api/voice /api/voice/stream</span></div>
-<div class="metric"><span>TTS/ASR</span><span class="val">/api/tts /api/asr</span></div>
-<div class="metric"><span>对话</span><span class="val">/api/chat /api/chat/stream</span></div>
-<div class="metric"><span>提醒/搜索</span><span class="val">/api/reminders /api/search /api/export</span></div>
-<div class="metric"><span>实时/系统</span><span class="val">/api/events /api/metrics /api/status</span></div>
-<div class="metric"><span>WebSocket</span><span class="val">/ws (双向通信)</span></div>
-</div>
-<div class="card"><h3>🔌 实时连接</h3>
-<div class="metric"><span>WebSocket</span><span class="val">{len(_ws_clients)} 个连接</span></div>
-<div class="metric"><span>SSE通知</span><span class="val">{len(_sse_clients)} 个连接</span></div>
-<div class="metric"><span>限流IP</span><span class="val">{len(_rate_buckets)} 个</span></div>
-<div class="metric"><span>限流策略</span><span class="val">普通{_RATE_GENERAL}/min 语音{_RATE_VOICE}/min</span></div>
-</div>
-<div class="card"><h3>📊 请求指标</h3>
-<div class="metric"><span>总请求</span><span class="val">{m["total_requests"]}</span></div>
-<div class="metric"><span>错误</span><span class="val">{m["total_errors"]}</span></div>
-<div class="metric"><span>缓存命中</span><span class="val">{m["cache_hits"]}</span></div>
-<div class="metric"><span>平均响应</span><span class="val">{m["avg_response_ms"]}ms</span></div>
-<div class="metric"><span>P95响应</span><span class="val">{m["p95_response_ms"]}ms</span></div>
-<a href="/api/metrics" style="font-size:12px">详情 →</a>
-</div>
-</div>
-</body></html>"""
 
 @app.get("/manifest.json")
 async def manifest():

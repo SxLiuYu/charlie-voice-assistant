@@ -4,7 +4,7 @@
 连接韧性: Session复用 + 自动重试 + 异常降级
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
 """
-import os, json, base64, requests, datetime, time, logging, asyncio, re, threading
+import os, sys, json, base64, requests, datetime, time, logging, asyncio, re, threading
 from typing import Optional, Generator, Tuple, List, Dict, Any
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -14,10 +14,10 @@ except ImportError: pass
 log = logging.getLogger("magic")
 
 FINNA = os.getenv("FINNA_BASE", "https://www.finna.com.cn/v1")
-TTS_KEY = os.getenv("TTS_KEY", "REDACTED")
-ASR_KEY = os.getenv("ASR_KEY", "REDACTED")
+TTS_KEY = os.getenv("TTS_KEY", "")
+ASR_KEY = os.getenv("ASR_KEY", "")
 # 支持多GLM密钥故障转移(GLM_KEY, GLM_KEY_2, GLM_KEY_3...)
-_glm_keys = [os.getenv("GLM_KEY", "app-Egtyx0Fytauhxkr6rWBLZyZl")]
+_glm_keys = [os.getenv("GLM_KEY", "")]
 for i in range(2, 6):
     k = os.getenv(f"GLM_KEY_{i}", "")
     if k:
@@ -373,10 +373,10 @@ def _build_brain():
     # MCP服务器配置(可通过MCP_SERVERS环境变量控制启用哪些, 逗号分隔)
     all_mcp = {
         "amap-maps": {"command": "npx", "args": ["-y", "@amap/amap-maps-mcp-server"],
-            "env": {"AMAP_MAPS_API_KEY": os.getenv("AMAP_KEY", "REDACTED")}},
-        "magic-phone": {"command": os.path.join(os.getcwd(), ".venv/bin/python"),
+            "env": {"AMAP_MAPS_API_KEY": os.getenv("AMAP_KEY", "")}},
+        "magic-phone": {"command": sys.executable,
             "args": ["mcp_server.py"], "cwd": os.getcwd()},
-        "baize-skills": {"command": os.path.join(os.getcwd(), ".venv/bin/python"),
+        "baize-skills": {"command": sys.executable,
             "args": ["baize_skills_mcp.py"], "cwd": os.getcwd(),
             "env": {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", ""),
                     "ALIYUN_API_KEY": os.getenv("ALIYUN_API_KEY", "")}},
