@@ -1,6 +1,6 @@
 # Charlie (Assistant Kid) · Qwen-Agent 语音大脑
 
-中国版贾维斯：GLM-5.2 大脑 + 原生 MCP + ASR/TTS 语音闭环，一句话跨多个 MCP 工具完成任务。
+中国版贾维斯：deepseek-v4-flash 大脑 + 原生 MCP + ASR/TTS 语音闭环，一句话跨多个 MCP 工具完成任务。
 
 ## 架构
 ```
@@ -10,13 +10,13 @@
     └──────────────────────────────────────────────┘
                       ┌──────────────────────────────┐
 语音/文字输入          │  ASR(qwen3-asr-flash)         │
-        └─────────────►│  → GLM-5.2+6MCP大脑(带记忆)   │──┐
+        └─────────────►│  → deepseek-v4-flash+6MCP大脑(带记忆)   │──┐
                       │  → TTS(qwen3-tts-flash)       │  │
                       └──────────────────────────────┘  │
                       ↑ 流式: 逐句产出+TTS批量(50字/块)  │ 回复
 后台调度器(30s) ──► 检查reminders.json ──► 到期? ──► TTS+afplay自动播报到AirPods
 ```
-- **大脑**: Qwen-Agent + GLM-5.2(finna中转, use_raw_api走原生tool_calls)
+- **大脑**: Qwen-Agent + deepseek-v4-flash(finna中转, use_raw_api走原生tool_calls)
 - **对话记忆**: 跨请求保留多轮对话历史(最多20轮)，支持追问和上下文引用
 - **语音**: qwen3-asr-flash / qwen3-tts-flash (finna, voice=Cherry)
 - **协议**: 原生 MCP (标准 mcpServers 配置即插即用)
@@ -45,14 +45,14 @@
 ## 配置
 所有API密钥集中管理在 `.env` 文件（已被 .gitignore 保护，不会提交到git）：
 ```env
-GLM_KEY=app-xxx          # GLM-5.2大脑
+GLM_KEY=app-xxx          # deepseek-v4-flash大脑
 TTS_KEY=app-xxx          # qwen3-tts-flash
 ASR_KEY=app-xxx          # qwen3-asr-flash
 AMAP_KEY=xxx              # 高德地图
 TAVILY_API_KEY=tvly-xxx   # Tavily搜索
 ALIYUN_API_KEY=sk-xxx    # 阿里云(购物分析)
 FINNA_BASE=https://...   # finna API基址
-GLM_MODEL=glm-5.2        # 模型名
+GLM_MODEL=deepseek-v4-flash  # 模型名
 TTS_VOICE=Cherry         # TTS音色
 ```
 所有Python文件启动时自动 `load_dotenv()`，无需手动 export。
@@ -212,7 +212,7 @@ python test_system.py https://sxliuyudeMac-mini.local:8443  # 测HTTPS
 - [x] ~~pytest单元测试~~ (v3.1: 139个测试全通过, mock GLM/TTS/ASR)
 - [x] ~~多用户会话管理~~ (v3.1: session_id全链路隔离, 最多10会话)
 - [x] ~~唤醒词检测~~ (v3.1: 浏览器端'Charlie'唤醒)
-- [x] ~~API密钥故障转移~~ (v3.1: GLM_KEY_1~5多密钥轮换)
+- [x] ~~API密钥故障转移~~ (v3.1: GLM_KEY_1~5多密钥轮换(均走deepseek-v4-flash))
 - [x] ~~输入清洗(XSS防护)~~ (v3.1: _sanitize_text全端点)
 - [x] ~~CORS加固~~ (v3.1: 动态来源+最小权限)
 - [x] ~~优雅降级~~ (v3.1: 大脑失败时返回友好提示+密钥轮换)
