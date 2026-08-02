@@ -1,0 +1,59 @@
+{
+  "name": "baize",
+  "version": "3.2.0",
+  "description": "白泽3.2 - JARVIS级AI助手（增强版）",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "baize": "dist/cli/bootstrap.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/cli/bootstrap.js",
+    "dev": "ts-node src/cli/bootstrap.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "clean": "rm -rf dist",
+    "web": "npm run build && node dist/cli/bootstrap.js web",
+    "web:dev": "ts-node src/cli/bootstrap.ts web"
+  },
+  "keywords": [
+    "ai",
+    "assistant",
+    "jarvis",
+    "llm",
+    "metacognition"
+  ],
+  "author": "baize",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^12.0.0",
+    "dotenv": "^16.6.1",
+    "inquirer": "^8.2.6",
+    "puppeteer": "^24.37.5",
+    "socket.io": "^4.8.3",
+    "sql.js": "^1.10.3",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/inquirer": "^9.0.7",
+    "@types/node": "^20.11.16",
+    "@types/uuid": "^9.0.8",
+    "@vitest/coverage-v8": "^4.0.18",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "ora": "^9.3.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3",
+    "vitest": "^4.0.18",
+    "winston": "^3.19.0",
+    "yaml": "^2.8.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

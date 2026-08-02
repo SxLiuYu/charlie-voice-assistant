@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Data
+data/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.ssh/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage/
+test-*.ts
+test-*.js
+*.test.ts
+*.test.js
+__tests__/
+
+# Misc
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+# Temporary files
+*.tmp
+*.temp
+HelloWorld.js
+hello.txt
+test.txt

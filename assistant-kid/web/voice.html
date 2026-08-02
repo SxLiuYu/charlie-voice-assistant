@@ -526,7 +526,17 @@ function copyTunnelURL(){
 }
 // ===== 唤醒词检测(Charlie) =====
 let wakeMode=false,wakeRec=null;
-const WAKE_WORDS=["charlie","查理","查理查理","查莉","查利","cha li","cha r lie"];
+const WAKE_WORDS=["charlie","charley","charly","charli","查理","查莉","查利","查里","茶理"];
+// 编辑距离(Levenshtein)：用于 fuzzy match 唤醒词
+function levenshtein(a,b){
+  const m=a.length,n=b.length;
+  const dp=Array.from({length:m+1},()=>Array(n+1).fill(0));
+  for(let i=0;i<=m;i++)dp[i][0]=i;
+  for(let j=0;j<=n;j++)dp[0][j]=j;
+  for(let i=1;i<=m;i++)for(let j=1;j<=n;j++)
+    dp[i][j]=Math.min(dp[i-1][j]+1,dp[i][j-1]+1,dp[i-1][j-1]+(a[i-1]===b[j-1]?0:1));
+  return dp[m][n];
+}
 function toggleWake(){
   wakeMode=!wakeMode;
   const btn=document.getElementById('wakebtn');
@@ -545,7 +555,9 @@ function startWakeListener(){
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
   if(!SR){diag.textContent='⚠️ 浏览器不支持语音识别,请用Chrome';wakeMode=false;return;}
   wakeRec=new SR();
-  wakeRec.lang='zh-CN';wakeRec.continuous=true;wakeRec.interimResults=true;
+  // 用 en-US 而非 zh-CN：Chrome 中文模式识别英文"Charlie"失败率极高
+  // en-US 模式下英文词识别率高，中文指令也能部分识别
+  wakeRec.lang='en-US';wakeRec.continuous=true;wakeRec.interimResults=true;
   wakeRec.onresult=function(e){
     for(let i=e.resultIndex;i<e.results.length;i++){
       const t=e.results[i][0].transcript.toLowerCase().trim();
@@ -555,9 +567,9 @@ function startWakeListener(){
       if(logs.length>5)logs.pop();diag._logs=logs;
       diag.innerHTML=logs.map(l=>l.startsWith('[')?'<div>'+l+'</div>':l).join('');
       diag.scrollTop=0;
-      // 检测唤醒词
+      // 检测唤醒词 — fuzzy match：编辑距离≤2 都算匹配
       for(const w of WAKE_WORDS){
-        if(t.includes(w.toLowerCase())){
+        if(t.includes(w.toLowerCase())||levenshtein(t,w.toLowerCase())<=2){
           // 唤醒成功!
           stopWakeListener();
           diag.textContent='✅ 唤醒成功! 正在聆听...';

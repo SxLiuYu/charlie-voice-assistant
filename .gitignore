@@ -1,9 +1,32 @@
 # macOS
 .DS_Store
 
-# Baize is an independent nested git repo — never track from parent
-/Baize/
-
 # Editor
 .vscode/
 .idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Runtime data
+*.log
+*.lock
+conversation_history.json*
+preferences.json*
+reminders.json*
+suggestions_state.json*
+tunnel_url.txt
+audio_000.wav
+logs/
+workspace/
+
+# Baize build artifacts (source code IS tracked)
+Baize/node_modules/
+Baize/dist/
+Baize/data/
+Baize/logs/
+Baize/coverage/
+Baize/.env
