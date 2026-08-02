@@ -2,9 +2,21 @@
 Charlie - 共享工具模块
 提取重复逻辑: 时间解析、临时文件清理、错误脱敏
 """
-import os, re, datetime, tempfile, glob, logging
+import os, re, datetime, tempfile, glob, logging, fcntl
+import json
+from contextlib import contextmanager
 
 log = logging.getLogger("magic")
+
+
+@contextmanager
+def _locked_file(path: str, shared: bool = False):
+    with open(path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 def parse_time_str(s: str) -> str | None:
     """
@@ -52,27 +64,26 @@ def parse_time_str(s: str) -> str | None:
     return tg.isoformat() if ok else None
 
 
-def cleanup_temp_files(pattern: str = "/tmp/*_reply.wav") -> int:
+def cleanup_temp_files(pattern: str = "/tmp/*_reply.wav", extra_dirs: list[str] | None = None) -> int:
     """
     清理临时音频文件(启动时+定期调用)。
     返回清理的文件数。
     """
     removed = 0
-    for f in glob.glob(pattern):
+    files_to_remove = set(glob.glob(pattern))
+    cleanup_dirs = ["/tmp", *(extra_dirs or [])]
+    runtime_patterns = ["voice_reply.wav", "tts_test.wav", "asr_test.wav", "tmp*.mp3", "*_reply*.wav"]
+    for directory in cleanup_dirs:
+        for name in runtime_patterns:
+            files_to_remove.update(glob.glob(os.path.join(directory, name)))
+    for f in sorted(files_to_remove):
+        if os.path.isdir(f):
+            continue
         try:
             os.unlink(f)
             removed += 1
         except Exception:
             pass
-    # 也清理 voice_reply.wav 等测试文件
-    for name in ["voice_reply.wav", "tts_test.wav", "asr_test.wav"]:
-        p = os.path.join("/tmp", name)
-        if os.path.exists(p):
-            try:
-                os.unlink(p)
-                removed += 1
-            except Exception:
-                pass
     if removed > 0:
         log.info(f"[cleanup] 清理{removed}个临时文件")
     return removed
@@ -83,14 +94,43 @@ def truncate_history_file(path: str, max_entries: int = 100) -> None:
     对话历史文件大小保护: 超过max_entries条自动截断保留最近的。
     """
     try:
-        import json
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if len(data) > max_entries:
-            data = data[-max_entries:]
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            log.info(f"[history] 截断至{max_entries}条(原{len(data)}+)")
+        with _locked_file(f"{path}.lock"):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            truncated = False
+            if isinstance(data, list):
+                original_count = len(data)
+                if original_count > max_entries:
+                    data = data[-max_entries:]
+                    truncated = True
+            elif isinstance(data, dict):
+                original_count = 0
+                for session_id, messages in data.items():
+                    if isinstance(messages, list):
+                        original_count += len(messages)
+                        if len(messages) > max_entries:
+                            data[session_id] = messages[-max_entries:]
+                            truncated = True
+            else:
+                raise ValueError(f"unsupported history type: {type(data).__name__}")
+
+            if truncated:
+                target_dir = os.path.dirname(os.path.abspath(path)) or "."
+                fd, temp_path = tempfile.mkstemp(prefix=".history_truncate.", suffix=".tmp", dir=target_dir)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(temp_path, path)
+                    log.info(f"[history] 截断至{max_entries}条/会话(原{original_count}+)")
+                except Exception:
+                    try:
+                        os.unlink(temp_path)
+                    except FileNotFoundError:
+                        pass
+                    raise
     except Exception as e:
         log.warning(f"[history] 截断失败: {e}")
 

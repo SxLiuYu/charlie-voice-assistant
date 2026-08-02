@@ -3,7 +3,11 @@
 这些对象在模块加载时创建一次; voice_server 与各 route 模块通过
 `from app.state import _ws_clients` 等共享同一对象(原地修改, 不重绑).
 """
+import asyncio
 import logging
+from collections import deque
+import threading
+import time
 log = logging.getLogger("magic")
 
 MAX_REQUEST_BODY = 15 * 1024 * 1024  # 15MB 请求体上限(含音频)
@@ -14,48 +18,263 @@ class Metrics:
         self.requests: dict = {}
         self.errors = 0
         self.cache_hits = 0
+        self.conditional_requests = 0
+        self.not_modified = 0
         self.total_requests = 0
-        self.response_times: list = []
+        self.revision = 0
+        self.response_times = deque(maxlen=100)
+        self._latency_stats: tuple[float, float] | None = None
 
-    def record(self, endpoint: str, duration_ms: float, ok: bool = True):
+    def record(self, endpoint: str, duration_ms: float, ok: bool = True,
+               conditional: bool = False, not_modified: bool = False,
+               include_latency: bool = True, include_in_metrics: bool = True):
         self.total_requests += 1
+        if include_in_metrics:
+            self.revision += 1
+        if conditional:
+            self.conditional_requests += 1
+        if not_modified:
+            self.not_modified += 1
+            self.cache_hits = self.not_modified
         if not ok:
             self.errors += 1
         if endpoint not in self.requests:
-            self.requests[endpoint] = {"count": 0, "total_ms": 0, "errors": 0}
+            self.requests[endpoint] = {
+                "count": 0,
+                "total_ms": 0,
+                "errors": 0,
+                "conditional": 0,
+                "not_modified": 0,
+            }
         self.requests[endpoint]["count"] += 1
         self.requests[endpoint]["total_ms"] += duration_ms
+        if conditional:
+            self.requests[endpoint]["conditional"] += 1
+        if not_modified:
+            self.requests[endpoint]["not_modified"] += 1
         if not ok:
             self.requests[endpoint]["errors"] += 1
-        self.response_times.append(duration_ms)
-        if len(self.response_times) > 100:
-            self.response_times = self.response_times[-100:]
+        if include_latency:
+            self.response_times.append(duration_ms)
+            self._latency_stats = None
 
     def cache_hit(self):
         self.cache_hits += 1
 
-    def summary(self) -> dict:
-        import statistics
+    def token(self, exclude_endpoint: str | None = None) -> str:
+        """Opaque cache token for metrics payloads without building them."""
+        total_requests = self.total_requests
+        errors = self.errors
+        conditional_requests = self.conditional_requests
+        not_modified = self.not_modified
+        if exclude_endpoint is not None and exclude_endpoint in self.requests:
+            d = self.requests[exclude_endpoint]
+            total_requests -= d["count"]
+            errors -= d["errors"]
+            conditional_requests -= d["conditional"]
+            not_modified -= d["not_modified"]
+        parts = [self.revision, total_requests, errors, conditional_requests,
+                 not_modified, not_modified]
+        return "metrics:" + ":".join(str(part) for part in parts)
+
+    def summary(
+        self,
+        exclude_endpoint: str | None = None,
+        include_endpoints: bool = True,
+    ) -> dict:
         times = self.response_times
-        avg_ms = statistics.mean(times) if times else 0
-        p95 = sorted(times)[int(len(times) * 0.95)] if len(times) >= 20 else 0
-        endpoints = {}
+        if self._latency_stats is None and times:
+            sorted_times = sorted(times)
+            avg_ms = sum(times) / len(times)
+            p95 = sorted_times[int(len(times) * 0.95)] if len(times) >= 20 else 0
+            self._latency_stats = (avg_ms, p95)
+        elif self._latency_stats is not None:
+            avg_ms, p95 = self._latency_stats
+        else:
+            avg_ms = 0
+            p95 = 0
+        total_requests = self.total_requests
+        total_errors = self.errors
+        conditional_requests = self.conditional_requests
+        not_modified = self.not_modified
+        endpoints = {} if include_endpoints else None
         for ep, d in self.requests.items():
-            endpoints[ep] = {
-                "count": d["count"],
-                "avg_ms": round(d["total_ms"] / d["count"], 1) if d["count"] else 0,
-                "errors": d["errors"],
-            }
-        return {
-            "total_requests": self.total_requests,
-            "total_errors": self.errors,
-            "cache_hits": self.cache_hits,
+            if ep == exclude_endpoint:
+                total_requests -= d["count"]
+                total_errors -= d["errors"]
+                conditional_requests -= d["conditional"]
+                not_modified -= d["not_modified"]
+                continue
+            if include_endpoints:
+                endpoints[ep] = {
+                    "count": d["count"],
+                    "avg_ms": round(d["total_ms"] / d["count"], 1) if d["count"] else 0,
+                    "errors": d["errors"],
+                    "conditional": d["conditional"],
+                    "not_modified": d["not_modified"],
+                    "not_modified_rate": round(d["not_modified"] * 100 / d["conditional"], 1) if d["conditional"] else 0,
+                }
+        result = {
+            "total_requests": total_requests,
+            "total_errors": total_errors,
+            "cache_hits": not_modified,
+            "conditional_requests": conditional_requests,
+            "not_modified": not_modified,
+            "not_modified_rate": round(not_modified * 100 / conditional_requests, 1) if conditional_requests else 0,
             "avg_response_ms": round(avg_ms, 1),
             "p95_response_ms": round(p95, 1),
-            "endpoints": endpoints,
         }
+        if include_endpoints:
+            result["endpoints"] = endpoints
+        return result
 
 _metrics = Metrics()
+
+# ===== 前端轮询可观测性(页面隐藏暂停/失败退避) =====
+_POLL_TELEMETRY_EVENTS = ("paused", "resumed", "backoff", "errors")
+_POLL_TELEMETRY_EVENT_ALIASES = {
+    "paused": "paused",
+    "resumed": "resumed",
+    "backoff": "backoff",
+    "error": "errors",
+    "errors": "errors",
+}
+_POLL_TELEMETRY_JOBS = ("reminders", "preferences", "tunnel")
+
+
+class PollTelemetry:
+    """记录浏览器端轮询暂停、恢复和失败退避，供状态页排查降载是否生效。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.totals = {event: 0 for event in _POLL_TELEMETRY_EVENTS}
+            self.jobs = {
+                job: {event: 0 for event in _POLL_TELEMETRY_EVENTS if event != "resumed"}
+                for job in _POLL_TELEMETRY_JOBS
+            }
+            self.last_event = None
+
+    def record(self, event: str, job: str | None = None):
+        normalized = _POLL_TELEMETRY_EVENT_ALIASES.get(event, event)
+        if normalized not in _POLL_TELEMETRY_EVENTS:
+            raise ValueError(f"unknown polling telemetry event: {event}")
+        if job is not None and job not in _POLL_TELEMETRY_JOBS:
+            raise ValueError(f"unknown polling telemetry job: {job}")
+        if normalized != "resumed" and not job:
+            raise ValueError("polling telemetry job is required")
+        if normalized == "resumed":
+            job = None
+        with self._lock:
+            self.totals[normalized] += 1
+            if job:
+                self.jobs[job][normalized] += 1
+            self.last_event = {
+                "event": normalized,
+                "job": job,
+                "at": time.time(),
+            }
+
+    def record_failure(self, job: str):
+        """Record a failed poll and the resulting backoff scheduling together."""
+        if job not in _POLL_TELEMETRY_JOBS:
+            raise ValueError(f"unknown polling telemetry job: {job}")
+        with self._lock:
+            self.totals["errors"] += 1
+            self.totals["backoff"] += 1
+            self.jobs[job]["errors"] += 1
+            self.jobs[job]["backoff"] += 1
+            self.last_event = {
+                "event": "errors",
+                "job": job,
+                "at": time.time(),
+            }
+
+    def summary(self) -> dict:
+        with self._lock:
+            return {
+                "totals": dict(self.totals),
+                "jobs": {
+                    job: dict(events) for job, events in self.jobs.items()
+                },
+                "last_event": dict(self.last_event) if self.last_event else None,
+            }
+
+
+_poll_telemetry = PollTelemetry()
+
+# ===== WebSocket 打断上下文可观测性 =====
+_MAX_INTERRUPT_REPLY_CHARS = 200
+
+
+class InterruptTelemetry:
+    """记录最近一次 WebSocket 打断和被截断的被打断回复。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self.total = 0
+            self.with_reply = 0
+            self.last_reply = ""
+            self.last_ws_id = None
+            self.last_at = None
+            self.last_follow_up = None
+            self._pending_replies = {}
+
+    def record(self, ws_id: int, interrupted_reply: str | None):
+        reply = (interrupted_reply or "").strip()[:_MAX_INTERRUPT_REPLY_CHARS]
+        with self._lock:
+            self.total += 1
+            if reply:
+                self.with_reply += 1
+                self.last_reply = reply
+                self._pending_replies[ws_id] = reply
+            else:
+                self._pending_replies.pop(ws_id, None)
+            self.last_ws_id = ws_id
+            self.last_at = time.time()
+
+    def record_follow_up(self, ws_id: int, text: str | None, source: str) -> str:
+        follow_up = (text or "").strip()[:_MAX_INTERRUPT_REPLY_CHARS]
+        if not follow_up:
+            return ""
+        with self._lock:
+            interrupted_reply = self._pending_replies.pop(ws_id, None)
+            if not interrupted_reply:
+                return ""
+            self.last_follow_up = {
+                "text": follow_up,
+                "source": source,
+                "interrupted_reply": interrupted_reply,
+                "ws_id": ws_id,
+                "at": time.time(),
+            }
+            return interrupted_reply
+
+    def discard_pending(self, ws_id: int):
+        with self._lock:
+            self._pending_replies.pop(ws_id, None)
+
+    def summary(self) -> dict:
+        with self._lock:
+            return {
+                "total": self.total,
+                "with_reply": self.with_reply,
+                "last_reply": self.last_reply,
+                "last_ws_id": self.last_ws_id,
+                "last_at": self.last_at,
+                "last_follow_up": dict(self.last_follow_up) if self.last_follow_up else None,
+                "max_reply_chars": _MAX_INTERRUPT_REPLY_CHARS,
+            }
+
+
+_interrupt_telemetry = InterruptTelemetry()
 
 # ===== 限流(每IP每分钟60普通+10语音, 每会话30) =====
 _rate_buckets = {}        # {ip: {"voice":[ts], "general":[ts]}}
@@ -68,6 +287,33 @@ _session_buckets = {}      # {session_id: [ts]}
 # ===== 实时连接 =====
 _sse_clients = []          # SSE客户端队列列表
 _ws_clients = {}           # {ws_id: {"ws":ws,"interrupt":False,"last_active":...}}
+_ws_session_groups = {}    # {session_id: [ws_id, ...]} — 跨终端会话组
+_ws_client_locations = {}  # {ws_id: {"lat":...,"lng":...,"accuracy":...,"time":...}} — 客户端位置
+_sse_clients_lock = threading.Lock()
+
+
+def register_sse_client(client_q: asyncio.Queue) -> None:
+    with _sse_clients_lock:
+        if client_q not in _sse_clients:
+            _sse_clients.append(client_q)
+
+
+def unregister_sse_client(client_q: asyncio.Queue) -> None:
+    with _sse_clients_lock:
+        try:
+            _sse_clients.remove(client_q)
+        except ValueError:
+            pass
+
+
+def snapshot_sse_clients() -> list[asyncio.Queue]:
+    with _sse_clients_lock:
+        return list(_sse_clients)
+
+
+def sse_client_count() -> int:
+    with _sse_clients_lock:
+        return len(_sse_clients)
 
 def _ws_client_count() -> int:
     """当前活跃WebSocket连接数"""

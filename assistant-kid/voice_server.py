@@ -10,15 +10,19 @@ GET  /health        : 健康检查
 
 后台调度器: 每30s检查reminders.json，到期提醒自动TTS+afplay播报
 """
-import os, sys, subprocess, tempfile, json, threading, time, datetime, logging, asyncio
+import os, sys, subprocess, tempfile, json, threading, time, datetime, logging, asyncio, concurrent.futures
 import queue as _queue
 import base64 as _b64enc
-from contextlib import asynccontextmanager
+import hashlib
+from contextlib import asynccontextmanager, contextmanager
+from collections import deque
+from collections.abc import Callable
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
     from dotenv import load_dotenv; load_dotenv()
 except ImportError: pass
 from fastapi import FastAPI, UploadFile, File, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, HTMLResponse, JSONResponse, StreamingResponse
 import uvicorn
 import requests
@@ -52,9 +56,12 @@ else:
     _logging.basicConfig(level=_logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = _logging.getLogger("magic")
 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOG_DIR = os.environ.get("ASSISTANT_KID_LOG_DIR", os.path.join(PROJECT_DIR, "logs"))
+TUNNEL_FILE = os.path.join(PROJECT_DIR, "tunnel_url.txt")
+
 # ===== 文件日志(持久化, 含uvicorn错误堆栈, 防止traceback丢失) =====
 import logging.handlers as _loghandlers
-_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _file_handler = _loghandlers.RotatingFileHandler(
     os.path.join(_LOG_DIR, "app.log"), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
@@ -66,17 +73,34 @@ for _lg in (_logging.getLogger(), _logging.getLogger("uvicorn"),
     _lg.addHandler(_file_handler)
 log.info(f"文件日志已启用: {os.path.join(_LOG_DIR, 'app.log')}")
 # ===== 抽取到app模块(Phase1: 纯函数) =====
-from app.audio import to_wav, _wav_to_mp3, MAX_AUDIO_SIZE
+from app.audio import likely_empty_audio, to_wav, _wav_to_mp3, MAX_AUDIO_SIZE
 from app.auth import _client_ip, _is_local_request, _check_auth, _sanitize_text, AUTH_TOKEN
-from app.brain_health import _brain_is_warm, _get_brain_health, _warmup_brain
-from app.state import (_metrics, _ws_clients, _sse_clients, _rate_buckets, _session_buckets,
-    _RATE_GENERAL, _RATE_VOICE, _RATE_WINDOW, _RATE_PER_SESSION, MAX_REQUEST_BODY, _ws_client_count)
-from app.reminders import REMINDERS_FILE, _load_reminders, _save_reminders, _cleanup_old_reminders
+from app.brain_health import _brain_is_warm, _warmup_brain
+from app.config import (
+    configured_cors_origins,
+    http_port,
+    invalidate_lan_origins_cache,
+    lan_origins,
+    localhost_origins,
+)
+from app.state import (_metrics, _ws_clients, _rate_buckets, _session_buckets,
+    _RATE_GENERAL, _RATE_VOICE, _RATE_WINDOW, _RATE_PER_SESSION, MAX_REQUEST_BODY, _ws_client_count,
+    _ws_session_groups, _ws_client_locations, _interrupt_telemetry,
+    register_sse_client, unregister_sse_client, snapshot_sse_clients, sse_client_count)
+from app.reminders import (
+    REMINDERS_FILE, _load_reminders, acquire_scheduler_lock, append_reminder, claim_due_reminders,
+    complete_reminder, complete_reminder_delivery, release_failed_reminder,
+    SUGGESTIONS_STATE_FILE, PROACTIVE_LOCK_FILE, acquire_proactive_lock,
+)
 from app.routes.system import system_router
+from voice_agent import LOW_INTENT_ASR_REPLY, is_low_intent_asr
+
+HISTORY_FILE = os.path.join(os.path.dirname(REMINDERS_FILE), "conversation_history.json")
 
 # ===== 请求指标追踪 =====
 
 _start_time = time.time()  # 服务启动时间(用于健康检查uptime)
+_scheduler_lock_handle = None
 
 
 @asynccontextmanager
@@ -90,8 +114,9 @@ async def lifespan(app):
         _main_loop = asyncio.get_running_loop()
         # 启动时清理临时文件 + 截断历史
         from utils import cleanup_temp_files, truncate_history_file
-        cleanup_temp_files()
-        truncate_history_file(REMINDERS_FILE.replace("reminders.json", "conversation_history.json"), 100)
+        from voice_agent import runtime_temp_audio_path
+        cleanup_temp_files(extra_dirs=[runtime_temp_audio_path()])
+        truncate_history_file(HISTORY_FILE, 100)
         _start_scheduler()
         _start_proactive()
         _start_ws_cleanup()
@@ -133,6 +158,161 @@ def _validate_env():
         log.error(f"缺少{len(missing)}个必需密钥！请检查.env文件")
         log.error("复制 .env.example 为 .env 并填入密钥")
     return len(missing) == 0
+
+
+def _weak_etag(token: str) -> str:
+    """Build a compact weak ETag from an opaque cache token."""
+    return 'W/"' + hashlib.sha256(token.encode("utf-8")).hexdigest()[:16] + '"'
+
+
+def _etag_headers(etag: str) -> dict:
+    return {"ETag": etag, "Cache-Control": "no-cache", "Vary": "Accept-Encoding"}
+
+
+def _if_none_matches(request: Request, etag: str) -> bool:
+    """Match If-None-Match, tolerating comma-separated weak/strong ETags."""
+    cached_etags = []
+    for value in request.headers.get("if-none-match", "").split(","):
+        value = value.strip()
+        if not value:
+            continue
+        cached_etags.append(value)
+        if value.startswith("W/"):
+            cached_etags.append(value[2:])
+        else:
+            cached_etags.append("W/" + value)
+    return etag in cached_etags
+
+
+def _not_modified_response(etag: str) -> Response:
+    return Response(status_code=304, headers=_etag_headers(etag))
+
+
+def _file_not_modified_response(request: Request, path: str, prefix: str) -> Response | None:
+    """Return 304 only if both the request ETag and current file metadata still match."""
+    etag = _weak_etag(_file_etag_token(path, prefix))
+    if not _if_none_matches(request, etag):
+        return None
+    if _weak_etag(_file_etag_token(path, prefix)) != etag:
+        return None
+    return _not_modified_response(etag)
+
+
+def _file_etag_token(path: str, prefix: str) -> str:
+    """Return a stable file token without opening or reading the file."""
+    try:
+        stat = os.stat(path)
+        return f"{prefix}:{stat.st_mtime_ns}:{stat.st_size}:{stat.st_ino}"
+    except FileNotFoundError:
+        return f"{prefix}:missing"
+    except OSError as exc:
+        return f"{prefix}:error:{exc.__class__.__name__}"
+
+
+_open_text_file = open
+_text_file_cache: dict[str, tuple[tuple[int, int, int], str]] = {}
+_text_file_cache_lock = threading.Lock()
+
+
+def _read_cached_text(path: str, return_token: bool = False):
+    """Read a small static text file, reusing contents while file metadata is unchanged."""
+    for _ in range(2):
+        stat = os.stat(path)
+        token = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        with _text_file_cache_lock:
+            cached = _text_file_cache.get(path)
+        if cached is not None and cached[0] == token:
+            return (cached[1], token) if return_token else cached[1]
+
+        with _open_text_file(path, encoding="utf-8") as f:
+            text = f.read()
+
+        after_stat = os.stat(path)
+        after_token = (after_stat.st_mtime_ns, after_stat.st_size, after_stat.st_ino)
+        if token == after_token:
+            with _text_file_cache_lock:
+                cached = _text_file_cache.get(path)
+                if cached is None or cached[0] != token:
+                    _text_file_cache[path] = (token, text)
+            return (text, token) if return_token else text
+    return (text, token) if return_token else text
+
+
+def _html_response(request: Request, path: str, prefix: str) -> Response:
+    """Return HTML with a file-based weak ETag and no-store validation headers."""
+    cached = _file_not_modified_response(request, path, prefix)
+    if cached is not None:
+        return cached
+    text, token = _read_cached_text(path, return_token=True)
+    etag = _weak_etag(f"{prefix}:{token[0]}:{token[1]}:{token[2]}")
+    if _if_none_matches(request, etag):
+        return _not_modified_response(etag)
+    body = text.encode("utf-8")
+    headers = _etag_headers(etag)
+    headers["Content-Length"] = str(len(body))
+    if request.method == "HEAD":
+        body = b""
+    return Response(content=body, media_type="text/html; charset=utf-8", headers=headers)
+
+
+def _json_response(
+    request: Request,
+    payload: dict | Callable[[], dict],
+    etag_token: str | None = None,
+) -> Response:
+    """Return compact JSON with a weak ETag for polling-heavy GET endpoints."""
+    if etag_token is not None:
+        etag = _weak_etag(etag_token)
+        if _if_none_matches(request, etag):
+            return _not_modified_response(etag)
+        resolved_payload = payload() if callable(payload) else payload
+        body = json.dumps(resolved_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    else:
+        resolved_payload = payload() if callable(payload) else payload
+        body = json.dumps(resolved_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        etag = 'W/"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+        if _if_none_matches(request, etag):
+            return _not_modified_response(etag)
+    return Response(content=body, media_type="application/json", headers=_etag_headers(etag))
+
+
+_manifest_lock = threading.Lock()
+_MANIFEST_BODY: tuple[bytes, str] | None = None
+
+
+def _build_manifest_payload() -> dict:
+    return {
+        "name": "Charlie",
+        "short_name": "Charlie",
+        "description": "中国版贾维斯 - AI语音助理",
+        "start_url": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#0f0c29",
+        "theme_color": "#e94560",
+    }
+
+
+def _manifest_response(request: Request) -> Response:
+    """Serve the immutable PWA manifest once, supporting HEAD and conditional GET."""
+    global _MANIFEST_BODY
+    with _manifest_lock:
+        if _MANIFEST_BODY is None:
+            body = json.dumps(
+                _build_manifest_payload(), ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            etag = 'W/"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+            _MANIFEST_BODY = (body, etag)
+        body, etag = _MANIFEST_BODY
+
+    if _if_none_matches(request, etag):
+        return _not_modified_response(etag)
+
+    headers = _etag_headers(etag)
+    headers["Content-Length"] = str(len(body))
+    content = b"" if request.method == "HEAD" else body
+    return Response(content=content, media_type="application/json", headers=headers)
+
 
 _validate_env()
 
@@ -184,25 +364,88 @@ async def limit_request_size(request: Request, call_next):
     return await call_next(request)
 
 # CORS: 允许跨域访问(手机/其他设备)
-from fastapi.middleware.cors import CORSMiddleware
 # CORS: 动态允许来源(localhost + tunnel + 局域网)
-_cors_origins = [
-    "*",  # 开发阶段仍允许所有(生产环境可移除)
-    "http://localhost:8000",
-    "http://localhost:8443",
-    "https://localhost:8443",
-]
-# 动态加载tunnel URL
-try:
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnel_url.txt")) as f:
-        _tunnel = f.read().strip()
-        if _tunnel:
-            _cors_origins.append(_tunnel)
-except Exception:
-    pass
 
-app.add_middleware(CORSMiddleware,
-    allow_origins=_cors_origins,
+
+class DynamicCORSMiddleware(CORSMiddleware):
+    """CORS middleware that refreshes allowed origins from a provider per request."""
+
+    def __init__(self, app, allow_origins=(), **kwargs):
+        if callable(allow_origins):
+            self._origin_provider = allow_origins
+        else:
+            self._origin_provider = lambda: allow_origins
+        super().__init__(app, allow_origins=list(self._origin_provider()), **kwargs)
+
+    def _refresh_origins(self):
+        origins = list(self._origin_provider())
+        allow_all = "*" in origins
+        self.allow_origins = origins
+        self.allow_all_origins = allow_all
+        self.preflight_explicit_allow_origin = not allow_all or self.allow_credentials
+        if allow_all:
+            self.simple_headers["Access-Control-Allow-Origin"] = "*"
+        else:
+            self.simple_headers.pop("Access-Control-Allow-Origin", None)
+        if self.preflight_explicit_allow_origin:
+            self.preflight_headers["Vary"] = "Origin"
+            self.preflight_headers.pop("Access-Control-Allow-Origin", None)
+        else:
+            self.preflight_headers["Access-Control-Allow-Origin"] = "*"
+            self.preflight_headers.pop("Vary", None)
+
+    async def __call__(self, scope, receive, send):
+        _refresh_cors_origins()
+        self._refresh_origins()
+        return await super().__call__(scope, receive, send)
+
+
+def _tunnel_origins() -> list[str]:
+    try:
+        with open(TUNNEL_FILE, encoding="utf-8") as f:
+            tunnel = f.read().strip()
+        return [tunnel] if tunnel else []
+    except OSError:
+        return []
+
+
+_CORS_ORIGIN_TTL_SECONDS = 2.0
+_cors_origins_loaded_at = 0.0
+
+
+def _refresh_cors_origins(force: bool = False) -> list[str]:
+    """Refresh tunnel CORS origins when cloudflared writes a new public URL."""
+    global _cors_origins_loaded_at
+    now = time.monotonic()
+    if not force and _cors_origins and now - _cors_origins_loaded_at < _CORS_ORIGIN_TTL_SECONDS:
+        return []
+    invalidate_lan_origins_cache()
+    tunnel = _tunnel_origins()
+    origins = [
+        *localhost_origins(),
+        *lan_origins(),
+        *tunnel,
+        *configured_cors_origins(),
+    ]
+    _cors_origins[:] = list(dict.fromkeys(origins))
+    _cors_origins_loaded_at = now
+    return tunnel
+
+
+def _reload_cors_origins() -> list[str]:
+    """Force refresh CORS origins, returning the active tunnel origins."""
+    return _refresh_cors_origins(force=True)
+
+
+_cors_origins = [
+    *localhost_origins(),
+    *lan_origins(),
+    *_tunnel_origins(),
+    *configured_cors_origins(),
+]
+
+app.add_middleware(DynamicCORSMiddleware,
+    allow_origins=lambda: list(_cors_origins),
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
     allow_credentials=True,
@@ -254,7 +497,7 @@ async def request_logger(request: Request, call_next):
     import uuid, time as _t
     rid = str(uuid.uuid4())[:8]
     start = _t.time()
-    log.info(f"[{rid}] {request.method} {request.url.path}")
+    log.debug(f"[{rid}] {request.method} {request.url.path}")
     # 认证检查
     if not _check_auth(request):
         return JSONResponse({"error": "未授权"}, status_code=401)
@@ -276,13 +519,33 @@ async def request_logger(request: Request, call_next):
         response = await call_next(request)
     except Exception as e:
         dur = (_t.time() - start) * 1000
-        _metrics.record(request.url.path, dur, ok=False)
+        _metrics.record(
+            request.url.path,
+            dur,
+            ok=False,
+            include_latency=path != "/api/metrics",
+            include_in_metrics=path != "/api/metrics",
+        )
         log.error(f"[{rid}] 异常: {e} ({dur:.0f}ms)")
         raise
     dur = (_t.time() - start) * 1000
     ok = response.status_code < 500
-    _metrics.record(request.url.path, dur, ok=ok)
-    log.info(f"[{rid}] {request.method} {request.url.path} → {response.status_code} {dur:.0f}ms")
+    conditional = request.method.upper() == "GET" and bool(request.headers.get("if-none-match"))
+    not_modified = response.status_code == 304
+    _metrics.record(
+        request.url.path,
+        dur,
+        ok=ok,
+        conditional=conditional,
+        not_modified=not_modified,
+        include_latency=path != "/api/metrics",
+        include_in_metrics=path != "/api/metrics",
+    )
+    completion_message = f"[{rid}] {request.method} {request.url.path} → {response.status_code} {dur:.0f}ms"
+    if response.status_code == 304:
+        log.debug(completion_message)
+    else:
+        log.info(completion_message)
     response.headers["X-Request-ID"] = rid
     return response
 
@@ -296,93 +559,122 @@ MAX_TEXT_LENGTH = 500  # 文字输入上限
 
 
 # ===== 通知队列(Web客户端可轮询获取主动通知) =====
-_notifications = []
 MAX_NOTIFICATIONS = 20
+_notifications = deque(maxlen=MAX_NOTIFICATIONS)
+_notifications_lock = threading.Lock()
+
+
+def _append_notification(notification: dict) -> None:
+    with _notifications_lock:
+        _notifications.append(notification)
+
+
+def _drain_notifications() -> list[dict]:
+    with _notifications_lock:
+        notifications = list(_notifications)
+        _notifications.clear()
+        return notifications
 
 def _add_notification(text: str, ntype: str = "reminder"):
     """添加通知到队列+SSE推送"""
-    _notifications.append({
+    notification = {
         "text": text, "type": ntype,
         "time": datetime.datetime.now().isoformat()
-    })
-    if len(_notifications) > MAX_NOTIFICATIONS:
-        _notifications.pop(0)
-    _push_notification_to_sse(text, ntype)  # SSE实时推送
+    }
+    _append_notification(notification)
+    if sse_client_count():
+        _push_notification_to_sse(_sse_event(notification))  # SSE实时推送
 
 # ===== SSE实时通知推送 =====
 _main_loop = None  # 主线程event loop(启动时捕获)
 
-def _push_notification_to_sse(text: str, ntype: str = "reminder"):
-    """推送通知到所有已连接的SSE客户端(线程安全)"""
+def _push_notification_to_sse(event_frame: str):
+    """推送已编码的 SSE 帧到所有已连接客户端(线程安全)"""
     global _main_loop
     if _main_loop is None:
         return  # 没有SSE客户端或loop未初始化
-    for client_q in list(_sse_clients):
+    for client_q in snapshot_sse_clients():
         try:
-            _main_loop.call_soon_threadsafe(
-                client_q.put_nowait, {"text": text, "type": ntype,
-                    "time": datetime.datetime.now().isoformat()})
+            _main_loop.call_soon_threadsafe(_put_sse_event_nowait, client_q, event_frame)
         except Exception:
-            try: _sse_clients.remove(client_q)
-            except: pass
+            log.debug("SSE调度失败，等待连接清理", exc_info=True)
 
-def _play_reminder_audio(text: str):
-    """生成提醒语音并播放到默认音频输出(AirPods/扬声器)"""
+
+def _put_sse_event_nowait(client_q: asyncio.Queue, event_frame: str) -> None:
     try:
-        from voice_agent import tts
+        client_q.put_nowait(event_frame)
+    except Exception:
+        unregister_sse_client(client_q)
+
+def _play_reminder_audio(text: str, reminder_id: int | None = None):
+    """生成提醒语音并播放到默认音频输出(AirPods/扬声器)"""
+    tmp = None
+    delivery_failed = False
+    delivery_error = ""
+    try:
+        from voice_agent import tts_to_mp3
         _add_notification(text, "reminder")
         log.info(f"[reminder] TTS生成: {text}")
-        audio = tts(f"主人，提醒您：{text}")
+        audio = tts_to_mp3(f"主人，提醒您：{text}")
         if not audio or len(audio) < 100:
-            log.warning("[reminder] TTS返回空音频，跳过播放")
-            return
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="/tmp")
+            raise RuntimeError("TTS返回空音频")
+        from voice_agent import runtime_temp_audio_path
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir=runtime_temp_audio_path())
         tmp.write(audio)
         tmp.close()
-        log.info(f"[reminder] 播放提醒语音 {len(audio)}字节: {text}")
+        log.info(f"[reminder] 播放提醒语音 {len(audio)}字节(MP3): {text}")
         subprocess.run(["afplay", tmp.name], timeout=30, capture_output=True)
-        os.unlink(tmp.name)
         log.info("[reminder] 播放完成")
+        if reminder_id is not None:
+            complete_reminder_delivery(reminder_id)
     except Exception as e:
+        delivery_failed = True
+        delivery_error = str(e)
         log.error(f"[reminder] 播放失败: {e}")
+        if reminder_id is not None:
+            release_failed_reminder(reminder_id, datetime.datetime.now(), delivery_error)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp.name)
+            except FileNotFoundError:
+                pass
+        if reminder_id is not None and delivery_failed:
+            log.warning(f"[reminder] 提醒{reminder_id}已释放，等待重试: {delivery_error}")
 
 def _reminder_scheduler():
     """后台守护线程：每30s检查到期提醒，自动播报"""
-    log.info("[reminder] 提醒调度器已启动，每30秒检查一次")
+    global _scheduler_lock_handle
+    log.info("[reminder] 提醒调度器已启动，正在竞争机器级调度锁")
     cleanup_counter = 0
     while True:
         try:
+            if _scheduler_lock_handle is None:
+                _scheduler_lock_handle = acquire_scheduler_lock()
+                if _scheduler_lock_handle is None:
+                    time.sleep(30)
+                    continue
+                log.info("[reminder] 已获取机器级调度锁，开始检查到期提醒")
             cleanup_counter += 1
             if cleanup_counter >= 20:
                 cleanup_counter = 0
                 from utils import cleanup_temp_files, truncate_history_file
-                cleanup_temp_files()
-                truncate_history_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation_history.json"), 100)
-            reminders = _load_reminders()
+                from voice_agent import runtime_temp_audio_path
+                cleanup_temp_files(extra_dirs=[runtime_temp_audio_path()])
+                truncate_history_file(HISTORY_FILE, 100)
             now = datetime.datetime.now()
-            changed = False
-            for r in reminders:
-                if r.get("done"):
-                    continue
-                due_str = r.get("due", "")
-                if not due_str:
-                    continue
-                try:
-                    due = datetime.datetime.fromisoformat(due_str)
-                except Exception:
-                    continue
-                if now >= due:
-                    text = r.get("text", "提醒")
-                    rid = r.get("id", 0)
-                    log.info(f"[reminder] 提醒到期(id={rid}): {text} (due={due_str})")
-                    # 异步播放（不阻塞调度器循环）
-                    threading.Thread(target=_play_reminder_audio, args=(text,), daemon=True).start()
-                    r["done"] = True
-                    r["triggered_at"] = now.isoformat()
-                    changed = True
-            if changed:
-                _save_reminders(reminders)
-                log.info("[reminder] 已更新reminders.json")
+            due_reminders = claim_due_reminders(now)
+            for reminder in due_reminders:
+                rid = reminder.get("id", 0)
+                text = reminder.get("text", "提醒")
+                due_str = reminder.get("due", "")
+                log.info(f"[reminder] 提醒到期(id={rid}): {text} (due={due_str})")
+                threading.Thread(
+                    target=_play_reminder_audio,
+                    args=(text,),
+                    kwargs={"reminder_id": rid},
+                    daemon=True,
+                ).start()
         except Exception as e:
             log.error(f"[reminder] 调度器异常: {e}")
         time.sleep(30)
@@ -393,23 +685,111 @@ def _start_scheduler():
 
 # ===== 主动建议(天气/时间感知) =====
 AMAP_KEY = os.getenv("AMAP_KEY", "")
-SUGGEST_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "suggestions_state.json")
-SUGGESTIONS_STATE = {"last_weather_check": 0, "last_rain_suggest": "", "last_time_suggest": "", "last_health_alert": ""}
+SUGGEST_STATE_FILE = SUGGESTIONS_STATE_FILE
+SUGGEST_STATE_LOCK_FILE = SUGGEST_STATE_FILE + ".lock"
+_SUGGESTIONS_DEFAULT_STATE = {
+    "last_weather_check": 0,
+    "last_rain_suggest": "",
+    "last_time_suggest": "",
+    "last_health_alert": "",
+}
+SUGGESTIONS_STATE = dict(_SUGGESTIONS_DEFAULT_STATE)
+_suggest_state_lock = threading.Lock()
+_proactive_lock_handle = None
+_proactive_thread = None
+
+
+@contextmanager
+def _locked_suggest_state(shared: bool = False):
+    os.makedirs(os.path.dirname(SUGGEST_STATE_FILE), exist_ok=True)
+    with _suggest_state_lock:
+        with open(SUGGEST_STATE_LOCK_FILE, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _read_locked_suggest_state() -> dict:
+    try:
+        with open(SUGGEST_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _write_locked_suggest_state(state: dict) -> None:
+    directory = os.path.dirname(SUGGEST_STATE_FILE) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".suggestions_state.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, SUGGEST_STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _refresh_suggestions_state(data: dict) -> None:
+    SUGGESTIONS_STATE.clear()
+    SUGGESTIONS_STATE.update(_SUGGESTIONS_DEFAULT_STATE)
+    SUGGESTIONS_STATE.update(data)
 
 def _load_suggest_state():
-    global SUGGESTIONS_STATE
     try:
-        with open(SUGGEST_STATE_FILE, "r") as f:
-            SUGGESTIONS_STATE.update(json.load(f))
+        with _locked_suggest_state(shared=True):
+            data = _read_locked_suggest_state()
+        _refresh_suggestions_state(data)
     except Exception:
         pass
 
 def _save_suggest_state():
     try:
-        with open(SUGGEST_STATE_FILE, "w") as f:
-            json.dump(SUGGESTIONS_STATE, f)
+        _update_suggest_state({})
     except Exception:
         pass
+
+
+def _suggest_state_snapshot() -> dict:
+    with _locked_suggest_state(shared=True):
+        data = _read_locked_suggest_state()
+    state = dict(_SUGGESTIONS_DEFAULT_STATE)
+    state.update(data)
+    _refresh_suggestions_state(state)
+    return dict(state)
+
+
+def _update_suggest_state(updates: dict) -> dict:
+    with _locked_suggest_state(shared=False):
+        state = dict(_SUGGESTIONS_DEFAULT_STATE)
+        state.update(_read_locked_suggest_state())
+        state.update(updates)
+        _write_locked_suggest_state(state)
+        _refresh_suggestions_state(state)
+        return dict(state)
+
+
+def _claim_suggest_state(key: str, value) -> bool:
+    with _locked_suggest_state(shared=False):
+        state = dict(_SUGGESTIONS_DEFAULT_STATE)
+        state.update(_read_locked_suggest_state())
+        if state.get(key) == value:
+            _refresh_suggestions_state(state)
+            return False
+        state[key] = value
+        _write_locked_suggest_state(state)
+        _refresh_suggestions_state(state)
+        return True
+
 
 _load_suggest_state()
 
@@ -426,44 +806,78 @@ def _get_weather():
         log.error(f"[suggest] 天气API失败: {e}")
     return []
 
+def _forecast_for_date(casts, target_date: str) -> dict:
+    """返回指定日期的预报；兼容缺少 date 字段的旧测试/API 返回。"""
+    for cast in casts:
+        if str(cast.get("date", "")).strip() == target_date:
+            return cast
+    if casts and all(not str(cast.get("date", "")).strip() for cast in casts):
+        return casts[0]
+    return {}
+
+def _preference_state_key(pkey: str, pval: str) -> tuple[str, str]:
+    """为偏好生成稳定且不会因中文截断而碰撞的当日去重键。"""
+    fingerprint = hashlib.sha256(f"{pkey}\0{pval}".encode("utf-8")).hexdigest()[:16]
+    return f"last_pref_{fingerprint}", fingerprint
+
 def _proactive_suggestions():
     """后台守护线程：定时检查天气和时间，主动推送建议"""
-    log.info("[suggest] 主动建议系统已启动，每小时检查天气，定时推送建议")
+    global _proactive_lock_handle
+    log.info("[suggest] 主动建议系统已启动，正在竞争机器级运行锁")
     while True:
         try:
+            if _proactive_lock_handle is None:
+                _proactive_lock_handle = acquire_proactive_lock()
+                if _proactive_lock_handle is None:
+                    time.sleep(60)
+                    continue
+                log.info("[suggest] 已获取机器级运行锁，开始检查天气和定时建议")
             now = datetime.datetime.now()
             hour = now.hour
             today = now.strftime("%Y-%m-%d")
+            suggest_state = _suggest_state_snapshot()
+            casts = None
+            weather_loaded = False
 
             # 1. 天气建议(每小时检查一次)
-            if time.time() - SUGGESTIONS_STATE["last_weather_check"] > 3600:
-                SUGGESTIONS_STATE["last_weather_check"] = time.time()
+            now_ts = time.time()
+            if now_ts - float(suggest_state.get("last_weather_check", 0) or 0) > 3600:
+                should_check_weather = _claim_suggest_state("last_weather_check", now_ts)
+            else:
+                should_check_weather = False
+            if should_check_weather:
                 casts = _get_weather()
-                for c in casts:
-                    weather = c.get("dayweather", "") + " " + c.get("nightweather", "")
-                    if ("雨" in weather or "雪" in weather) and SUGGESTIONS_STATE["last_rain_suggest"] != today:
-                        SUGGESTIONS_STATE["last_rain_suggest"] = today
-                        _save_suggest_state()
+                weather_loaded = bool(casts)
+                today_forecast = _forecast_for_date(casts, today)
+                if today_forecast:
+                    c = today_forecast
+                    weather_parts = []
+                    for weather_name in (c.get("dayweather", ""), c.get("nightweather", "")):
+                        weather_name = str(weather_name).strip()
+                        if weather_name and weather_name not in weather_parts:
+                            weather_parts.append(weather_name)
+                    weather = " ".join(weather_parts)
+                    if (
+                        any("雨" in weather_name or "雪" in weather_name for weather_name in weather_parts)
+                        and _claim_suggest_state("last_rain_suggest", today)
+                    ):
                         msg = f"主人，今天天气预报有{weather}，出门记得带伞哦。"
                         _add_notification(msg, "weather")
                         log.info(f"[suggest] 主动天气建议: {msg}")
                         threading.Thread(target=_play_reminder_audio, args=(msg,), daemon=True).start()
-                        break
 
             # 2. 时间建议(每天只推一次)
-            if hour >= 23 and hour < 24 and SUGGESTIONS_STATE["last_time_suggest"] != today + "_late":
-                SUGGESTIONS_STATE["last_time_suggest"] = today + "_late"
-                _save_suggest_state()
+            if hour >= 23 and hour < 24 and _claim_suggest_state("last_time_suggest", today + "_late"):
                 msg = "主人，已经23点了，该休息了，明天的事明天再说。"
                 _add_notification(msg, "bedtime")
                 log.info(f"[suggest] 主动休息建议: {msg}")
                 threading.Thread(target=_play_reminder_audio, args=(msg,), daemon=True).start()
-            elif 8 <= hour < 10 and SUGGESTIONS_STATE["last_time_suggest"] != today + "_morning":
-                SUGGESTIONS_STATE["last_time_suggest"] = today + "_morning"
-                _save_suggest_state()
-                casts = _get_weather()
-                w = casts[0].get("dayweather", "") if casts else ""
-                temp = casts[0].get("daytemp", "") if casts else ""
+            elif 8 <= hour < 10 and _claim_suggest_state("last_time_suggest", today + "_morning"):
+                if not weather_loaded:
+                    casts = _get_weather()
+                today_forecast = _forecast_for_date(casts, today)
+                w = today_forecast.get("dayweather", "") if today_forecast else ""
+                temp = today_forecast.get("daytemp", "") if today_forecast else ""
                 # 晨报：天气 + 今日待办
                 parts = [f"早上好主人！{'今天' + w + '，最高' + temp + '度，' if w and temp else ''}新的一天加油！"]
                 pending = [r for r in _load_reminders() if not r.get("done") and r.get("due", "").startswith(today)]
@@ -479,12 +893,10 @@ def _proactive_suggestions():
 
             # 3. 系统健康监控(CPU>90%或内存>95%时告警，每小时最多一次)
             import psutil
-            cpu = psutil.cpu_percent(interval=0.5)
+            cpu = psutil.cpu_percent(interval=None)
             mem = psutil.virtual_memory().percent
             health_key = today + f"_health_{hour}"
-            if (cpu > 90 or mem > 95) and SUGGESTIONS_STATE.get("last_health_alert", "") != health_key:
-                SUGGESTIONS_STATE["last_health_alert"] = health_key
-                _save_suggest_state()
+            if (cpu > 90 or mem > 95) and _claim_suggest_state("last_health_alert", health_key):
                 msg = f"主人，系统资源紧张：CPU使用率{cpu:.0f}%，内存{mem:.0f}%，建议关闭一些不必要的程序。"
                 _add_notification(msg, "health")
                 log.warning(f"[suggest] 系统健康告警: {msg}")
@@ -495,9 +907,8 @@ def _proactive_suggestions():
                 from voice_agent import list_preferences
                 prefs = list_preferences()
                 for pkey, pval in prefs.items():
-                    pref_suggest_key = today + f"_pref_{pkey[:10]}"
-                    if SUGGESTIONS_STATE.get(f"last_pref_{pkey[:10]}", "") == pref_suggest_key:
-                        continue
+                    state_key, pref_fingerprint = _preference_state_key(str(pkey), str(pval))
+                    pref_suggest_key = f"{today}_pref_{pref_fingerprint}"
                     # 根据偏好类型和时间生成建议
                     suggestion = None
                     if "下班" in pkey or "下班" in pval:
@@ -512,9 +923,7 @@ def _proactive_suggestions():
                     elif "睡" in pkey or "休息" in pkey:
                         if 22 <= hour < 24:  # 晚上10-12点
                             suggestion = f"主人，你设定了{pkey}为{pval}，该准备休息了。"
-                    if suggestion:
-                        SUGGESTIONS_STATE[f"last_pref_{pkey[:10]}"] = pref_suggest_key
-                        _save_suggest_state()
+                    if suggestion and _claim_suggest_state(state_key, pref_suggest_key):
                         _add_notification(suggestion, "preference")
                         log.info(f"[suggest] 偏好建议({pkey}): {suggestion}")
                         threading.Thread(target=_play_reminder_audio, args=(suggestion,), daemon=True).start()
@@ -527,8 +936,11 @@ def _proactive_suggestions():
         time.sleep(60)  # 每分钟检查一次时间条件
 
 def _start_proactive():
-    t = threading.Thread(target=_proactive_suggestions, daemon=True)
-    t.start()
+    global _proactive_thread
+    if _proactive_thread is not None and _proactive_thread.is_alive():
+        return
+    _proactive_thread = threading.Thread(target=_proactive_suggestions, daemon=True)
+    _proactive_thread.start()
 
 
 
@@ -545,14 +957,29 @@ async def voice_api(file: UploadFile = File(...)):
         return JSONResponse({"error": f"音频过大({len(data)//1024}KB), 上限{MAX_AUDIO_SIZE//1024//1024}MB"}, status_code=413)
     log.info(f"/api/voice 收到音频: {len(data)}字节, 格式={ext}")
     wav = to_wav(data, ext)
-    from voice_agent import voice_loop
+    if likely_empty_audio(wav):
+        from voice_agent import EMPTY_ASR_REPLY, EMPTY_ASR_TEXT
+        log.info("/api/voice 本地判定为长静音，短路ASR、大脑和TTS")
+        return {
+            "text": EMPTY_ASR_TEXT,
+            "reply": EMPTY_ASR_REPLY,
+            "audio": "",
+            "format": "mp3",
+            "degraded": True,
+        }
+    from voice_agent import voice_loop, TTSUnavailableError
     try:
         text, reply, audio_out = await asyncio.wait_for(
             asyncio.to_thread(voice_loop, wav, "wav"), timeout=60)
         mp3_out = _wav_to_mp3(audio_out)
-        log.info(f"/api/voice 完成: 识别={text[:30]} 回复={reply[:30]} WAV={len(audio_out)}→MP3={len(mp3_out)}字节")
+        degraded = not mp3_out
+        log.info(f"/api/voice 完成: 识别={text[:30]} 回复={reply[:30]} WAV={len(audio_out)}→MP3={len(mp3_out)}字节 degraded={degraded}")
         import base64 as _b64
-        return {"text": text, "reply": reply, "audio": _b64.b64encode(mp3_out).decode(), "format": "mp3"}
+        return {
+            "text": text, "reply": reply,
+            "audio": _b64.b64encode(mp3_out).decode(),
+            "format": "mp3", "degraded": degraded,
+        }
     except asyncio.TimeoutError:
         log.error("/api/voice 超时(60s)")
         return JSONResponse({"error": "处理超时，请重试"}, status_code=504)
@@ -562,93 +989,210 @@ async def voice_api(file: UploadFile = File(...)):
         return JSONResponse({"error": sanitize_error(str(e))}, status_code=500)
 
 # ===== 流式端点: 大脑逐句产出 → TTS批量推送(SSE) =====
-_TTS_BATCH_SIZE = 50  # TTS批量大小(字符数)，平衡延迟与效率
+_TTS_BATCH_SIZE = 30  # TTS批量大小(字符数)，降低延迟
+TTS_DEGRADED_MESSAGE = "语音服务繁忙，本轮先显示文字回复。"
+BRAIN_BUSY_MESSAGE = "大脑服务繁忙，请稍后再试。"
+ASR_ACK_MESSAGE = "嗯，让我想想"
+_SSE_DONE_FRAME = 'data: {"type":"done"}\n\n'
+_SSE_HEARTBEAT_FRAME = ': heartbeat\n\n'
+
+
+def _sse_event(event: dict) -> str:
+    """Serialize one compact SSE data frame."""
+    return f'data: {json.dumps(event, ensure_ascii=False, separators=(",", ":"))}\n\n'
+
+
+_SSE_EVENT_HEARTBEAT_FRAME = _sse_event({"type": "heartbeat", "text": "", "time": ""})
+
+
+def _friendly_brain_error(error: Exception) -> str:
+    """Keep upstream brain errors in logs while returning a stable client message."""
+    from utils import sanitize_error
+
+    raw_message = str(error)
+    lowered = raw_message.lower()
+    if "429" in raw_message or "too many requests" in lowered or "rate limit" in lowered or "限流" in raw_message:
+        log.warning(f"大脑服务限流，返回友好提示: {raw_message}")
+        return BRAIN_BUSY_MESSAGE
+    log.error(f"大脑流式生成失败: {raw_message}")
+    return sanitize_error(raw_message)
 
 def _flush_tts_buffer(tts_buffer: str) -> str:
-    """清理并生成TTS音频，返回base64 MP3(空则返回'')"""
-    from voice_agent import tts_to_mp3, _clean_for_tts
-    cleaned = _clean_for_tts(tts_buffer)
-    if not cleaned or len(cleaned) < 2:
+    """为已清洗文本生成TTS音频，返回base64 MP3(空则返回'')"""
+    from voice_agent import _tts_cleaned_to_mp3
+    if not tts_buffer or len(tts_buffer) < 2:
         return ""
-    mp3 = tts_to_mp3(cleaned)
+    mp3 = _tts_cleaned_to_mp3(tts_buffer)
     if not mp3 or len(mp3) < 100:
         return ""
     return _b64enc.b64encode(mp3).decode()
 
+def _empty_asr_events(as_event_stream: bool):
+    """空 ASR 的降级事件：展示用户可读提示，但不写入大脑历史或触发 TTS。"""
+    from voice_agent import EMPTY_ASR_REPLY
+    text_event = {"type": "text", "text": EMPTY_ASR_REPLY}
+    done_event = {"type": "done"}
+    if as_event_stream:
+        yield _sse_event(text_event)
+        yield _sse_event(done_event)
+    else:
+        yield text_event
+        yield done_event
+
+def _low_intent_asr_events(asr_text: str, as_event_stream: bool):
+    """语气词 ASR 的本地确认事件：展示 ASR 与轻量回复，但不进入大脑、历史或 TTS。"""
+    asr_event = {"type": "asr", "text": asr_text}
+    text_event = {"type": "text", "text": LOW_INTENT_ASR_REPLY}
+    done_event = {"type": "done"}
+    if as_event_stream:
+        yield _sse_event(asr_event)
+        yield _sse_event(text_event)
+        yield _sse_event(done_event)
+    else:
+        yield asr_event
+        yield text_event
+        yield done_event
+
+async def _synthesize_tts_event(tts_buffer: str):
+    """合成一段 TTS；失败时返回降级 warning，供上层停止本轮后续语音尝试。"""
+    if not tts_buffer or len(tts_buffer) < 2:
+        return "", None
+    try:
+        audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
+        return audio_b64, None
+    except Exception as e:
+        log.warning(f"流式TTS失败，降级为文字: {e}")
+        return "", {"type": "warning", "message": TTS_DEGRADED_MESSAGE}
+
 async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "default"):
     """
-    流式大脑+TTS生成器(SSE事件流)。
-    大脑在后台线程逐句产出 → 文本事件即时推送(显示) → TTS批量推送(音频)。
-    yield: SSE格式的data行。
+    流式大脑+TTS生成器(SSE事件流) — 并行版。
+    brain 在后台线程逐句产出，TTS 合成在独立线程池并行执行，
+    总耗时 = max(brain总时间, TTS总时间) 而非两者之和。
     """
     from voice_agent import brain_stream_sentences
     
-    q = _queue.Queue()
+    q = _queue.Queue()          # brain → 主循环
+    tts_q = _queue.Queue()      # TTS线程 → 主循环 (并行)
+    brain_thread = None
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     
     def brain_worker():
         try:
             for sentence, full_reply in brain_stream_sentences(text, session_id):
                 q.put(("sentence", sentence, full_reply))
         except Exception as e:
-            q.put(("error", str(e)[:60], None))
+            q.put(("error", _friendly_brain_error(e), None))
         finally:
             q.put(("done", None, None))
     
-    threading.Thread(target=brain_worker, daemon=True).start()
-    
     # 如果有ASR结果，先推送
     if asr_text:
-        yield f'data: {json.dumps({"type":"asr","text":asr_text}, ensure_ascii=False)}\n\n'
+        yield _sse_event({"type": "asr", "text": asr_text})
+        # 立即推送预缓存过渡语(0ms, 填充 brain 首 token 窗口)
+        from voice_agent import _tts_cache_get
+        ack_audio = _tts_cache_get(ASR_ACK_MESSAGE, cleaned=True)
+        if ack_audio:
+            yield _sse_event({"type": "audio", "audio": _b64enc.b64encode(ack_audio).decode()})
+        yield _sse_event({"type": "ack", "message": ASR_ACK_MESSAGE})
+        brain_thread = threading.Thread(target=brain_worker, daemon=True)
+        brain_thread.start()
+
+    if brain_thread is None:
+        brain_thread = threading.Thread(target=brain_worker, daemon=True)
+        brain_thread.start()
     
     tts_buffer = ""
-    first_audio_sent = False  # 首段立即flush(降首音频延迟)
+    tts_failed = False
+    first_audio_sent = False
+    brain_done = False
+    pending_tts = []
     total_wait = 0
-    HEARTBEAT_INTERVAL = 5  # 每5秒发心跳
-    MAX_WAIT = 120  # 总超时120秒
+    HEARTBEAT_INTERVAL = 0.15
+    MAX_WAIT = 120
+    
+    def _submit_tts(text_to_synth: str):
+        """在后台线程合成TTS，完成后通过tts_q返回结果。"""
+        try:
+            if not text_to_synth or len(text_to_synth) < 2:
+                tts_q.put(("result", text_to_synth, "", None))
+                return
+            audio_b64 = _flush_tts_buffer(text_to_synth)
+            tts_q.put(("result", text_to_synth, audio_b64, None))
+        except Exception as e:
+            tts_q.put(("error", text_to_synth, None, {"type": "warning", "message": TTS_DEGRADED_MESSAGE}))
     
     while True:
+        # 检查 brain 队列
+        brain_item = None
         try:
-            item = q.get_nowait()  # 非阻塞检查队列
-            total_wait = 0  # 收到数据,重置计时
+            brain_item = q.get_nowait()
+            total_wait = 0
         except _queue.Empty:
-            # 队列空, 发心跳保活
-            if total_wait >= MAX_WAIT:
-                yield f'data: {json.dumps({"type":"error","message":"思考超时"}, ensure_ascii=False)}\n\n'
-                yield 'data: {"type":"done"}\n\n'
+            pass
+        
+        # 检查 TTS 结果队列
+        tts_result = None
+        try:
+            tts_result = tts_q.get_nowait()
+        except _queue.Empty:
+            pass
+        
+        if brain_item:
+            etype, sentence, full_reply = brain_item
+            if etype == "done":
+                brain_done = True
+                # brain 结束，但还有 pending TTS 任务 — 继续等待
+                if not pending_tts and not tts_buffer.strip():
+                    yield _SSE_DONE_FRAME
+                    break
+            elif etype == "error":
+                yield _sse_event({"type": "error", "message": sentence})
+                yield _SSE_DONE_FRAME
                 break
-            yield ': heartbeat\n\n'  # SSE心跳(注释,客户端忽略,保活连接)
+            elif etype == "sentence":
+                # 文本事件即时推送
+                yield _sse_event({"type": "text", "text": sentence})
+                if sentence and len(sentence) >= 2:
+                    tts_buffer = (tts_buffer + "， " + sentence) if tts_buffer else sentence
+                    should_flush = (not first_audio_sent) or (len(tts_buffer) >= _TTS_BATCH_SIZE)
+                    if should_flush and not tts_failed:
+                        buf = tts_buffer
+                        tts_buffer = ""
+                        first_audio_sent = True
+                        pending_tts.append(buf)
+                        # 并行提交 TTS 到线程池
+                        threading.Thread(target=_submit_tts, args=(buf,), daemon=True).start()
+        
+        if tts_result:
+            rtype, txt, audio_b64, warning = tts_result
+            if rtype == "result" and audio_b64:
+                yield _sse_event({"type": "audio", "audio": audio_b64})
+                if txt in pending_tts:
+                    pending_tts.remove(txt)
+            elif rtype == "error":
+                if not tts_failed:
+                    tts_failed = True
+                    yield _sse_event(warning)
+        
+        # brain 结束 + 所有TTS完成 → 结束
+        if brain_done and not pending_tts:
+            if tts_buffer.strip() and not tts_failed:
+                threading.Thread(target=_submit_tts, args=(tts_buffer,), daemon=True).start()
+                pending_tts.append(tts_buffer)
+                tts_buffer = ""
+            elif not pending_tts:
+                yield _SSE_DONE_FRAME
+                break
+        
+        if not brain_item and not tts_result:
+            if total_wait >= MAX_WAIT:
+                yield _sse_event({"type": "error", "message": "思考超时"})
+                yield _SSE_DONE_FRAME
+                break
+            yield _SSE_HEARTBEAT_FRAME
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             total_wait += HEARTBEAT_INTERVAL
-            continue
-        
-        etype, sentence, full_reply = item
-        if etype == "done":
-            # 推送剩余TTS
-            if tts_buffer.strip():
-                audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
-                if audio_b64:
-                    yield f'data: {json.dumps({"type":"audio","audio":audio_b64}, ensure_ascii=False)}\n\n'
-            yield 'data: {"type":"done"}\n\n'
-            break
-        elif etype == "error":
-            yield f'data: {json.dumps({"type":"error","message":sentence}, ensure_ascii=False)}\n\n'
-            yield 'data: {"type":"done"}\n\n'
-            break
-        elif etype == "sentence":
-            # 文本事件即时推送(用于显示)
-            yield f'data: {json.dumps({"type":"text","text":sentence}, ensure_ascii=False)}\n\n'
-            # 积累TTS缓冲区
-            from voice_agent import _clean_for_tts
-            cleaned = _clean_for_tts(sentence)
-            if cleaned and len(cleaned) >= 2:
-                tts_buffer = (tts_buffer + "，" + cleaned) if tts_buffer else cleaned
-                # 首段立即flush(不等50字,降低首音频延迟); 后续按50字批
-                if (not first_audio_sent) or (len(tts_buffer) >= _TTS_BATCH_SIZE):
-                    audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
-                    tts_buffer = ""
-                    first_audio_sent = True
-                    if audio_b64:
-                        yield f'data: {json.dumps({"type":"audio","audio":audio_b64}, ensure_ascii=False)}\n\n'
 
 @app.post("/api/chat/stream")
 async def chat_stream_api(req: ChatRequest):
@@ -665,11 +1209,19 @@ async def voice_stream_api(request: Request, file: UploadFile = File(...), sessi
     data = await file.read()
     ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
     if len(data) > MAX_AUDIO_SIZE:
-        return JSONResponse({"error": f"音频过大", "status_code": 413}, status_code=413)
+        log.warning(f"/api/voice/stream 音频过大: {len(data)}字节 (>{MAX_AUDIO_SIZE})")
+        return JSONResponse(
+            {"error": f"音频过大({len(data)//1024}KB), 上限{MAX_AUDIO_SIZE//1024//1024}MB"},
+            status_code=413,
+        )
     ua = request.headers.get("user-agent", "?")[:80]
     log.info(f"/api/voice/stream 收到音频: {len(data)}字节, 格式={ext}, UA={ua}")
     
     wav = to_wav(data, ext)
+    if likely_empty_audio(wav):
+        log.info("/api/voice/stream 本地判定为长静音，短路ASR、大脑和TTS")
+        return StreamingResponse(_empty_asr_events(True), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     from voice_agent import asr
     try:
         asr_text = await asyncio.wait_for(asyncio.to_thread(asr, wav, "wav"), timeout=30)
@@ -681,7 +1233,13 @@ async def voice_stream_api(request: Request, file: UploadFile = File(...), sessi
     
     log.info(f"/api/voice/stream ASR结果: [{asr_text[:60]}] (len={len(asr_text or '')})")
     if not asr_text:
-        asr_text = "(未识别到语音)"
+        log.info("/api/voice/stream ASR为空，短路大脑和TTS")
+        return StreamingResponse(_empty_asr_events(True), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    if is_low_intent_asr(asr_text):
+        log.info("/api/voice/stream ASR为低意图语气词，短路大脑和TTS")
+        return StreamingResponse(_low_intent_asr_events(asr_text, True), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     
     return StreamingResponse(_stream_brain_tts(asr_text, asr_text, session_id=session_id), 
                              media_type="text/event-stream",
@@ -719,10 +1277,19 @@ async def reset_conversation(session_id: str = "default"):
 
 
 @app.get("/api/reminders")
-async def list_reminders():
+async def list_reminders(request: Request):
+    cached = _file_not_modified_response(request, REMINDERS_FILE, "reminders")
+    if cached is not None:
+        return cached
+    reminders_token = _file_etag_token(REMINDERS_FILE, "reminders")
     data = _load_reminders()
+    reminders_token_after_load = _file_etag_token(REMINDERS_FILE, "reminders")
     pending = [r for r in data if not r.get("done")]
-    return {"total": len(data), "pending": len(pending), "reminders": data}
+    return _json_response(
+        request,
+        {"total": len(data), "pending": len(pending), "reminders": data},
+        etag_token=reminders_token if reminders_token == reminders_token_after_load else None,
+    )
 
 @app.post("/api/reminders")
 async def add_reminder(req: ReminderRequest):
@@ -733,26 +1300,15 @@ async def add_reminder(req: ReminderRequest):
     if time_str:
         from utils import parse_time_str
         due = parse_time_str(time_str)
-    data = _load_reminders()
-    rid = int(datetime.datetime.now().timestamp())
-    data.append({"id": rid, "text": text, "time": time_str, "due": due, "done": False})
-    _save_reminders(data)
+    item = append_reminder(text, time_str, due)
+    rid = item["id"]
     when = f"，提醒时间{due.replace('T', ' ')}" if due else (f"（时间'{time_str}'未解析出时刻）" if time_str else "")
     return {"ok": True, "id": rid, "message": f"已添加提醒：{text}{when}"}
 
 @app.delete("/api/reminders/{rid}")
 async def delete_reminder(rid: int):
-    data = _load_reminders()
-    found = False
-    for r in data:
-        if r.get("id") == rid:
-            r["done"] = True
-            r["completed_at"] = datetime.datetime.now().isoformat()
-            found = True
-            break
-    if not found:
+    if not complete_reminder(rid):
         raise HTTPException(404, "提醒不存在")
-    _save_reminders(data)
     return {"ok": True, "message": f"提醒{rid}已标记完成"}
 
 @app.get("/api/conversation")
@@ -760,8 +1316,8 @@ async def get_conversation(page: int = 1, limit: int = 50, session_id: str = "de
     """获取对话历史(支持分页)
     page: 页码(从1开始), limit: 每页条数(默认50)
     """
-    from voice_agent import _get_history
-    hist = _get_history(session_id)
+    from voice_agent import _history_snapshot
+    hist = _history_snapshot(session_id)
     total = len(hist)
     # 分页计算
     start = max(0, (page - 1) * limit)
@@ -780,14 +1336,14 @@ async def get_conversation(page: int = 1, limit: int = 50, session_id: str = "de
 async def tts_api(req: TTSRequest):
     """文字 → 语音(MP3)"""
     text = _sanitize_text(req.text, MAX_TEXT_LENGTH)
-    from voice_agent import tts
+    from voice_agent import tts_to_mp3, TTSUnavailableError
     try:
-        audio = await asyncio.wait_for(
-            asyncio.to_thread(tts, text), timeout=30)
+        audio = await asyncio.wait_for(asyncio.to_thread(tts_to_mp3, text), timeout=30)
         if not audio:
             return JSONResponse({"error": "TTS生成失败"}, status_code=500)
-        mp3 = _wav_to_mp3(audio)
-        return Response(content=mp3, media_type="audio/mpeg")
+        return Response(content=audio, media_type="audio/mpeg")
+    except TTSUnavailableError:
+        return JSONResponse({"error": "TTS服务繁忙，请稍后再试"}, status_code=503)
     except asyncio.TimeoutError:
         return JSONResponse({"error": "TTS超时"}, status_code=504)
 
@@ -797,6 +1353,9 @@ async def asr_api(file: UploadFile = File(...)):
     data = await file.read()
     ext = (file.filename or "audio.wav").rsplit(".", 1)[-1].lower()
     wav = to_wav(data, ext)
+    if likely_empty_audio(wav):
+        log.info("/api/asr 本地判定为长静音，短路远端ASR")
+        return {"text": ""}
     from voice_agent import asr
     try:
         text = await asyncio.wait_for(
@@ -806,10 +1365,47 @@ async def asr_api(file: UploadFile = File(...)):
         return JSONResponse({"error": "ASR超时"}, status_code=504)
 
 @app.get("/api/export")
-async def export_conversation(format: str = "txt"):
-    """导出对话历史(支持txt/markdown/json格式)"""
-    from voice_agent import _history
-    if not _history:
+async def export_conversation(
+    format: str = "txt",
+    session_id: str = "default",
+    from_date: str | None = None,
+    to_date: str | None = None,
+):
+    """导出对话历史(支持txt/markdown/json格式, 按会话和日期筛选)"""
+    from voice_agent import _history_snapshot
+    hist = _history_snapshot(session_id)
+
+    start_date = None
+    end_date = None
+    try:
+        if from_date:
+            start_date = datetime.date.fromisoformat(from_date)
+        if to_date:
+            end_date = datetime.date.fromisoformat(to_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+
+    filtered = []
+    for message in hist:
+        raw_ts = message.get("ts")
+        if not raw_ts:
+            if not start_date and not end_date:
+                filtered.append(message)
+            continue
+        try:
+            message_date = datetime.datetime.fromisoformat(str(raw_ts)).date()
+        except ValueError:
+            continue
+        if start_date and message_date < start_date:
+            continue
+        if end_date and message_date > end_date:
+            continue
+        filtered.append(message)
+    hist = filtered
+
+    if not hist:
         return Response(content="(对话历史为空)".encode("utf-8"), media_type="text/plain")
     
     if format == "json":
@@ -820,7 +1416,7 @@ async def export_conversation(format: str = "txt"):
     
     if format in ("markdown", "md"):
         lines = ["# Charlie · 对话记录\n"]
-        for m in _history:
+        for m in hist:
             role = "🙋 我" if m.get("role") == "user" else "🤖 Charlie"
             lines.append(f"### {role}\n\n{m.get('content', '')}\n")
         lines.append(f"\n---\n*共{len(hist)}条消息 · {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}导出*")
@@ -842,35 +1438,34 @@ async def export_conversation(format: str = "txt"):
 @app.get("/api/notifications")
 async def get_notifications():
     """获取并清空通知队列(Web客户端轮询用)"""
-    notifs = list(_notifications)
-    _notifications.clear()
+    notifs = _drain_notifications()
     return {"count": len(notifs), "notifications": notifs}
 
 @app.get("/api/events")
 async def sse_events():
     """SSE实时通知流(Web客户端用EventSource连接, 免轮询)"""
-    import asyncio
-    from starlette.responses import StreamingResponse
-
     queue = asyncio.Queue()
-    _sse_clients.append(queue)
+    register_sse_client(queue)
 
     async def event_stream():
         try:
             # 发送连接确认
-            yield f"data: {json.dumps({'type':'connect','text':'已连接','time':datetime.datetime.now().isoformat()})}\n\n"
+            yield _sse_event({
+                "type": "connect",
+                "text": "已连接",
+                "time": datetime.datetime.now().isoformat(),
+            })
             while True:
                 try:
-                    notif = await asyncio.wait_for(queue.get(), timeout=30)
-                    yield f"data: {json.dumps(notif, ensure_ascii=False)}\n\n"
+                    event_frame = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield event_frame
                 except asyncio.TimeoutError:
                     # 心跳保活
-                    yield f"data: {json.dumps({'type':'heartbeat','text':'','time':''})}\n\n"
+                    yield _SSE_EVENT_HEARTBEAT_FRAME
         except asyncio.CancelledError:
             pass
         finally:
-            if queue in _sse_clients:
-                _sse_clients.remove(queue)
+            unregister_sse_client(queue)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream",
                             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -893,15 +1488,7 @@ def _ws_cleanup_stale():
     stale = [sid for sid, info in _ws_clients.items()
              if now - info.get("last_active", now) > _WS_STALE_TIMEOUT]
     for sid in stale:
-        try:
-            ws = _ws_clients[sid].get("ws")
-            if ws:
-                import asyncio
-                loop = asyncio.get_running_loop()
-                loop.call_soon_threadsafe(asyncio.ensure_future, ws.close())
-        except Exception:
-            pass
-        _ws_clients.pop(sid, None)
+        _ws_cleanup_after_disconnect(sid, close_connection=True)
     if stale:
         log.info(f"[ws] 清理{len(stale)}个过期连接, 剩余{len(_ws_clients)}个")
 
@@ -912,6 +1499,145 @@ def _start_ws_cleanup():
             time.sleep(60)
             _ws_cleanup_stale()
     threading.Thread(target=_cleanup_loop, daemon=True).start()
+
+async def _ws_stream_and_send(
+    ws,
+    ws_id: int,
+    *,
+    text: str,
+    asr_text: str = "",
+    session_id: str,
+    interrupted_reply: str = "",
+):
+    """后台运行大脑流式生成+发送事件; 可被interrupt标志或任务取消打断。
+    后台任务模式下receive循环不被阻塞, 客户端可随时发送interrupt。
+    跨终端：回复同时广播给同一 session 的所有终端。"""
+    try:
+        if asr_text:
+            await _ws_broadcast_to_session(
+                ws_id,
+                {"type": "asr", "text": asr_text},
+                exclude_self=True,
+            )
+        async for event in _ws_stream_brain(
+            ws_id,
+            text,
+            session_id,
+            interrupted_reply=interrupted_reply,
+        ):
+            info = _ws_clients.get(ws_id)
+            if not info or info.get("stream_task") is not asyncio.current_task():
+                break
+            await ws.send_json(event)
+            # 跨终端广播（text/audio/done/error 事件发给同 session 其他终端）
+            if event.get("type") in ("text", "audio", "done", "error"):
+                await _ws_broadcast_to_session(ws_id, event, exclude_self=True)
+    except asyncio.CancelledError:
+        raise  # 由调用方发送interrupted, 这里只清理
+    except Exception as e:
+        log.error(f"[ws] 流式任务异常 (id={ws_id}): {e}")
+        try:
+            await ws.send_json({"type": "error", "message": str(e)[:60]})
+        except Exception:
+            pass
+    finally:
+        info = _ws_clients.get(ws_id)
+        if info and info.get("stream_task") is asyncio.current_task():
+            info["stream_task"] = None
+
+def _ws_cancel_stream(ws_id: int):
+    """打断当前流式任务: 设interrupt标志 + 取消后台task(即时停止发送)"""
+    info = _ws_clients.get(ws_id)
+    if not info:
+        return
+    info["interrupt"] = True
+    task = info.get("stream_task")
+    if task and not task.done():
+        task.cancel()
+
+def _ws_join_session(ws_id: int, session_id: str):
+    """把 WebSocket 加入会话组，供后续流式回复跨终端同步。"""
+    info = _ws_clients.get(ws_id)
+    if not info:
+        return
+    info["session_id"] = session_id
+    if session_id not in _ws_session_groups:
+        _ws_session_groups[session_id] = []
+    if ws_id not in _ws_session_groups[session_id]:
+        _ws_session_groups[session_id].append(ws_id)
+        peers = [p for p in _ws_session_groups[session_id] if p != ws_id]
+        if peers:
+            log.info(f"[ws] 会话 {session_id[:8]} 跨终端同步: {len(peers)+1}个终端")
+
+async def _ws_broadcast_to_session(ws_id: int, event: dict, exclude_self: bool = True):
+    """跨终端广播：把事件发给同一 session 的所有客户端（排除发送者）"""
+    info = _ws_clients.get(ws_id)
+    if not info:
+        return
+    session_id = info.get("session_id", "default")
+    peers = _ws_session_groups.get(session_id, [])
+    for pid in peers:
+        if exclude_self and pid == ws_id:
+            continue
+        pinfo = _ws_clients.get(pid)
+        if pinfo:
+            try:
+                await pinfo["ws"].send_json(event)
+            except Exception:
+                pass
+
+async def _ws_reverse_geocode(lat: float, lng: float) -> str:
+    """高德地图反向地理编码：经纬度→地址"""
+    amap_key = os.getenv("AMAP_KEY", "")
+    if not amap_key:
+        return f"经纬度: {lat:.4f}, {lng:.4f}"
+    try:
+        r = await asyncio.to_thread(
+            requests.get,
+            f"https://restapi.amap.com/v3/geocode/regeo?key={amap_key}&location={lng},{lat}&extensions=base",
+            timeout=5
+        )
+        data = r.json()
+        addr = data.get("regeocode", {}).get("formatted_address", "")
+        if addr:
+            return f"{addr} (经纬度: {lat:.4f}, {lng:.4f})"
+        return f"经纬度: {lat:.4f}, {lng:.4f}"
+    except Exception:
+        return f"经纬度: {lat:.4f}, {lng:.4f}"
+
+def _ws_cleanup_after_disconnect(ws_id: int, close_connection: bool = False):
+    """取消连接上的后台流式任务, 并可从后台线程安全关闭WebSocket。"""
+    info = _ws_clients.pop(ws_id, None)
+    if not info:
+        return
+
+    _interrupt_telemetry.discard_pending(ws_id)
+
+    task = info.get("stream_task")
+    if task and not task.done():
+        task.cancel()
+
+    # 从会话组移除
+    session_id = info.get("session_id", "default")
+    if session_id in _ws_session_groups:
+        try:
+            _ws_session_groups[session_id].remove(ws_id)
+        except ValueError:
+            pass
+        if not _ws_session_groups[session_id]:
+            del _ws_session_groups[session_id]
+
+    # 清除位置
+    _ws_client_locations.pop(ws_id, None)
+
+    if close_connection:
+        ws = info.get("ws")
+        if ws and _main_loop and not _main_loop.is_closed():
+            try:
+                _main_loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(ws.close()))
+            except RuntimeError:
+                pass
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -930,6 +1656,7 @@ async def websocket_endpoint(ws: WebSocket):
       {"type":"done"}                            → 回复完成
       {"type":"error","message":"..."}           → 错误
       {"type":"pong"}                            → 心跳回复
+      {"type":"location","lat":31.23,"lng":121.47,"accuracy":10} → 浏览器GPS定位
     """
     await ws.accept()
     # WebSocket认证
@@ -941,7 +1668,7 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.close(code=4001, reason="未授权")
                 return
     ws_id = id(ws)
-    _ws_clients[ws_id] = {"ws": ws, "interrupt": False, "last_active": time.time()}
+    _ws_clients[ws_id] = {"ws": ws, "interrupt": False, "last_active": time.time(), "stream_task": None}
     log.info(f"[ws] 客户端已连接 (id={ws_id}), 共{len(_ws_clients)}个连接")
     
     # 发送连接确认
@@ -971,10 +1698,30 @@ async def websocket_endpoint(ws: WebSocket):
                 continue
             
             if mtype == "interrupt":
-                # 设置打断标志, 流式生成器会检查
-                _ws_clients[ws_id]["interrupt"] = True
-                log.info(f"[ws] 客户端请求打断TTS (id={ws_id})")
+                # 设打断标志 + 取消流式任务(后台任务模式下可即时收到)
+                interrupted_reply = data.get("interrupted_reply", "")
+                _ws_cancel_stream(ws_id)
+                _interrupt_telemetry.record(ws_id, interrupted_reply)
+                log.info(f"[ws] 客户端请求打断TTS (id={ws_id}), 被打断回复: {interrupted_reply[:60]}")
                 await ws.send_json({"type": "interrupted"})
+                continue
+
+            if mtype == "location":
+                # 浏览器 GPS 定位
+                lat = data.get("lat")
+                lng = data.get("lng")
+                acc = data.get("accuracy", 0)
+                if lat is None or lng is None:
+                    await ws.send_json({"type": "error", "message": "缺少经纬度"})
+                    continue
+                _ws_client_locations[ws_id] = {
+                    "lat": lat, "lng": lng, "accuracy": acc,
+                    "time": datetime.datetime.now().isoformat()
+                }
+                # 反向地理编码
+                addr = await _ws_reverse_geocode(lat, lng)
+                log.info(f"[ws] 位置上报 (id={ws_id}): {addr}")
+                await ws.send_json({"type": "location_ack", "address": addr, "lat": lat, "lng": lng})
                 continue
             
             if mtype == "text":
@@ -986,17 +1733,22 @@ async def websocket_endpoint(ws: WebSocket):
                 if len(text) > MAX_TEXT_LENGTH:
                     await ws.send_json({"type": "error", "message": f"输入过长(上限{MAX_TEXT_LENGTH}字)"})
                     continue
-                # 重置打断标志
+                # 注册到会话组（跨终端同步）
+                _ws_join_session(ws_id, session_id)
+                interrupted_reply = _interrupt_telemetry.record_follow_up(ws_id, text, "text")
+                # 取消上一轮流式任务(如有), 重置打断标志
+                _ws_cancel_stream(ws_id)
                 _ws_clients[ws_id]["interrupt"] = False
                 log.info(f"[ws] 文字对话: {text[:40]} (session={session_id[:8]})")
-                
-                # 流式处理大脑回复
-                async for event in _ws_stream_brain(ws_id, text, "", session_id):
-                    await ws.send_json(event)
-                    # 检查打断
-                    if _ws_clients[ws_id]["interrupt"]:
-                        await ws.send_json({"type": "interrupted"})
-                        break
+                # 流式处理大脑回复(后台任务, 不阻塞receive循环→可即时响应打断)
+                task = asyncio.create_task(_ws_stream_and_send(
+                    ws,
+                    ws_id,
+                    text=text,
+                    session_id=session_id,
+                    interrupted_reply=interrupted_reply,
+                ))
+                _ws_clients[ws_id]["stream_task"] = task
                 continue
             
             if mtype == "audio":
@@ -1013,12 +1765,19 @@ async def websocket_endpoint(ws: WebSocket):
                 if len(raw) > MAX_AUDIO_SIZE:
                     await ws.send_json({"type": "error", "message": "音频过大"})
                     continue
-                # 重置打断标志
+                ws_session_id = data.get("session_id", "default")
+                _ws_join_session(ws_id, ws_session_id)
+                # 取消上一轮流式任务(如有), 重置打断标志
+                _ws_cancel_stream(ws_id)
                 _ws_clients[ws_id]["interrupt"] = False
                 log.info(f"[ws] 语音对话: {len(raw)}字节, 格式={fmt}")
-                
-                # ASR
+                # ASR(内联, ~800ms; 用户刚说完话不会在此期间打断)
                 wav = to_wav(raw, fmt)
+                if likely_empty_audio(wav):
+                    log.info(f"[ws] 本地判定为长静音，短路ASR、大脑和TTS (id={ws_id})")
+                    for event in _empty_asr_events(False):
+                        await ws.send_json(event)
+                    continue
                 from voice_agent import asr
                 try:
                     asr_text = await asyncio.wait_for(asyncio.to_thread(asr, wav, "wav"), timeout=30)
@@ -1026,16 +1785,35 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "error", "message": "语音识别超时"})
                     continue
                 if not asr_text:
-                    asr_text = "(未识别到语音)"
-                await ws.send_json({"type": "asr", "text": asr_text})
-                
-                # 流式大脑回复
-                ws_session_id = data.get("session_id", "default")
-                async for event in _ws_stream_brain(ws_id, asr_text, asr_text, ws_session_id):
-                    await ws.send_json(event)
-                    if _ws_clients[ws_id]["interrupt"]:
-                        await ws.send_json({"type": "interrupted"})
-                        break
+                    log.info(f"[ws] ASR为空，短路大脑和TTS (id={ws_id})")
+                    for event in _empty_asr_events(False):
+                        await ws.send_json(event)
+                    continue
+                if is_low_intent_asr(asr_text):
+                    log.info(f"[ws] ASR为低意图语气词，短路大脑和TTS (id={ws_id})")
+                    for event in _low_intent_asr_events(asr_text, False):
+                        await ws.send_json(event)
+                    continue
+                asr_event = {"type": "asr", "text": asr_text}
+                ack_event = {"type": "ack", "message": ASR_ACK_MESSAGE}
+                await ws.send_json(asr_event)
+                # 立即推送预缓存确认音(0ms, 用户1s后听到"收到")
+                from voice_agent import _tts_cache_get
+                ack_audio = _tts_cache_get(ASR_ACK_MESSAGE, cleaned=True)
+                if ack_audio:
+                    await ws.send_json({"type": "audio", "data": _b64enc.b64encode(ack_audio).decode(), "format": "mp3"})
+                await ws.send_json(ack_event)
+                interrupted_reply = _interrupt_telemetry.record_follow_up(ws_id, asr_text, "asr")
+                # 流式大脑回复(后台任务, 不阻塞receive循环→可即时响应打断)
+                task = asyncio.create_task(_ws_stream_and_send(
+                    ws,
+                    ws_id,
+                    text=asr_text,
+                    asr_text=asr_text,
+                    session_id=ws_session_id,
+                    interrupted_reply=interrupted_reply,
+                ))
+                _ws_clients[ws_id]["stream_task"] = task
                 continue
             
             # 未知类型
@@ -1046,33 +1824,38 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         log.error(f"[ws] 异常 (id={ws_id}): {e}")
     finally:
-        _ws_clients.pop(ws_id, None)
+        _ws_cleanup_after_disconnect(ws_id)
         log.info(f"[ws] 连接清理完成 (id={ws_id}), 剩余{len(_ws_clients)}个")
 
-async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = "", session_id: str = "default"):
+async def _ws_stream_brain(
+    ws_id: int,
+    text: str,
+    session_id: str = "default",
+    interrupted_reply: str = "",
+):
     """WebSocket专用流式大脑+TTS生成器(检查打断标志)"""
-    from voice_agent import brain_stream_sentences, _clean_for_tts
+    from voice_agent import brain_stream_sentences
     
     q = _queue.Queue()
     
     def brain_worker():
         try:
-            for sentence, full_reply in brain_stream_sentences(text, session_id):
+            for sentence, full_reply in brain_stream_sentences(
+                text,
+                session_id,
+                interrupted_reply=interrupted_reply,
+            ):
                 q.put(("sentence", sentence, full_reply))
         except Exception as e:
-            q.put(("error", str(e)[:60], None))
+            q.put(("error", _friendly_brain_error(e), None))
         finally:
             q.put(("done", None, None))
     
     threading.Thread(target=brain_worker, daemon=True).start()
     
-    # 如果有ASR结果, 先推送
-    if asr_text:
-        yield {"type": "asr", "text": asr_text}
-    
     tts_buffer = ""
+    tts_failed = False
     first_audio_sent = False  # 首段立即flush(降首音频延迟)
-    total_wait = 0
     total_wait = 0
     
     while True:
@@ -1095,9 +1878,12 @@ async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = "", session_id
         etype, sentence, full_reply = item
         if etype == "done":
             # 推送剩余TTS
-            if tts_buffer.strip():
-                audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
-                if audio_b64:
+            if tts_buffer.strip() and not tts_failed:
+                audio_b64, warning = await _synthesize_tts_event(tts_buffer)
+                if warning:
+                    tts_failed = True
+                    yield warning
+                elif audio_b64:
                     yield {"type": "audio", "data": audio_b64}
             yield {"type": "done"}
             break
@@ -1110,14 +1896,20 @@ async def _ws_stream_brain(ws_id: int, text: str, asr_text: str = "", session_id
             if _ws_clients.get(ws_id, {}).get("interrupt"):
                 break
             yield {"type": "text", "text": sentence}
-            cleaned = _clean_for_tts(sentence)
-            if cleaned and len(cleaned) >= 2:
-                tts_buffer = (tts_buffer + "，" + cleaned) if tts_buffer else cleaned
+            if sentence and len(sentence) >= 2:
+                tts_buffer = (tts_buffer + "，" + sentence) if tts_buffer else sentence
                 if (not first_audio_sent) or (len(tts_buffer) >= _TTS_BATCH_SIZE):
-                    audio_b64 = await asyncio.to_thread(_flush_tts_buffer, tts_buffer)
+                    if tts_failed:
+                        tts_buffer = ""
+                        first_audio_sent = True
+                        continue
+                    audio_b64, warning = await _synthesize_tts_event(tts_buffer)
                     tts_buffer = ""
                     first_audio_sent = True
-                    if audio_b64:
+                    if warning:
+                        tts_failed = True
+                        yield warning
+                    elif audio_b64:
                         yield {"type": "audio", "data": audio_b64}
                         # 检查打断
                         if _ws_clients.get(ws_id, {}).get("interrupt"):
@@ -1129,26 +1921,8 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
     """搜索对话历史中的关键词(同时搜索内存+文件)"""
     if not q:
         return JSONResponse({"error": "请提供搜索关键词?q=xxx"}, status_code=400)
-    from voice_agent import _get_history, HISTORY_FILE
-    # 合并内存历史和文件历史(去重)
-    hist = _get_history(session_id)
-    all_history = list(hist)
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            file_data = json.load(f)
-        # 新格式: dict {session_id: [messages]}
-        if isinstance(file_data, dict):
-            file_hist = file_data.get(session_id, [])
-        # 旧格式: list [messages]
-        elif isinstance(file_data, list):
-            file_hist = file_data
-        else:
-            file_hist = []
-        # 使用文件中更完整的历史
-        if len(file_hist) > len(all_history):
-            all_history = file_hist
-    except Exception:
-        pass
+    from voice_agent import _searchable_history
+    all_history = _searchable_history(session_id)
     results = []
     for i, m in enumerate(all_history):
         content = m.get("content", "")
@@ -1192,20 +1966,10 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
 
 
 
-@app.get("/manifest.json")
-async def manifest():
+@app.api_route("/manifest.json", methods=["GET", "HEAD"])
+async def manifest(request: Request):
     """PWA manifest for mobile install"""
-    from fastapi.responses import JSONResponse
-    return JSONResponse({
-        "name": "Charlie",
-        "short_name": "Charlie",
-        "description": "中国版贾维斯 - AI语音助理",
-        "start_url": "/",
-        "display": "standalone",
-        "orientation": "portrait",
-        "background_color": "#0f0c29",
-        "theme_color": "#e94560",
-    })
+    return _manifest_response(request)
 
 
 
@@ -1219,9 +1983,13 @@ async def restart_brain_api():
 
 
 @app.get("/api/metrics")
-async def metrics():
+async def metrics(request: Request):
     """请求指标: 请求数/错误率/缓存命中/响应时间(p50/p95)"""
-    return _metrics.summary()
+    return _json_response(
+        request,
+        lambda: _metrics.summary(exclude_endpoint="/api/metrics"),
+        etag_token=_metrics.token(exclude_endpoint="/api/metrics"),
+    )
 
 
 # ===== 用户偏好管理API =====
@@ -1231,11 +1999,20 @@ class PreferenceRequest(BaseModel):
     value: str = Field(..., min_length=1, max_length=200, description="偏好值(如'意大利菜')")
 
 @app.get("/api/preferences")
-async def get_preferences():
+async def get_preferences(request: Request):
     """获取所有用户偏好"""
-    from voice_agent import list_preferences
-    prefs = list_preferences()
-    return {"total": len(prefs), "preferences": prefs}
+    from voice_agent import preferences_conditional
+    prefs, prefs_token = preferences_conditional(
+        lambda etag: _if_none_matches(request, etag),
+        _weak_etag,
+    )
+    if prefs is None:
+        return _not_modified_response(_weak_etag(prefs_token))
+    return _json_response(
+        request,
+        {"total": len(prefs), "preferences": prefs},
+        etag_token=prefs_token,
+    )
 
 @app.post("/api/preferences")
 async def set_preference_api(req: PreferenceRequest):
@@ -1254,21 +2031,15 @@ async def del_preference_api(key: str):
 @app.get("/api/sessions")
 async def list_sessions():
     """列出所有活跃会话(多用户监控)"""
-    from voice_agent import _sessions
-    sessions = []
-    for sid, hist in _sessions.items():
-        sessions.append({
-            "session_id": sid[:16] + "..." if len(sid) > 16 else sid,
-            "message_count": len(hist),
-            "last_message": hist[-1].get("content", "")[:50] if hist else "",
-        })
+    from voice_agent import _session_summaries
+    sessions = _session_summaries()
     return {"total": len(sessions), "sessions": sessions}
 
 @app.get("/api/context")
 async def get_context(session_id: str = "default"):
     """获取对话上下文摘要(调试用)"""
-    from voice_agent import _context_summaries, _get_history, list_preferences, _estimate_msg_tokens as _est_tokens
-    hist = _get_history(session_id)
+    from voice_agent import _context_summaries, _history_snapshot, list_preferences, _estimate_msg_tokens as _est_tokens
+    hist = _history_snapshot(session_id)
     summary = _context_summaries.get(session_id, "")
     prefs = list_preferences()
     # 估算token使用
@@ -1284,17 +2055,31 @@ async def get_context(session_id: str = "default"):
     }
 
 @app.get("/api/tunnel")
-async def tunnel_status():
+async def tunnel_status(request: Request):
     """获取Cloudflare Tunnel公网访问地址"""
-    tunnel_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tunnel_url.txt")
+    cached = _file_not_modified_response(request, TUNNEL_FILE, "tunnel")
+    if cached is not None:
+        return cached
+    tunnel_token = _file_etag_token(TUNNEL_FILE, "tunnel")
+    _reload_cors_origins()
     try:
-        with open(tunnel_file, "r") as f:
+        with open(TUNNEL_FILE, "r", encoding="utf-8") as f:
             url = f.read().strip()
+        tunnel_token_after_read = _file_etag_token(TUNNEL_FILE, "tunnel")
         if url:
-            return {"active": True, "url": url}
+            return _json_response(
+                request,
+                {"active": True, "url": url},
+                etag_token=tunnel_token if tunnel_token == tunnel_token_after_read else None,
+            )
     except Exception:
         pass
-    return {"active": False, "url": None, "message": "隧道未运行, 运行 bash start_tunnel.sh 启动"}
+    tunnel_token_after_read = _file_etag_token(TUNNEL_FILE, "tunnel")
+    return _json_response(
+        request,
+        {"active": False, "url": None, "message": "隧道未运行, 运行 bash start_tunnel.sh 启动"},
+        etag_token=tunnel_token if tunnel_token == tunnel_token_after_read else None,
+    )
 
 @app.get("/health")
 def health():
@@ -1308,21 +2093,86 @@ def health():
         "uptime_human": f"{uptime_s//3600}h{(uptime_s%3600)//60}m",
         "brain_ready": _brain_is_warm(),
         "websocket_clients": _ws_client_count(),
-        "sse_clients": len(_sse_clients),
+        "sse_clients": sse_client_count(),
         "auth_enabled": bool(AUTH_TOKEN),
     }
 
-@app.get("/", response_class=HTMLResponse)
-async def web_client():
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "voice.html")
-    with open(html_path, encoding="utf-8") as f: return f.read()
+def _build_app_icon_png() -> bytes:
+    """Build a small inline PNG icon without adding a binary asset to the repo."""
+    import struct
+    import zlib
 
-@app.get("/test", response_class=HTMLResponse)
-async def voice_test():
+    size = 64
+    bg = (15, 12, 41)
+    fg = (233, 69, 96)
+    cx = cy = size // 2
+    radius = size // 3
+
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)
+        for x in range(size):
+            color = fg if (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2 else bg
+            raw.extend(color)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    return b"".join((
+        b"\x89PNG\r\n\x1a\n",
+        chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)),
+        chunk(b"IDAT", zlib.compress(bytes(raw), 9)),
+        chunk(b"IEND", b""),
+    ))
+
+
+_APP_ICON_PNG = _build_app_icon_png()
+_ICON_HEADERS = {"Cache-Control": "public, max-age=86400"}
+_APP_ICON_ETAG = 'W/"' + hashlib.sha256(_APP_ICON_PNG).hexdigest()[:16] + '"'
+
+
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def web_client(request: Request):
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "voice.html")
+    return _html_response(request, html_path, "voice-html")
+
+
+@app.api_route(
+    "/favicon.ico",
+    methods=["GET", "HEAD"],
+)
+@app.api_route(
+    "/apple-touch-icon.png",
+    methods=["GET", "HEAD"],
+)
+@app.api_route(
+    "/apple-touch-icon-precomposed.png",
+    methods=["GET", "HEAD"],
+)
+async def app_icon(request: Request):
+    if _if_none_matches(request, _APP_ICON_ETAG):
+        headers = dict(_ICON_HEADERS)
+        headers["ETag"] = _APP_ICON_ETAG
+        headers["Vary"] = "Accept-Encoding"
+        return Response(status_code=304, headers=headers)
+    content = b"" if request.method == "HEAD" else _APP_ICON_PNG
+    headers = dict(_ICON_HEADERS)
+    headers["ETag"] = _APP_ICON_ETAG
+    headers["Vary"] = "Accept-Encoding"
+    headers["Content-Length"] = str(len(_APP_ICON_PNG))
+    return Response(content=content, media_type="image/png", headers=headers)
+
+@app.api_route("/test", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def voice_test(request: Request):
     """语音对话测试台 - 调试用, 显示SSE事件流+延迟指标(首音频优化验证)"""
     html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "voice_test.html")
-    with open(html_path, encoding="utf-8") as f: return f.read()
+    return _html_response(request, html_path, "voice-test-html")
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=http_port())

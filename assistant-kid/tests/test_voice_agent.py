@@ -2,8 +2,11 @@
 Charlie - 语音Agent核心单元测试
 使用mock测试: 缓存/对话历史/流式大脑生成/Markdown清理
 """
-import os, json, tempfile
+import os, sys, json, tempfile, time, types
 from unittest.mock import patch, MagicMock
+
+import pytest
+import requests
 
 import voice_agent
 
@@ -38,7 +41,7 @@ class TestCache:
         """缓存过期后返回None"""
         voice_agent._cache_set("temp", "reply")
         # 手动设置过期时间戳
-        key = "temp"
+        key = "text\x00temp"
         voice_agent._cache[key] = ("reply", 0)  # epoch=0, 必定过期
         assert voice_agent._cache_get("temp") is None
 
@@ -76,6 +79,155 @@ class TestHistory:
         assert voice_agent._history[0]["content"] == "测试持久化"
         voice_agent.reset_history()
 
+    def test_save_history_does_not_hold_history_lock_during_file_write(self, monkeypatch):
+        """落盘 I/O 不应阻塞历史读取和追加。"""
+        voice_agent.reset_history()
+        voice_agent._history.append({"role": "user", "content": "落盘不持锁"})
+        original_open = open
+
+        def assert_lock_released(path, *args, **kwargs):
+            if str(path) == voice_agent.HISTORY_FILE:
+                assert not voice_agent._history_lock.locked()
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", assert_lock_released)
+        voice_agent._save_history()
+        voice_agent.reset_history()
+
+    def test_stale_history_save_does_not_replace_newer_snapshot(self, monkeypatch):
+        """先开始的旧快照不能在新快照排队后覆盖文件。"""
+        import threading
+
+        voice_agent.reset_history()
+        hist = voice_agent._history
+        hist.append({"role": "user", "content": "旧快照"})
+        initial_seq = voice_agent._history_save_seq
+        first_dump_started = threading.Event()
+        second_save_snapshotted = threading.Event()
+        replace_calls = []
+        original_dump = voice_agent.json.dump
+        original_replace = voice_agent.os.replace
+
+        def counting_replace(src, dst):
+            replace_calls.append((src, dst))
+            return original_replace(src, dst)
+
+        def block_first_dump(obj, f, **kwargs):
+            result = original_dump(obj, f, **kwargs)
+            if not first_dump_started.is_set():
+                first_dump_started.set()
+                if not second_save_snapshotted.wait(1):
+                    raise TimeoutError("second save did not snapshot")
+                time.sleep(0.02)
+            return result
+
+        monkeypatch.setattr(voice_agent.json, "dump", block_first_dump)
+        monkeypatch.setattr(voice_agent.os, "replace", counting_replace)
+
+        old_thread = threading.Thread(target=voice_agent._save_history)
+        old_thread.start()
+        assert first_dump_started.wait(1)
+
+        with voice_agent._history_lock:
+            hist.append({"role": "assistant", "content": "新快照"})
+        new_thread = threading.Thread(target=voice_agent._save_history)
+        new_thread.start()
+
+        deadline = time.time() + 1
+        while time.time() < deadline and voice_agent._history_save_seq < initial_seq + 2:
+            time.sleep(0.01)
+        assert voice_agent._history_save_seq >= initial_seq + 2
+        second_save_snapshotted.set()
+
+        old_thread.join(1)
+        new_thread.join(1)
+        assert not old_thread.is_alive()
+        assert not new_thread.is_alive()
+        assert len(replace_calls) == 1
+
+        voice_agent._history_file_signature = None
+        voice_agent._history_file_cache = None
+        voice_agent._load_history()
+        assert any(message.get("content") == "新快照" for message in voice_agent._history)
+        voice_agent.reset_history()
+
+    def test_save_history_waits_for_shared_history_file_lock(self):
+        """保存历史应等待 conversation_history.json.lock，和后台截断共用事务边界。"""
+        import subprocess
+        import sys
+
+        voice_agent.reset_history()
+        voice_agent._history.append({"role": "user", "content": "文件锁保存"})
+        lock_file = voice_agent.HISTORY_FILE + ".lock"
+        script = f"""
+import fcntl, time
+with open({lock_file!r}, "a+", encoding="utf-8") as lock_file:
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+    time.sleep(0.5)
+"""
+        proc = subprocess.Popen([sys.executable, "-c", script])
+        try:
+            time.sleep(0.1)
+            started = time.monotonic()
+            voice_agent._save_history()
+            elapsed = time.monotonic() - started
+        finally:
+            proc.wait(timeout=5)
+
+        assert elapsed >= 0.35
+        assert os.path.exists(voice_agent.HISTORY_FILE)
+        voice_agent.reset_history()
+
+    def test_searchable_history_reads_file_without_holding_history_lock(self, monkeypatch):
+        """搜索补齐外部历史时，文件读取不应阻塞内存历史的并发访问。"""
+        import json
+
+        session_id = "search_file_read_unlocked"
+        voice_agent.reset_history(session_id)
+        with open(voice_agent.HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump({session_id: [{"role": "user", "content": "外部历史"}]}, f, ensure_ascii=False)
+        voice_agent._history_file_signature = None
+        voice_agent._history_file_cache = None
+        original_open = open
+        lock_state_when_opened = None
+
+        def track_open(path, *args, **kwargs):
+            if str(path) == voice_agent.HISTORY_FILE:
+                nonlocal lock_state_when_opened
+                lock_state_when_opened = voice_agent._history_lock.locked()
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", track_open)
+        hist = voice_agent._searchable_history(session_id)
+
+        assert lock_state_when_opened is False
+        assert hist[0]["content"] == "外部历史"
+        voice_agent.reset_history(session_id)
+
+    def test_history_snapshot_is_stable_after_append(self):
+        voice_agent.reset_history()
+        hist = voice_agent._get_history("snapshot_session")
+        hist.append({"role": "user", "content": "快照前"})
+
+        snapshot = voice_agent._history_snapshot("snapshot_session")
+        hist.append({"role": "assistant", "content": "快照后追加"})
+
+        assert len(snapshot) == 1
+        assert snapshot[0]["content"] == "快照前"
+        voice_agent.reset_history("snapshot_session")
+
+    def test_session_summaries_are_copied_under_lock(self):
+        session_id = "summary_session"
+        hist = voice_agent._get_history(session_id)
+        hist.append({"role": "user", "content": "摘要消息"})
+
+        summaries = voice_agent._session_summaries()
+        voice_agent.reset_history(session_id)
+
+        summary = next(item for item in summaries if item["session_id"] == session_id)
+        assert summary["message_count"] == 1
+        assert summary["last_message"] == "摘要消息"
+
 
 class TestCleanForTTS:
     """测试Markdown清理(用于TTS)"""
@@ -107,6 +259,28 @@ class TestCleanForTTS:
         result = voice_agent._clean_for_tts("你好世界")
         assert result == "你好世界"
 
+    def test_clean_for_tts_reuses_compiled_patterns(self, monkeypatch):
+        """TTS热路径复用预编译正则，避免每个片段重复编译。"""
+        import re
+
+        compiled_patterns = [
+            value
+            for name, value in vars(voice_agent).items()
+            if name.startswith("_TTS_") and name.endswith("_RE") and isinstance(value, re.Pattern)
+        ]
+        assert len(compiled_patterns) >= 9
+
+        def reject_re_sub(*args, **kwargs):
+            raise AssertionError("voice_agent._clean_for_tts must reuse compiled Pattern.sub")
+
+        monkeypatch.setattr(re, "sub", reject_re_sub)
+
+        result = voice_agent._clean_for_tts(
+            "## 标题 **粗体** |列| ```code``` `inline` [链接](http://x)  空格"
+        )
+
+        assert result == "标题 粗体 列 链接 空格"
+
 
 class TestBuildSystemMsg:
     """测试系统提示词构建"""
@@ -120,16 +294,50 @@ class TestBuildSystemMsg:
         """包含角色定义"""
         msg = voice_agent._build_system_msg()
         assert "Charlie" in msg
-        assert "贾维斯" in msg
+        assert "私人AI助理" in msg
 
     def test_contains_tools(self):
         """包含工具列表"""
         msg = voice_agent._build_system_msg()
         assert "MCP" in msg or "地图" in msg
 
+    def test_today_reminders_use_locked_reminder_loader(self, monkeypatch):
+        """系统提示词复用提醒锁加载器，避免直接读文件绕过畸形过滤和共享锁。"""
+        from app import reminders as app_reminders
+
+        today = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
+        calls = {"load": 0, "open": 0}
+
+        def fake_load_reminders():
+            calls["load"] += 1
+            return [
+                {"text": "系统提示待办", "due": f"{today}T10:00:00", "done": False},
+                {"text": "已完成待办", "due": f"{today}T11:00:00", "done": True},
+            ]
+
+        def reject_direct_open(path, *args, **kwargs):
+            if str(path) == voice_agent.REMINDERS_FILE or str(path) == app_reminders.REMINDERS_FILE:
+                calls["open"] += 1
+                raise AssertionError("system prompt must load reminders through app.reminders")
+            return original_open(path, *args, **kwargs)
+
+        original_open = open
+        monkeypatch.setattr(app_reminders, "_load_reminders", fake_load_reminders)
+        monkeypatch.setattr("builtins.open", reject_direct_open)
+        voice_agent.invalidate_system_msg_cache()
+
+        msg = voice_agent._build_system_msg()
+
+        assert calls == {"load": 1, "open": 0}
+        assert "今日有1项待办" in msg
+
 
 class TestBrainStreamSentences:
     """测试流式大脑句子切分(使用mock)"""
+
+    def setup_method(self):
+        voice_agent.reset_history()
+        voice_agent._cache.clear()
 
     def test_stream_with_mock_brain(self):
         """使用mock大脑测试流式句子切分"""
@@ -140,7 +348,8 @@ class TestBrainStreamSentences:
              {"role": "assistant", "content": "你好。我是Charlie，很高兴为你服务！"}]
         ])
 
-        with patch.object(voice_agent, '_brain', mock_brain):
+        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
+             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
             voice_agent.reset_history()
             sentences = list(voice_agent.brain_stream_sentences("你好"))
 
@@ -153,12 +362,136 @@ class TestBrainStreamSentences:
 
     def test_stream_brain_not_built(self):
         """大脑未构建且无法构建时返回错误"""
-        voice_agent.reset_history()
-        with patch.object(voice_agent, '_brain', None):
-            with patch.object(voice_agent, '_build_brain', side_effect=Exception("mock build failed")):
+        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
+             patch.object(voice_agent, '_get_brain', side_effect=Exception("mock build failed")):
                 sentences = list(voice_agent.brain_stream_sentences("test"))
                 assert len(sentences) >= 1
                 assert "失败" in sentences[0][0] or "未" in sentences[0][0]
+
+    def test_interrupted_reply_is_added_to_prompt_but_not_history(self):
+        mock_brain = MagicMock()
+        mock_brain.run = MagicMock(return_value=[[
+            {"role": "assistant", "content": "我会接着刚才被打断的内容说明。"}
+        ]])
+
+        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
+             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
+            list(voice_agent.brain_stream_sentences(
+                "那明天呢？",
+                interrupted_reply="我正准备说明明天的天气和出门建议。"
+            ))
+
+        messages = mock_brain.run.call_args.args[0]
+        assert any(
+            msg["role"] == "system" and "上一条助手回复被用户打断" in msg["content"]
+            and "我正准备说明明天的天气和出门建议。" in msg["content"]
+            for msg in messages
+        )
+        assert messages[-1] == {"role": "user", "content": "那明天呢？"}
+        hist = voice_agent._get_history("default")
+        assert len(hist) == 2
+        assert not any("上一条助手回复被用户打断" in msg["content"] for msg in hist)
+
+    def test_interrupted_reply_uses_separate_response_cache(self):
+        replies = [
+            [[{"role": "assistant", "content": "明天有雨，出门带伞。"}]],
+            [[{"role": "assistant", "content": "明天日程是上午十点开会。"}]],
+        ]
+        mock_brain = MagicMock()
+        mock_brain.run = MagicMock(side_effect=replies)
+
+        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
+             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
+            first = list(voice_agent.brain_stream_sentences(
+                "那明天呢？",
+                interrupted_reply="我正准备说明明天的天气。",
+            ))
+            second = list(voice_agent.brain_stream_sentences(
+                "那明天呢？",
+                interrupted_reply="我正准备播报明天的日程。",
+            ))
+
+        assert first[-1][1] == "明天有雨，出门带伞。"
+        assert second[-1][1] == "明天日程是上午十点开会。"
+        assert mock_brain.run.call_count == 2
+
+
+class TestOpenAICompat:
+    """OpenAI SDK 与上游模型私有参数的兼容层。"""
+
+    def test_unknown_create_kwarg_moves_into_extra_body(self):
+        calls = []
+
+        def fake_create(*args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise TypeError("Completions.create() got an unexpected keyword argument 'enable_thinking'")
+            return "ok"
+
+        wrapped = voice_agent._wrap_openai_create_unknown_kwargs(fake_create)
+
+        assert wrapped(model="deepseek", messages=[], enable_thinking=False) == "ok"
+        assert calls[0].get("enable_thinking") is False
+        assert "enable_thinking" not in calls[1]
+        assert calls[1]["extra_body"] == {"enable_thinking": False}
+
+    def test_unrelated_type_error_is_not_swallowed(self):
+        def fake_create(*args, **kwargs):
+            raise TypeError("something else broke")
+
+        wrapped = voice_agent._wrap_openai_create_unknown_kwargs(fake_create)
+
+        with pytest.raises(TypeError, match="something else broke"):
+            wrapped(model="deepseek", messages=[])
+
+    def test_build_brain_installs_compat_wrapper(self):
+        class FakeCreate:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, *args, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    raise TypeError("Completions.create() got an unexpected keyword argument 'enable_thinking'")
+                return []
+
+        class FakeLlm:
+            def __init__(self):
+                self.create = FakeCreate()
+                self._chat_complete_create = self.create
+
+        class FakeMem:
+            def __init__(self, llm):
+                self.llm = llm
+
+        class FakeAssistant:
+            def __init__(self, **kwargs):
+                self.llm = FakeLlm()
+                self.mem = FakeMem(self.llm)
+
+        class FakeMemory:
+            percent = 50
+            total = 17179869184
+            available = 8589934592
+
+        fake_psutil = type("FakePsutil", (), {"virtual_memory": staticmethod(lambda: FakeMemory())})
+
+        fake_qwen_agent = types.ModuleType("qwen_agent")
+        fake_qwen_agents = types.ModuleType("qwen_agent.agents")
+        fake_qwen_agents.Assistant = FakeAssistant
+        fake_modules = {
+            "qwen_agent": fake_qwen_agent,
+            "qwen_agent.agents": fake_qwen_agents,
+        }
+
+        with patch.dict(sys.modules, fake_modules), \
+             patch.dict(sys.modules, {"psutil": fake_psutil}):
+            brain = voice_agent._build_brain("none")
+
+        assert brain.llm._chat_complete_create is not brain.llm.create
+        assert brain.mem.llm._chat_complete_create is brain.llm._chat_complete_create
+        assert brain.llm._chat_complete_create(model="deepseek", messages=[], enable_thinking=False) == []
+        assert brain.llm.create.calls[1]["extra_body"] == {"enable_thinking": False}
 
 
 class TestRetry:
@@ -199,9 +532,286 @@ class TestRetry:
             with _pytest.raises(Exception, match="test超时"):
                 voice_agent._retry(fn, "test")
 
+    def test_retry_logs_exception_type_when_message_is_empty(self, caplog):
+        """空字符串异常仍要记录异常类型，避免日志变成空错误。"""
+
+        class EmptyRuntimeError(RuntimeError):
+            def __str__(self):
+                return ""
+
+        def fn():
+            raise EmptyRuntimeError()
+
+        caplog.clear()
+        with patch.object(voice_agent, "RETRY_BACKOFF", [0, 0, 0]), pytest.raises(
+            Exception, match="test失败: EmptyRuntimeError"
+        ):
+            voice_agent._retry(fn, "test")
+
+        assert "test第1次异常: EmptyRuntimeError" in caplog.text
 
 
+class TestIntentClassification:
+    """本地意图分类在 Ollama 不稳定时要快速降级并自动恢复。"""
 
+    def setup_method(self):
+        voice_agent._intent_failures = 0
+        voice_agent._intent_disabled_until = 0.0
+
+    def test_consecutive_local_intent_failures_trip_short_circuit(self):
+        with patch.object(voice_agent, "INTENT_FAILURE_THRESHOLD", 2), \
+             patch.object(voice_agent, "INTENT_FAILURE_COOLDOWN", 30), \
+             patch.object(voice_agent.time, "time", return_value=100.0), \
+             patch.object(voice_agent._session, "post", side_effect=requests.exceptions.Timeout("slow")) as mock_post:
+            assert voice_agent._classify_intent("第一条") == "none"
+            assert voice_agent._classify_intent("第二条") == "none"
+            assert voice_agent._classify_intent("第三条") == "none"
+
+        assert mock_post.call_count == 2
+        assert voice_agent._intent_disabled_until == 130.0
+
+    def test_successful_intent_classification_resets_failure_state(self):
+        voice_agent._intent_failures = 1
+        response = MagicMock()
+        response.json.return_value = {"message": {"content": "amap-maps"}}
+
+        with patch.object(voice_agent._session, "post", return_value=response):
+            assert voice_agent._classify_intent("天气") == "amap-maps"
+
+        assert voice_agent._intent_failures == 0
+
+
+class TestVoiceLoop:
+    """完整语音闭环边界。"""
+
+    @pytest.mark.parametrize("text", ["嗯。", "啊啊啊", "Hmm.", "hmm", " ，。！ "])
+    def test_low_intent_asr_short_circuits_brain_and_tts(self, text):
+        """明确无任务的语气词只给本地确认，不写历史、不调用大脑或 TTS。"""
+        with patch.object(voice_agent, "asr", return_value=text), \
+             patch.object(voice_agent, "brain") as mock_brain, \
+             patch.object(voice_agent, "tts") as mock_tts:
+            recognized, reply, audio = voice_agent.voice_loop(b"fake-audio", "wav")
+
+        assert voice_agent.is_low_intent_asr(text)
+        assert recognized == text
+        assert reply == voice_agent.LOW_INTENT_ASR_REPLY
+        assert audio == b""
+        mock_brain.assert_not_called()
+        mock_tts.assert_not_called()
+
+    @pytest.mark.parametrize("text", ["几点了", "讲个冷笑话", "今天天气怎么样", "对。", "好啊。", "home"])
+    def test_short_real_questions_are_not_low_intent_asr(self, text):
+        """短但有明确意图的问题必须继续进入大脑。"""
+        assert not voice_agent.is_low_intent_asr(text)
+
+    def test_runtime_audio_path_uses_configured_data_dir(self, tmp_path, monkeypatch):
+        """命令行 demo 输出必须遵守数据目录隔离，不能固定写入 /tmp。"""
+        monkeypatch.setattr(voice_agent, "DATA_DIR", str(tmp_path))
+
+        assert voice_agent.runtime_audio_path("voice_reply.wav") == str(
+            tmp_path / "voice_reply.wav"
+        )
+
+    def test_write_audio_file_keeps_existing_file_when_replace_fails(self, tmp_path, monkeypatch):
+        """音频输出必须先写临时文件再替换，不能在落盘中断时截断旧文件。"""
+        target = tmp_path / "voice_reply.wav"
+        target.write_bytes(b"old audio")
+
+        def fail_replace(src, dst):
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(voice_agent.os, "replace", fail_replace)
+
+        with pytest.raises(OSError):
+            voice_agent.write_audio_file(str(target), b"new audio")
+
+        assert target.read_bytes() == b"old audio"
+        assert list(tmp_path.glob(".voice_reply*.tmp")) == []
+
+    def test_empty_asr_short_circuits_brain_and_tts(self):
+        """空 ASR 不进入大脑、不合成 TTS，避免污染历史和浪费调用。"""
+        with patch.object(voice_agent, "asr", return_value=""), \
+             patch.object(voice_agent, "brain") as mock_brain, \
+             patch.object(voice_agent, "tts") as mock_tts:
+            text, reply, audio = voice_agent.voice_loop(b"fake-audio", "wav")
+
+        assert text == "(未识别到语音)"
+        assert reply == "抱歉，我没听清，请再说一遍。"
+        assert audio == b""
+        mock_brain.assert_not_called()
+        mock_tts.assert_not_called()
+
+    def test_tts_unavailable_keeps_text_reply(self):
+        """TTS 限流冷却时仍返回 ASR 文本和大脑回复，避免整轮对话失败。"""
+        with patch.object(voice_agent, "asr", return_value="今天天气怎么样"), \
+             patch.object(voice_agent, "brain", return_value="今天晴天。"), \
+             patch.object(voice_agent, "tts", side_effect=voice_agent.TTSUnavailableError("TTSHTTP异常: 429")):
+            text, reply, audio = voice_agent.voice_loop(b"fake-audio", "wav")
+
+        assert text == "今天天气怎么样"
+        assert reply == "今天晴天。"
+        assert audio == b""
+
+
+class TestTTSCache:
+    """TTS 音频缓存只复用成功的短音频，并按音色/模型隔离。"""
+
+    def setup_method(self):
+        voice_agent._tts_cache.clear()
+        voice_agent._tts_unavailable_until = 0.0
+
+    def test_repeated_short_tts_calls_network_and_transcoder_once(self):
+        from subprocess import CompletedProcess
+
+        wav = b"wav-audio-bytes" + b"x" * 120
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        with patch.object(voice_agent, "tts", return_value=wav) as mock_tts, \
+             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)) as mock_ffmpeg, \
+             patch.object(voice_agent, "_LOCAL_TTS_ENABLED", False):
+            first = voice_agent.tts_to_mp3("提醒时间到了")
+            second = voice_agent.tts_to_mp3(" 提醒时间到了 ")
+
+        assert first == mp3
+        assert second == mp3
+        mock_tts.assert_called_once_with("提醒时间到了")
+        mock_ffmpeg.assert_called_once()
+
+    def test_public_tts_to_mp3_cleans_markdown_before_synthesis(self):
+        from subprocess import CompletedProcess
+
+        wav = b"wav-audio-bytes" + b"x" * 120
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        with patch.object(voice_agent, "tts", return_value=wav) as mock_tts, \
+             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)):
+            result = voice_agent.tts_to_mp3("## 标题 **粗体**")
+
+        assert result == mp3
+        mock_tts.assert_called_once_with("标题 粗体")
+
+    def test_tts_cache_path_does_not_reclean_already_cleaned_text(self, monkeypatch):
+        from subprocess import CompletedProcess
+
+        wav = b"wav-audio-bytes" + b"x" * 120
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        original_clean = voice_agent._clean_for_tts
+        calls = []
+
+        def counting_clean(text):
+            calls.append(text)
+            return original_clean(text)
+
+        monkeypatch.setattr(voice_agent, "_clean_for_tts", counting_clean)
+        with patch.object(voice_agent, "tts", return_value=wav) as mock_tts, \
+             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)) as mock_ffmpeg, \
+             patch.object(voice_agent, "_LOCAL_TTS_ENABLED", False):
+            voice_agent.tts_to_mp3("提醒时间到了")
+            voice_agent.tts_to_mp3("提醒时间到了")
+
+        assert calls == ["提醒时间到了", "提醒时间到了"]
+        mock_tts.assert_called_once_with("提醒时间到了")
+        mock_ffmpeg.assert_called_once()
+
+    def test_failed_tts_is_not_cached(self):
+        from subprocess import CompletedProcess
+
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        with patch.object(voice_agent, "tts", side_effect=[
+                    voice_agent.TTSUnavailableError("TTSHTTP异常: 429"),
+                    b"wav-two" + b"x" * 120,
+                ]) as mock_tts, \
+             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)) as mock_ffmpeg:
+            with pytest.raises(voice_agent.TTSUnavailableError):
+                voice_agent.tts_to_mp3("重试这段")
+            second = voice_agent.tts_to_mp3("重试这段")
+
+        assert second.startswith(b"mp3-audio-bytes")
+        assert mock_tts.call_count == 2
+        mock_ffmpeg.assert_called_once()
+
+    def test_long_tts_is_not_cached(self):
+        wav = b"wav-audio-bytes" + b"x" * 120
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        long_text = "很" * (voice_agent.TTS_CACHE_MAX_CHARS + 1)
+        with patch.object(voice_agent, "tts", return_value=wav) as mock_tts, \
+             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+            voice_agent.tts_to_mp3(long_text)
+            voice_agent.tts_to_mp3(long_text)
+
+        assert mock_tts.call_count == 2
+        assert voice_agent._tts_cache == {}
+
+    def test_cache_key_includes_voice_and_model(self):
+        wav = b"wav-audio-bytes" + b"x" * 120
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        with patch.object(voice_agent, "tts", return_value=wav) as mock_tts, \
+             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+            voice_agent.tts_to_mp3("同一句话")
+            with patch.object(voice_agent, "TTS_VOICE", "Serena"):
+                voice_agent.tts_to_mp3("同一句话")
+            with patch.object(voice_agent, "TTS_MODEL", "another-tts-model"):
+                voice_agent.tts_to_mp3("同一句话")
+
+        assert mock_tts.call_count == 3
+
+    def test_cache_respects_ttl(self):
+        wav = b"wav-audio-bytes" + b"x" * 120
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        with patch.object(voice_agent, "TTS_CACHE_TTL", 0.01), \
+             patch.object(voice_agent, "tts", return_value=wav) as mock_tts, \
+             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+            voice_agent.tts_to_mp3("第一句")
+            assert voice_agent._tts_cache_get("第一句") == mp3
+            time.sleep(0.02)
+            assert voice_agent._tts_cache_get("第一句") is None
+            voice_agent.tts_to_mp3("第一句")
+
+        assert mock_tts.call_count == 2
+
+    def test_cache_respects_max_size(self):
+        wav = b"wav-audio-bytes" + b"x" * 120
+        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        with patch.object(voice_agent, "TTS_CACHE_MAX", 2), \
+             patch.object(voice_agent, "tts", return_value=wav) as mock_tts, \
+             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+            voice_agent.tts_to_mp3("第一句")
+            voice_agent.tts_to_mp3("第二句")
+            voice_agent.tts_to_mp3("第三句")
+            voice_agent.tts_to_mp3("第三句")
+
+        assert mock_tts.call_count == 3
+        assert voice_agent._tts_cache_get("第一句") is None
+        assert voice_agent._tts_cache_get("第三句", "Cherry", voice_agent.TTS_MODEL) == mp3
+
+
+class TestTTSFailureCooldown:
+    """TTS 最终失败后短时间冷却，避免在限流窗口继续打上游。"""
+
+    def setup_method(self):
+        voice_agent._tts_cache.clear()
+        voice_agent._tts_unavailable_until = 0.0
+
+    def test_final_failure_sets_short_circuit_cooldown(self):
+        with patch.object(voice_agent, "TTS_FAILURE_COOLDOWN", 0.02), \
+             patch.object(voice_agent, "_retry", side_effect=Exception("TTSHTTP异常: 429")) as mock_retry:
+            for _ in range(2):
+                with pytest.raises(voice_agent.TTSUnavailableError):
+                    voice_agent.tts("第一句")
+                with pytest.raises(voice_agent.TTSUnavailableError):
+                    voice_agent.tts("第二句")
+
+        mock_retry.assert_called_once()
+
+    def test_success_resets_cooldown(self):
+        wav = b"wav-audio-bytes" + b"x" * 120
+        with patch.object(voice_agent, "TTS_FAILURE_COOLDOWN", 0.02), \
+             patch.object(voice_agent, "_retry", side_effect=[Exception("TTSHTTP异常: 429"), wav]) as mock_retry:
+            with pytest.raises(voice_agent.TTSUnavailableError):
+                voice_agent.tts("失败")
+            time.sleep(0.03)
+            assert voice_agent.tts("恢复") == wav
+
+        assert mock_retry.call_count == 2
+        assert voice_agent._tts_unavailable_until == 0.0
 
 
 class TestContextSummarization:
@@ -268,6 +878,7 @@ class TestContextSummarization:
     def test_summary_in_system_prompt(self):
         """摘要出现在系统提示词中"""
         voice_agent._context_summaries["default"] = "之前聊过天气和订餐"
+        voice_agent.invalidate_system_msg_cache()
         msg = voice_agent._build_system_msg()
         assert "天气" in msg or "订餐" in msg
         voice_agent._context_summaries.clear()
@@ -275,9 +886,32 @@ class TestContextSummarization:
 class TestPreferences:
     """用户偏好系统测试"""
 
+    class _NoCopyDict(dict):
+        def copy(self):
+            raise AssertionError("preference_count must not copy preferences")
+
+        def __iter__(self):
+            raise AssertionError("preference_count must not iterate preferences")
+
+        def items(self):
+            raise AssertionError("preference_count must not iterate preferences")
+
+        def keys(self):
+            raise AssertionError("preference_count must not iterate preferences")
+
+        def values(self):
+            raise AssertionError("preference_count must not iterate preferences")
+
     def setup_method(self):
         """每个测试前清空偏好"""
         voice_agent._preferences.clear()
+
+    def teardown_method(self):
+        """每个测试后恢复偏好状态，避免污染其他用例。"""
+        voice_agent._preferences.clear()
+        voice_agent._preferences_revision = 0
+        if hasattr(voice_agent, "_preferences_save_seq"):
+            voice_agent._preferences_save_seq = 0
 
     def test_set_and_get_preference(self):
         """设置和获取偏好"""
@@ -292,6 +926,18 @@ class TestPreferences:
         assert "key1" in prefs
         assert "key2" in prefs
         assert prefs["key1"] == "val1"
+
+    def test_preference_count_without_copying(self):
+        """只统计偏好数量，不复制或遍历整份偏好"""
+        original = voice_agent._preferences
+        voice_agent._preferences = self._NoCopyDict()
+        try:
+            assert voice_agent.preference_count() == 0
+            voice_agent._preferences["key1"] = "val1"
+            voice_agent._preferences["key2"] = "val2"
+            assert voice_agent.preference_count() == 2
+        finally:
+            voice_agent._preferences = original
 
     def test_del_preference(self):
         """删除偏好"""
@@ -308,6 +954,7 @@ class TestPreferences:
     def test_preferences_in_system_prompt(self):
         """偏好出现在系统提示词中"""
         voice_agent.set_preference("下班时间", "18:00")
+        voice_agent.invalidate_system_msg_cache()
         msg = voice_agent._build_system_msg()
         assert "18:00" in msg
         assert "用户偏好" in msg or "下班时间" in msg
@@ -317,6 +964,117 @@ class TestPreferences:
         voice_agent._preferences.clear()
         msg = voice_agent._build_system_msg()
         assert "Charlie" in msg  # 系统提示词仍然正常
+
+    def test_save_preferences_does_not_hold_prefs_lock_during_file_write(self, monkeypatch):
+        """偏好落盘 I/O 不应阻塞内存偏好的并发访问。"""
+        import threading
+
+        voice_agent._preferences["落盘锁探针"] = "value"
+        write_started = threading.Event()
+        release_probe = threading.Event()
+        original_dump = voice_agent.json.dump
+
+        def block_during_dump(obj, f, **kwargs):
+            write_started.set()
+            release_probe.wait(1)
+            return original_dump(obj, f, **kwargs)
+
+        monkeypatch.setattr(voice_agent.json, "dump", block_during_dump)
+        save_thread = threading.Thread(target=voice_agent._save_preferences)
+        save_thread.start()
+        assert write_started.wait(1)
+
+        lock_available = voice_agent._prefs_lock.acquire(timeout=0.2)
+        if lock_available:
+            voice_agent._prefs_lock.release()
+
+        release_probe.set()
+        save_thread.join(1)
+        assert not save_thread.is_alive()
+        assert lock_available
+
+    def test_stale_preferences_save_does_not_replace_newer_snapshot(self, monkeypatch):
+        """先开始的旧偏好快照不能在新快照排队后覆盖文件。"""
+        import threading
+
+        voice_agent._preferences["旧偏好"] = "旧值"
+        initial_seq = getattr(voice_agent, "_preferences_save_seq", 0)
+        first_dump_started = threading.Event()
+        second_save_snapshotted = threading.Event()
+        replace_calls = []
+        original_dump = voice_agent.json.dump
+        original_replace = voice_agent.os.replace
+
+        def counting_replace(src, dst):
+            replace_calls.append((src, dst))
+            return original_replace(src, dst)
+
+        def block_first_dump(obj, f, **kwargs):
+            if not first_dump_started.is_set():
+                first_dump_started.set()
+                if not second_save_snapshotted.wait(1):
+                    raise TimeoutError("second preferences save did not snapshot")
+                time.sleep(0.02)
+            result = original_dump(obj, f, **kwargs)
+            return result
+
+        monkeypatch.setattr(voice_agent.json, "dump", block_first_dump)
+        monkeypatch.setattr(voice_agent.os, "replace", counting_replace)
+
+        old_thread = threading.Thread(target=voice_agent._save_preferences)
+        old_thread.start()
+        assert first_dump_started.wait(1)
+
+        with voice_agent._prefs_lock:
+            voice_agent._preferences["新偏好"] = "新值"
+        new_thread = threading.Thread(target=voice_agent._save_preferences)
+        new_thread.start()
+
+        deadline = time.time() + 1
+        while time.time() < deadline and getattr(voice_agent, "_preferences_save_seq", 0) < initial_seq + 2:
+            time.sleep(0.01)
+        assert getattr(voice_agent, "_preferences_save_seq", 0) >= initial_seq + 2
+        second_save_snapshotted.set()
+
+        old_thread.join(1)
+        new_thread.join(1)
+        assert not old_thread.is_alive()
+        assert not new_thread.is_alive()
+        assert len(replace_calls) == 1
+
+        with open(voice_agent.PREFS_FILE, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        assert persisted.get("新偏好") == "新值"
+
+    def test_refresh_preferences_reloads_external_changes_and_bumps_etag(self, tmp_path, monkeypatch):
+        """主进程必须检测其他进程写入的 preferences.json，并刷新内存快照和 ETag。"""
+        prefs_file = tmp_path / "preferences.json"
+        lock_file = tmp_path / "preferences.json.lock"
+        prefs_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(voice_agent, "PREFS_FILE", str(prefs_file))
+        monkeypatch.setattr(voice_agent, "PREFS_LOCK_FILE", str(lock_file), raising=False)
+        voice_agent._preferences.clear()
+        voice_agent._preferences_revision = 0
+        if hasattr(voice_agent, "_preferences_save_seq"):
+            voice_agent._preferences_save_seq = 0
+        if hasattr(voice_agent, "_preferences_file_signature"):
+            voice_agent._preferences_file_signature = None
+        voice_agent._load_preferences()
+
+        assert voice_agent.list_preferences() == {}
+        prefs_file.write_text(
+            json.dumps({"external_pref": "external_value"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        changed = voice_agent._refresh_preferences_if_changed()
+
+        assert changed is True
+        assert voice_agent.get_preference("external_pref") == "external_value"
+        assert voice_agent.preferences_etag_token() != "preferences:0:0"
+
+        changed_again = voice_agent._refresh_preferences_if_changed()
+        assert changed_again is False
 
 class TestTimestamps:
     """测试对话时间戳"""
@@ -331,7 +1089,8 @@ class TestTimestamps:
         ])
         voice_agent.reset_history()
         voice_agent._cache.clear()  # 清除缓存, 确保走真实brain路径
-        with patch.object(voice_agent, '_brain', mock_brain):
+        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
+             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
             voice_agent.brain("你好")
         hist = voice_agent._get_history("default")
         assert len(hist) >= 2
@@ -353,7 +1112,8 @@ class TestTimestamps:
              {"role": "user", "content": "test"},
              {"role": "assistant", "content": "reply"}]
         ])
-        with patch.object(voice_agent, '_brain', mock_brain):
+        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
+             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
             voice_agent.brain("test")
         
         # 验证brain.run收到的消息没有ts字段
@@ -405,6 +1165,36 @@ class TestApiKeyFailover:
 class TestContextManagement:
     """测试对话上下文管理(token感知截断)"""
 
+    def test_estimate_tokens_reuses_compiled_patterns_once(self, monkeypatch):
+        import re
+
+        cn_pattern = getattr(voice_agent, "_TOKEN_CHINESE_RE", None)
+        en_pattern = getattr(voice_agent, "_TOKEN_ENGLISH_RE", None)
+        assert isinstance(cn_pattern, re.Pattern)
+        assert isinstance(en_pattern, re.Pattern)
+
+        calls = []
+
+        class TrackedPattern:
+            def __init__(self, pattern, label):
+                self.pattern = pattern
+                self.label = label
+
+            def findall(self, text):
+                calls.append(self.label)
+                return self.pattern.findall(text)
+
+        monkeypatch.setattr(voice_agent, "_TOKEN_CHINESE_RE", TrackedPattern(cn_pattern, "cn"))
+        monkeypatch.setattr(voice_agent, "_TOKEN_ENGLISH_RE", TrackedPattern(en_pattern, "en"))
+
+        def reject_re_findall(*args, **kwargs):
+            raise AssertionError("token estimation must reuse compiled Pattern.findall")
+
+        monkeypatch.setattr(re, "findall", reject_re_findall)
+
+        assert voice_agent._estimate_tokens("你好 hello world!") == 7
+        assert calls == ["cn", "en"]
+
     def test_estimate_tokens_chinese(self):
         """中文token估算"""
         tokens = voice_agent._estimate_tokens("你好世界")
@@ -451,6 +1241,27 @@ class TestContextManagement:
         voice_agent._trim_history_tokens(hist, 200)
         # 保留的最后一条应该是原来的最后一条
         assert "消息19" in hist[-1]["content"]
+
+    def test_trim_estimates_each_message_once(self):
+        """长历史截断复用首轮 token 估算，不对删除消息重复扫描。"""
+        hist = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": "主题" + str(i) + "测" * 10}
+            for i in range(8)
+        ]
+        message_count = len(hist)
+        original = voice_agent._estimate_msg_tokens
+        seen = []
+
+        def counting_estimate(msg):
+            seen.append(msg["content"])
+            return original(msg)
+
+        with patch.object(voice_agent, "_estimate_msg_tokens", side_effect=counting_estimate):
+            voice_agent._trim_history_tokens(hist, 100)
+
+        assert len(seen) == message_count
+        assert 4 <= len(hist) < 8
+        assert "主题7" in hist[-1]["content"]
 
 class TestMultiUserSessions:
     """多用户会话隔离测试"""

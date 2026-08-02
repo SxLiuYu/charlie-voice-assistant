@@ -4,6 +4,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Charlie">
 <meta name="theme-color" content="#e94560">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="manifest" href="/manifest.json">
 <title>Charlie · 语音助理</title><style>
 *{margin:0;box-sizing:border-box}body{font-family:-apple-system,"PingFang SC",sans-serif;
@@ -20,6 +22,7 @@ display:flex;align-items:center;justify-content:center;font-size:40px;cursor:poi
 #orb.listening{box-shadow:0 0 56px rgba(245,166,35,.85);animation:p .9s infinite}
 #orb.thinking{box-shadow:0 0 56px rgba(100,200,255,.85);animation:p .5s infinite}
 #orb.speaking{box-shadow:0 0 64px rgba(80,255,150,.85);animation:p .7s infinite}
+#orb.synthesizing{box-shadow:0 0 56px rgba(255,200,80,.85);animation:p .6s infinite}
 @keyframes p{0%,100%{transform:scale(1)}50%{transform:scale(1.09)}}
 #status{font-size:14px;color:#bbb;margin-bottom:8px;min-height:20px;text-align:center}
 #volwrap{width:80%;max-width:360px;margin-bottom:12px}
@@ -71,6 +74,14 @@ background:rgba(78,255,153,.06);border-radius:8px;font-size:13px}
 #prefadd{display:flex;gap:6px;margin-top:6px}
 #prefadd input{flex:1;padding:8px 12px;border-radius:16px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:13px}
 #prefadd button{padding:8px 14px;border:none;border-radius:16px;background:#4e9;color:#222;font-size:13px;cursor:pointer}
+#exportpanel{width:90%;max-width:520px;margin-top:8px}
+#exportpanel h3{color:#6cf;font-size:14px;margin-bottom:6px}
+#exportcontrols{display:grid;grid-template-columns:1fr 1fr auto auto;gap:6px}
+#exportcontrols input,#exportcontrols select{padding:8px 12px;border-radius:16px;border:1px solid #444;background:rgba(255,255,255,.06);color:#eee;font-size:13px;min-width:0}
+#exportcontrols select option{background:#1b1736;color:#eee}
+#exportcontrols button{padding:8px 14px;border:none;border-radius:16px;background:#6cf;color:#101528;font-size:13px;cursor:pointer;white-space:nowrap}
+#exportnote{font-size:11px;color:#666;margin-top:6px}
+@media(max-width:520px){#exportcontrols{grid-template-columns:1fr 1fr;}}
 </style></head><body>
 <h1>Charlie</h1><div class="sub">流式对话 · 自动监听 · 逐句播报</div>
 <div id="tunnelurl" style="display:none;font-size:11px;color:#4e9;margin-bottom:4px;text-align:center;cursor:pointer" onclick="copyTunnelURL()"></div>
@@ -80,10 +91,27 @@ background:rgba(78,255,153,.06);border-radius:8px;font-size:13px}
 <div id="volwrap"><div id="volbarbg"><div id="volbar"></div></div></div>
 <div id="volnum">音量 0.0</div>
 <div id="controls">
-<button id="stopbtn" onclick="interruptTTS()" style="padding:10px 18px;border:2px solid #f5a623;border-radius:28px;background:rgba(245,166,35,.1);color:#f5a623;font-size:13px;cursor:pointer;display:none">⏹️打断</button><button id="wakebtn" class="off" onclick="toggleWake()">唤醒词 OFF</button><button id="autobtn" onclick="toggleAuto()">自动监听 ON</button>
+<button id="stopbtn" onclick="interruptTTS()" style="padding:10px 18px;border:2px solid #f5a623;border-radius:28px;background:rgba(245,166,35,.1);color:#f5a623;font-size:13px;cursor:pointer;display:none">⏹️打断</button>
+<button id="loclbtn" onclick="reportLocation()" style="padding:10px 18px;border:2px solid #4e9;border-radius:28px;background:rgba(78,255,153,.1);color:#4e9;font-size:13px;cursor:pointer">📍定位</button>
+<button id="sharebtn" onclick="copySessionURL()" style="padding:10px 18px;border:2px solid #9b59b6;border-radius:28px;background:rgba(155,89,182,.1);color:#9b59b6;font-size:13px;cursor:pointer">🔗跨终端</button>
+<button id="wakebtn" class="off" onclick="toggleWake()">唤醒词 OFF</button><button id="autobtn" onclick="toggleAuto()">自动监听 ON</button>
 <button id="holdbtn" onmousedown="holdStart()" onmouseup="holdEnd()" onmouseleave="holdEnd()" ontouchstart="holdStart()" ontouchend="holdEnd()">按住说话</button>
 </div>
 <div id="conv"></div>
+<div id="exportpanel">
+<h3>⬇️ 对话导出</h3>
+<div id="exportcontrols">
+<input id="exportfrom" type="date" aria-label="开始日期">
+<input id="exportto" type="date" aria-label="结束日期">
+<select id="exportformat" aria-label="导出格式">
+<option value="txt">TXT</option>
+<option value="markdown">Markdown</option>
+<option value="json">JSON</option>
+</select>
+<button type="button" onclick="downloadConversationExport()">下载</button>
+</div>
+<div id="exportnote">默认导出当前共享会话；留空日期表示不限制。</div>
+</div>
 <div id="prefpanel">
 <h3>👤 用户偏好 <span onclick="loadPrefs()">刷新</span></h3>
 <div id="preflist"></div>
@@ -105,6 +133,54 @@ background:rgba(78,255,153,.06);border-radius:8px;font-size:13px}
 function genSessionId(){return 's'+Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
 let SESSION_ID=localStorage.getItem('magic_session_id')||genSessionId();
 localStorage.setItem('magic_session_id',SESSION_ID);
+const exportSessionId=SESSION_ID;
+
+// ===== WiFi/位置定位 =====
+function reportLocation(){
+  if(!navigator.geolocation)return;
+  navigator.geolocation.getCurrentPosition(
+    pos=>{
+      const{latitude:lat,longitude:lng,accuracy:acc}=pos.coords;
+      if(wsReady&&wsConn&&wsConn.readyState===1){
+        wsConn.send(JSON.stringify({type:'location',lat:lat,lng:lng,accuracy:acc}));
+      }
+      console.log('📍 位置已上报:',lat,lng,'±'+acc+'m');
+    },
+    err=>console.log('定位失败:',err.message),
+    {enableHighAccuracy:true,timeout:10000,maximumAge:30000}
+  );
+}
+// 每60秒上报一次位置（如果权限允许）
+setInterval(reportLocation,60000);
+
+// ===== 跨终端会话同步 =====
+function getSessionShareURL(){
+  return location.origin+'?session='+SESSION_ID;
+}
+function copySessionURL(){
+  const url=getSessionShareURL();
+  if(navigator.clipboard){
+    navigator.clipboard.writeText(url).then(()=>showTunnelURL(url));
+  }else{
+    showTunnelURL(url);
+  }
+}
+function showTunnelURL(url){
+  const el=document.getElementById('tunnelurl');
+  el.textContent='🔗 跨终端链接: '+url;
+  el.style.display='block';
+}
+// 从 URL 参数读取共享 session
+(function(){
+  const params=new URLSearchParams(location.search);
+  const shared=params.get('session');
+  if(shared&&shared.length>4){
+    SESSION_ID=shared;
+    localStorage.setItem('magic_session_id',SESSION_ID);
+    addMsg('sys','🔗 已加入共享会话: '+shared.slice(0,8));
+  }
+})();
+
 
 const st=document.getElementById('status'),diag=document.getElementById('diag'),conv=document.getElementById('conv');
 const orb=document.getElementById('orb'),volbar=document.getElementById('volbar'),volnum=document.getElementById('volnum');
@@ -123,17 +199,52 @@ function addMsg(cls,txt,ts){
 function addReplyChunk(txt){if(!streamingMsg)streamingMsg=addMsg('b streaming','');streamingMsg.textContent+=txt;conv.scrollTop=conv.scrollHeight;}
 function finishReply(){if(streamingMsg){streamingMsg.classList.remove('streaming');streamingMsg=null;}}
 
-// ===== 音频队列(顺序播放) =====
-let audioQueue=[],isPlaying=false;
-function enqueueAudio(b64mp3){audioQueue.push(base64ToBlob(b64mp3,'audio/mpeg'));if(!isPlaying)playNextAudio();}
-function playNextAudio(){
-  if(audioQueue.length===0){isPlaying=false;setState('idle','🎙️','在听…');const sb=document.getElementById('stopbtn');if(sb)sb.style.display='none';startCooldown();return;}
-  isPlaying=true;setState('speaking','🔊','朗读中…');const sb=document.getElementById('stopbtn');if(sb)sb.style.display='inline-block';
-  const blob=audioQueue.shift();const audio=new Audio(URL.createObjectURL(blob));
-  audio.onended=playNextAudio;audio.onerror=playNextAudio;
-  audio.play().catch(()=>{setState('idle','🎙️','在听…');isPlaying=false;startCooldown();});
+// ===== Safari 音频解锁(autoplay策略) =====
+let audioUnlocked=false;
+function unlockAudio(){
+  if(audioUnlocked)return;
+  try{
+    const a=new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+    a.volume=0;
+    const p=a.play(); if(p&&p.then)p.then(()=>{audioUnlocked=true;}).catch(()=>{});
+  }catch(e){}
 }
-function base64ToBlob(b64,mime){const bin=atob(b64);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return new Blob([a],{type:mime});}
+function ensureUnlock(){
+  if(audioUnlocked)return Promise.resolve();
+  return new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=').play().then(()=>{audioUnlocked=true;}).catch(()=>{});
+}
+
+// ===== 音频队列(WebAudio播放, Safari可靠; 降级HTMLAudio) =====
+let audioQueue=[],isPlaying=false,currentSrcNode=null,currentHtmlAudio=null,audioPlaybackGeneration=0;const BARGE_THRESHOLD=0.45,BARGE_DELAY=650,BARGE_START_GUARD_MS=900;let bargeTimer=null,abortCtrl=null,speakingStartedAt=0;
+function b64ToUint8(b64){const bin=atob(b64);const a=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return a;}
+function enqueueAudio(b64mp3){audioQueue.push(b64mp3);if(!isPlaying)playNextAudio();}
+function playNextAudio(){
+  if(audioQueue.length===0){isPlaying=false;speakingStartedAt=0;setState('idle','🎙️','在听…');const sb=document.getElementById('stopbtn');if(sb)sb.style.display='none';startCooldown();return;}
+  const playbackGeneration=++audioPlaybackGeneration;if(!isPlaying)speakingStartedAt=Date.now();isPlaying=true;setState('speaking','🔊','朗读中…');const sb=document.getElementById('stopbtn');if(sb)sb.style.display='inline-block';
+  const b64=audioQueue.shift();
+  // 优先WebAudio: 走已resume的AudioContext, 不受Safari autoplay限制, 异步到达的TTS也能放
+  if(audioCtx&&audioCtx.state==='running'){
+    try{
+      audioCtx.decodeAudioData(b64ToUint8(b64).buffer,function(buf){
+        if(playbackGeneration!==audioPlaybackGeneration)return;
+        const src=audioCtx.createBufferSource();src.buffer=buf;src.connect(audioCtx.destination);
+        currentSrcNode=src;src.onended=function(){if(playbackGeneration!==audioPlaybackGeneration||currentSrcNode!==src)return;currentSrcNode=null;playNextAudio();};src.start();
+      },function(){if(playbackGeneration!==audioPlaybackGeneration)return;htmlAudioFallback(b64);});  // 解码失败降级
+      return;
+    }catch(e){/*降级HTMLAudio*/}
+  }
+  htmlAudioFallback(b64);
+}
+function htmlAudioFallback(b64){
+  const audioUrl=URL.createObjectURL(new Blob([b64ToUint8(b64)],{type:'audio/mpeg'}));
+  const audio=new Audio(audioUrl);
+  const playbackGeneration=audioPlaybackGeneration;let released=false;
+  function releaseHtmlAudioUrl(){if(released)return;released=true;try{URL.revokeObjectURL(audioUrl);}catch(e){}}
+  audio._releaseHtmlAudioUrl=releaseHtmlAudioUrl;currentHtmlAudio=audio;
+  audio.onended=function(){releaseHtmlAudioUrl();if(playbackGeneration!==audioPlaybackGeneration||currentHtmlAudio!==audio)return;currentHtmlAudio=null;playNextAudio();};
+  audio.onerror=function(){releaseHtmlAudioUrl();if(playbackGeneration!==audioPlaybackGeneration||currentHtmlAudio!==audio)return;currentHtmlAudio=null;playNextAudio();};
+  audio.play().catch(()=>{releaseHtmlAudioUrl();if(playbackGeneration!==audioPlaybackGeneration||currentHtmlAudio!==audio)return;setState('idle','🎙️','在听…');isPlaying=false;startCooldown();});
+}
 
 // ===== SSE流解析 =====
 async function streamSSE(response,onEvent){
@@ -145,10 +256,12 @@ async function streamSSE(response,onEvent){
 function handleStreamEvent(data){
   switch(data.type){
     case'text':addReplyChunk(data.text);break;
-    case'audio':enqueueAudio(data.audio);break;
-    case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','思考中(流式)…');break;
+    case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','正在思考…');break;
+    case'ack':setState('thinking','👂','嗯，让我想想…');break;
+    case'audio':if(state!=='listening'){if(state==='thinking')setState('synthesizing','🎵','正在合成语音…');enqueueAudio(data.audio);}break;
     case'done':finishReply();if(!isPlaying&&audioQueue.length===0){setState('idle','🎙️','在听…');startCooldown();}break;
     case'error':addMsg('sys','⚠️ '+(data.message||'错误'));setState('idle','🎙️','在听…');startCooldown();break;
+    case'warning':addMsg('sys','🔈 '+(data.message||'语音暂时不可用'));break;
   }
 }
 function startCooldown(){if(cooldownTimer)clearTimeout(cooldownTimer);cooldownTimer=setTimeout(()=>{cooldownTimer=null;},COOLDOWN);}
@@ -161,20 +274,23 @@ async function sendText(){
   if(await sendTextWS(m))return;
   // 降级到SSE
   addMsg('u',m);setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
-  try{const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m,session_id:SESSION_ID})});
-    if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
-    await streamSSE(r,handleStreamEvent);
-  }catch(e){st.textContent='网络错误';setState('idle','🎙️','在听…');}
+  try{abortCtrl=new AbortController();
+    const r=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m,session_id:SESSION_ID}),signal:abortCtrl.signal});
+    if(!r.ok){abortCtrl=null;st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');return;}
+    await streamSSE(r,handleStreamEvent);abortCtrl=null;
+  }catch(e){abortCtrl=null;if(e.name==='AbortError')return;st.textContent='网络错误';setState('idle','🎙️','在听…');}
 }
 document.getElementById('msginput').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
 
 // ===== 麦克风初始化 + 自动监听 =====
 async function init(){
   if(mic)return;
+  unlockAudio();  // 同步解锁Safari音频autoplay(必须在用户手势内, await之前)
   try{
     micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1}});
     mic=true;diag.textContent='✅ 麦克风就绪 · 自动监听已'+(autoListen?'开启':'关闭');
     audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==='suspended'){audioCtx.resume().catch(()=>{});}
     const src=audioCtx.createMediaStreamSource(micStream);
     analyser=audioCtx.createAnalyser();analyser.fftSize=512;analyser.smoothingTimeConstant=0.6;
     src.connect(analyser);updateVolume();setState('idle','🎙️','在听…');
@@ -191,6 +307,12 @@ function updateVolume(){
       if(!soundTimer)soundTimer=setTimeout(()=>{if(state==='idle'&&autoListen&&!cooldownTimer)startAutoRecord();},SOUND_DELAY);
     }else{clearTimeout(soundTimer);soundTimer=null;}
   }
+  // 自动打断(barge-in): TTS播放中检测到用户大声说话→停止TTS+开始录音
+  if(autoListen&&state==='speaking'&&isPlaying){
+    if(v>BARGE_THRESHOLD&&Date.now()-speakingStartedAt>=BARGE_START_GUARD_MS){
+      if(!bargeTimer)bargeTimer=setTimeout(()=>{if(state==='speaking'&&isPlaying)bargeIn();},BARGE_DELAY);
+    }else{clearTimeout(bargeTimer);bargeTimer=null;}
+  }
   // 静默停止: 录音中检测到静默
   if(state==='listening'&&v<SILENCE_THRESHOLD){
     if(!silenceTimer)silenceTimer=setTimeout(()=>{if(state==='listening')stopAutoRecord();},SILENCE_DELAY);
@@ -203,7 +325,7 @@ function toggleAuto(){
   btn.textContent='自动监听 '+(autoListen?'ON':'OFF');
   btn.className=autoListen?'':'off';
   diag.textContent='自动监听已'+(autoListen?'开启':'关闭');
-  if(!autoListen){clearTimeout(soundTimer);clearTimeout(silenceTimer);}
+  if(!autoListen){clearTimeout(soundTimer);clearTimeout(silenceTimer);clearTimeout(bargeTimer);}
 }
 // ===== 自动录音 =====
 function startAutoRecord(){
@@ -224,10 +346,11 @@ async function onAutoRecordStop(){
   diag.textContent='📤 发送语音('+blob.size+'B,'+(dur/1000).toFixed(1)+'s)…';
   setState('thinking','🧠','识别+思考(流式)…');streamingMsg=null;
   try{const fd=new FormData();fd.append('file',blob,'audio.webm');
-    const r=await fetch('/api/voice/stream?session_id='+SESSION_ID,{method:'POST',body:fd});
-    if(!r.ok){st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');startCooldown();return;}
-    await streamSSE(r,handleStreamEvent);
-  }catch(e){st.textContent='发送失败:'+e.message;setState('idle','🎙️','在听…');startCooldown();}
+    abortCtrl=new AbortController();
+    const r=await fetch('/api/voice/stream?session_id='+SESSION_ID,{method:'POST',body:fd,signal:abortCtrl.signal});
+    if(!r.ok){abortCtrl=null;st.textContent='错误:'+r.status;setState('idle','🎙️','在听…');startCooldown();return;}
+    await streamSSE(r,handleStreamEvent);abortCtrl=null;
+  }catch(e){abortCtrl=null;if(e.name==='AbortError')return;st.textContent='发送失败:'+e.message;setState('idle','🎙️','在听…');startCooldown();}
 }
 // ===== 按住说话(手动模式) =====
 function holdStart(){
@@ -242,23 +365,38 @@ function holdStart(){
 function holdEnd(){if(state==='listening'&&mediaRecorder&&mediaRecorder.state==='recording')mediaRecorder.stop();}
 
 // ===== 提醒管理 =====
-async function loadRems(){
-  try{const r=await fetch('/api/reminders');const d=await r.json();const el=document.getElementById('remlist');
+const pollEtags={reminders:'',preferences:'',tunnel:''};
+async function fetchPollJSON(url,etagKey,options={}){
+  const headers={};
+  if(!options.force&&pollEtags[etagKey])headers['If-None-Match']=pollEtags[etagKey];
+  const{force,...fetchOptions}=options;
+  const r=await fetch(url,{headers,...fetchOptions});
+  const etag=r.headers.get('ETag');
+  if(etag)pollEtags[etagKey]=etag;
+  if(r.status===304)return null;
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  return r.json();
+}
+async function loadRems(force=false){
+  try{const d=await fetchPollJSON('/api/reminders','reminders',{force});
+    if(!d)return;
+    const el=document.getElementById('remlist');
     if(!d.reminders||!d.reminders.length){el.innerHTML='<div style="color:#666;font-size:13px;padding:8px">暂无提醒</div>';return;}
     el.innerHTML=d.reminders.map(r=>{const c=r.done?'remitem done':'remitem';
       const t=r.due?'<span class="rtime">'+r.due.replace('T',' ').slice(0,16)+'</span>':'';
       return '<div class="'+c+'"><span class="rtxt">'+r.text+'</span>'+t+'<span class="rdel" onclick="delRem('+r.id+')">✓</span></div>';
     }).join('');
-  }catch(e){document.getElementById('remlist').innerHTML='<div style="color:#e94560">加载失败</div>';}
+  }catch(e){document.getElementById('remlist').innerHTML='<div style="color:#e94560">加载失败</div>';throw e;}
+  return true;
 }
 async function addRem(){
   const t=document.getElementById('remtext').value.trim();const tm=document.getElementById('remtime').value.trim();
   if(!t)return;document.getElementById('remtext').value='';document.getElementById('remtime').value='';
   try{const r=await fetch('/api/reminders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t,time:tm})});
-    const d=await r.json();addMsg('sys',d.message||'已添加');loadRems();
+    const d=await r.json();addMsg('sys',d.message||'已添加');loadRems(true);
   }catch(e){addMsg('sys','添加失败');}
 }
-async function delRem(id){try{await fetch('/api/reminders/'+id,{method:'DELETE'});loadRems();}catch(e){}}
+async function delRem(id){try{await fetch('/api/reminders/'+id,{method:'DELETE'});loadRems(true);}catch(e){}}
 async function resetChat(){
   try{const r=await fetch('/api/reset?session_id='+SESSION_ID,{method:'POST'});const d=await r.json();
     conv.innerHTML='';addMsg('sys','🔄 '+d.message);setState('idle','🎙️','新对话，在听…');
@@ -293,7 +431,7 @@ function wsConnect(){
       const oldDiag=diag.textContent;
       diag.textContent='✅ 实时连接已建立 · '+(oldDiag.replace(/^[✅📡❌].*?· /,''));
       // 重连后恢复SSE通知
-      if(evtSource&&!evtSource.readyState||!evtSource)initSSE();
+      if(!evtSource||evtSource.readyState===EventSource.CLOSED)initSSE();
     };
     wsConn.onclose=()=>{wsReady=false;diag.textContent='📡 实时连接断开,5秒后重连…';setTimeout(wsConnect,5000);};
     wsConn.onerror=()=>{wsReady=false;};
@@ -302,13 +440,16 @@ function wsConnect(){
         switch(data.type){
           case'connect':diag.textContent='✅ '+data.text+' · 自动监听已'+(autoListen?'开启':'关闭');break;
           case'pong':break; // 心跳回复
-          case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','思考中(流式)…');break;
-          case'text':addReplyChunk(data.text);break;
-          case'audio':if(data.data)enqueueAudio(data.data);break;
+          case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','正在思考…');break;
+          case'ack':setState('thinking','👂','嗯，让我想想…');break;
+          case'text':addReplyChunk(data.text);if(state==='thinking')setState('thinking','🧠','正在思考…');break;
+          case'audio':if(data.data&&state!=='listening'){if(state==='thinking')setState('synthesizing','🎵','正在合成语音…');enqueueAudio(data.data);}break;
           case'done':finishReply();if(!isPlaying&&audioQueue.length===0){setState('idle','🎙️','在听…');startCooldown();}break;
           case'error':addMsg('sys','⚠️ '+(data.message||'错误'));setState('idle','🎙️','在听…');startCooldown();break;
-          case'interrupted':audioQueue=[];if(isPlaying){isPlaying=false;}finishReply();
-            setState('idle','🎙️','已打断,在听…');startCooldown();break;
+          case'warning':addMsg('sys','🔈 '+(data.message||'语音暂时不可用'));break;
+          case'interrupted':stopAllAudio();finishReply();
+            if(state==='speaking'||state==='idle'){setState('idle','🎙️','已打断,在听…');startCooldown();}break;
+          case'location_ack':addMsg('sys','📍 '+data.address);break;
         }
       }catch(err){}
     };
@@ -317,29 +458,64 @@ function wsConnect(){
 // WebSocket发送文字对话(优先WebSocket, 降级SSE)
 async function sendTextWS(msg){
   if(wsReady&&wsConn&&wsConn.readyState===1){
-    addMsg('u',msg);setState('thinking','🧠','思考中(流式)…');streamingMsg=null;
+    addMsg('u',msg);setState('thinking','🧠','正在思考…');streamingMsg=null;
     wsConn.send(JSON.stringify({type:'text',message:msg,session_id:SESSION_ID}));
     return true;
   }
   return false; // 降级到SSE
 }
-// 打断TTS播放
+// 停止所有TTS播放(清队列+停当前源)
+function stopAllAudio(){
+  audioQueue=[];clearTimeout(bargeTimer);bargeTimer=null;audioPlaybackGeneration++;if(isPlaying)isPlaying=false;speakingStartedAt=0;
+  if(currentSrcNode){try{currentSrcNode.onended=null;currentSrcNode.stop();}catch(e){}currentSrcNode=null;}
+  if(currentHtmlAudio){const audio=currentHtmlAudio;try{if(audio._releaseHtmlAudioUrl)audio._releaseHtmlAudioUrl();audio.pause();}catch(e){}currentHtmlAudio=null;}
+  const sb=document.getElementById('stopbtn');if(sb)sb.style.display='none';
+}
+function abortActiveStream(){
+  if(abortCtrl){try{abortCtrl.abort();}catch(e){}abortCtrl=null;}
+}
+function captureInterruptedReply(){
+  if(streamingMsg)return streamingMsg.textContent||'';
+  const msgs=conv.querySelectorAll('.msg.b:not(.streaming)');
+  return msgs.length?(msgs[msgs.length-1].textContent||''):'';
+}
+function buildInterruptPayload(){
+  const reply=captureInterruptedReply();
+  return reply?{type:'interrupt',interrupted_reply:reply.slice(-200)}:{type:'interrupt'};
+}
+// 打断TTS播放(手动按钮)
 function interruptTTS(){
-  if(wsReady&&wsConn&&wsConn.readyState===1){
-    wsConn.send(JSON.stringify({type:'interrupt'}));
-  }
-  audioQueue=[];if(isPlaying){isPlaying=false;}
+  stopAllAudio();
+  abortActiveStream();
+  if(wsReady&&wsConn&&wsConn.readyState===1)wsConn.send(JSON.stringify(buildInterruptPayload()));
+  finishReply();setState('idle','🎙️','已打断,在听…');startCooldown();
+}
+// 自动打断(barge-in): TTS播放中检测到用户说话→停止播放+开始录音
+function bargeIn(){
+  clearTimeout(bargeTimer);bargeTimer=null;
+  stopAllAudio();
+  abortActiveStream();
+  if(wsReady&&wsConn&&wsConn.readyState===1)wsConn.send(JSON.stringify(buildInterruptPayload()));
   finishReply();
+  if(!micStream){setState('idle','🎙️','在听…');startCooldown();return;}
+  recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:MediaRecorder.isTypeSupported('audio/webm')?'audio/webm':MediaRecorder.isTypeSupported('audio/mp4')?'audio/mp4':''});
+  mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recChunks.push(e.data);};
+  mediaRecorder.onstop=onAutoRecordStop;
+  mediaRecorder.start();recStart=Date.now();
+  setState('listening','👂','已打断,聆听中…');
+  addMsg('sys','⚡ 打断TTS,我在听');
 }
 // ===== Tunnel URL (public access) =====
 async function loadTunnelURL(){
   try{
-    const r=await fetch('/api/tunnel');const d=await r.json();
+    const d=await fetchPollJSON('/api/tunnel','tunnel');
+    if(!d)return;
     if(d.active&&d.url){
       const el=document.getElementById('tunnelurl');
       if(el){el.innerHTML='\u{1F310} \u516C\u7F51: '+d.url.replace('https://','');el.style.display='block';}
     }
-  }catch(e){}
+  }catch(e){throw e;}
+  return true;
 }
 function copyTunnelURL(){
   const el=document.getElementById('tunnelurl');
@@ -385,11 +561,11 @@ function startWakeListener(){
           // 唤醒成功!
           stopWakeListener();
           diag.textContent='✅ 唤醒成功! 正在聆听...';
-          setState('listening','👂','唤醒中...');
-          // 唤醒成功: 无论autoListen开关,都启动录音
-          startAutoRecord();
-          // 唤醒后3秒自动恢复监听
-          setTimeout(()=>{if(wakeMode)startWakeListener();},3000);
+          // TTS播放中→打断, 否则→启动录音
+          if(state==='speaking'){bargeIn();}
+          else{setState('listening','👂','唤醒中...');startAutoRecord();}
+          // 等对话结束(idle)再恢复唤醒监听, 避免TTS回声误唤醒
+          waitForIdleThenWake();
           return;
         }
       }
@@ -410,29 +586,106 @@ function startWakeListener(){
 function stopWakeListener(){
   if(wakeRec){try{wakeRec.onend=null;wakeRec.stop();wakeRec=null;}catch(e){}}
 }
+function waitForIdleThenWake(){
+  // 轮询等对话真正结束(idle)再恢复唤醒监听, 避免TTS回声喂给识别器
+  if(!wakeMode)return;
+  if(state==='idle'){startWakeListener();}
+  else{setTimeout(waitForIdleThenWake,300);}
+}
 // 心跳保活
 setInterval(()=>{if(wsReady&&wsConn&&wsConn.readyState===1)wsConn.send(JSON.stringify({type:'ping'}));},30000);
 
 // ===== 用户偏好管理 =====
 async function loadPrefs(){
   try{
-    const r=await fetch('/api/preferences');const d=await r.json();const el=document.getElementById('preflist');
+    const d=await fetchPollJSON('/api/preferences','preferences');
+    if(!d)return;
+    const el=document.getElementById('preflist');
     if(!d.preferences||!Object.keys(d.preferences).length){el.innerHTML='<div style="color:#666;font-size:13px;padding:8px">暂无偏好,说"记住我喜欢..."让AI自动记录</div>';return;}
     el.innerHTML=Object.entries(d.preferences).map(([k,v])=>
       '<div class="prefitem"><span class="pk">'+k+'</span><span class="pv">'+v+'</span><span class="pdel" onclick="delPref(\''+k+'\')">×</span></div>'
     ).join('');
-  }catch(e){document.getElementById('preflist').innerHTML='<div style="color:#e94560">加载失败</div>';}
+  }catch(e){document.getElementById('preflist').innerHTML='<div style="color:#e94560">加载失败</div>';throw e;}
+  return true;
 }
 async function addPref(){
   const k=document.getElementById('prefkey').value.trim();const v=document.getElementById('prefval').value.trim();
   if(!k||!v)return;
   document.getElementById('prefkey').value='';document.getElementById('prefval').value='';
   try{const r=await fetch('/api/preferences',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});
-    const d=await r.json();addMsg('sys','👤 '+d.message);loadPrefs();
+    const d=await r.json();addMsg('sys','👤 '+d.message);loadPrefs(true);
   }catch(e){addMsg('sys','设置偏好失败');}
 }
 async function delPref(k){
-  try{await fetch('/api/preferences/'+encodeURIComponent(k),{method:'DELETE'});loadPrefs();}catch(e){}
+  try{await fetch('/api/preferences/'+encodeURIComponent(k),{method:'DELETE'});loadPrefs(true);}catch(e){}
 }
-loadConv();loadRems();loadPrefs();wsConnect();initSSE();loadTunnelURL();setInterval(loadRems,30000);setInterval(loadPrefs,60000);setInterval(loadTunnelURL,60000);
+function downloadConversationExport(){
+  const format=document.getElementById('exportformat').value;
+  const fromDate=document.getElementById('exportfrom').value;
+  const toDate=document.getElementById('exportto').value;
+  const params=new URLSearchParams({format,session_id:exportSessionId});
+  if(fromDate)params.set('from_date',fromDate);
+  if(toDate)params.set('to_date',toDate);
+  const note=document.getElementById('exportnote');
+  if(fromDate&&toDate&&fromDate>toDate){
+    note.textContent='开始日期不能晚于结束日期。';
+    note.style.color='#e94560';
+    return;
+  }
+  note.textContent='开始下载…';
+  note.style.color='#6cf';
+  window.location.href='/api/export?'+params.toString();
+  setTimeout(()=>{
+    note.textContent='默认导出当前共享会话；留空日期表示不限制。';
+    note.style.color='#666';
+  },1500);
+}
+async function refreshRems(){return loadRems();}
+async function refreshPrefs(){return loadPrefs();}
+const pollJobs=[
+  {name:'reminders',interval:60000,failures:0,paused:false,run:refreshRems},
+  {name:'preferences',interval:120000,failures:0,paused:false,run:refreshPrefs},
+  {name:'tunnel',interval:120000,failures:0,paused:false,run:loadTunnelURL}
+];
+let pollTimers={};
+function reportPollingTelemetry(event,job=''){
+  const body={event};
+  if(job)body.job=job;
+  fetch('/api/polling-telemetry',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body),
+    keepalive:true
+  }).catch(()=>{});
+}
+function clearPolls(){Object.values(pollTimers).forEach(clearTimeout);pollTimers={};}
+function schedulePoll(job){
+  if(document.hidden){
+    if(!job.paused){job.paused=true;reportPollingTelemetry('paused',job.name);}
+    return;
+  }
+  job.paused=false;
+  const backoff=Math.min(job.interval*8,job.interval*2**job.failures);
+  pollTimers[job.name]=setTimeout(async()=>{
+    try{await job.run();job.failures=0;}
+    catch(e){
+      job.failures+=1;
+      reportPollingTelemetry('error',job.name);
+    }
+    schedulePoll(job);
+  },backoff);
+}
+function startPolling(){
+  pollJobs.forEach(schedulePoll);
+  document.addEventListener('visibilitychange',()=>{
+    clearPolls();
+    if(document.hidden){
+      pollJobs.forEach(job=>{if(!job.paused){job.paused=true;reportPollingTelemetry('paused',job.name);}});
+      return;
+    }
+    reportPollingTelemetry('resumed');
+    pollJobs.forEach(job=>{job.run().catch(()=>{});schedulePoll(job);});
+  });
+}
+loadConv().catch(()=>{});loadRems().catch(()=>{});loadPrefs().catch(()=>{});wsConnect();initSSE();loadTunnelURL().catch(()=>{});startPolling();
 </script></body></html>

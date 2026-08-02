@@ -3,9 +3,26 @@
 # 创建公网访问隧道, 让用户从任何地方都能访问Charlie
 # 用法: bash start_tunnel.sh
 
-CF_BIN="${HOME}/.local/bin/cloudflared"
-URL_FILE="$(dirname "$0")/tunnel_url.txt"
-LOG_FILE="/tmp/cloudflared.log"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$SCRIPT_DIR/.env"
+    set +a
+fi
+CF_BIN="${CF_BIN:-$HOME/.local/bin/cloudflared}"
+URL_FILE="${TUNNEL_URL_FILE:-$SCRIPT_DIR/tunnel_url.txt}"
+LOG_DIR="${ASSISTANT_KID_LOG_DIR:-$SCRIPT_DIR/logs}"
+LOG_FILE="${CLOUDFLARED_LOG_FILE:-$LOG_DIR/cloudflared.log}"
+HTTP_PORT="${ASSISTANT_KID_HTTP_PORT:-8000}"
+mkdir -p "$LOG_DIR"
+
+case "$HTTP_PORT" in
+    ''|*[!0-9]*) HTTP_PORT=8000 ;;
+esac
+if [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+    HTTP_PORT=8000
+fi
 
 # 检查cloudflared是否安装
 if [ ! -f "$CF_BIN" ]; then
@@ -19,7 +36,7 @@ sleep 2
 
 # 启动新隧道
 echo "🚀 启动Cloudflare Tunnel..."
-$CF_BIN tunnel --url http://localhost:8000 > "$LOG_FILE" 2>&1 &
+$CF_BIN tunnel --url "http://localhost:$HTTP_PORT" > "$LOG_FILE" 2>&1 &
 TUNNEL_PID=$!
 
 # 等待URL生成

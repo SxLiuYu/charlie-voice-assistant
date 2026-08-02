@@ -4,10 +4,33 @@
 # 用法: screen -dmS watchdog bash watchdog.sh
 
 cd "$(dirname "$0")"
+SCRIPT_DIR="$(pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$SCRIPT_DIR/.env"
+    set +a
+fi
+LOG_DIR="${ASSISTANT_KID_LOG_DIR:-$SCRIPT_DIR/logs}"
+mkdir -p "$LOG_DIR"
 source .venv/bin/activate
-LOG=/tmp/voice_srv.log
-HTTPS_LOG=/tmp/voice_https.log
-WATCHDOG_LOG=/tmp/watchdog.log
+LOG="${VOICE_SERVER_LOG:-$LOG_DIR/voice_srv.log}"
+HTTPS_LOG="${HTTPS_SERVER_LOG:-$LOG_DIR/voice_https.log}"
+WATCHDOG_LOG="${WATCHDOG_LOG:-$LOG_DIR/watchdog.log}"
+HTTP_PORT="${ASSISTANT_KID_HTTP_PORT:-8000}"
+HTTPS_PORT="${ASSISTANT_KID_HTTPS_PORT:-8443}"
+case "$HTTP_PORT" in
+    ''|*[!0-9]*) HTTP_PORT=8000 ;;
+esac
+case "$HTTPS_PORT" in
+    ''|*[!0-9]*) HTTPS_PORT=8443 ;;
+esac
+if [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+    HTTP_PORT=8000
+fi
+if [ "$HTTPS_PORT" -lt 1 ] || [ "$HTTPS_PORT" -gt 65535 ]; then
+    HTTPS_PORT=8443
+fi
 RESTART_COUNT=0
 
 log() {
@@ -18,9 +41,9 @@ log "看门狗v2启动 - 检查间隔60s"
 
 while true; do
     # 检查HTTP
-    HTTP_OK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost:8000/api/status 2>/dev/null)
+    HTTP_OK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://localhost:$HTTP_PORT/api/status" 2>/dev/null)
     # 检查HTTPS
-    HTTPS_OK=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 https://localhost:8443/api/status 2>/dev/null)
+    HTTPS_OK=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://localhost:$HTTPS_PORT/api/status" 2>/dev/null)
 
     NEED_RESTART=0
 

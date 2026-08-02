@@ -4,7 +4,13 @@
 # 运行时数据
 conversation_history.json
 reminders.json
+reminders.json.lock
+reminders.json.scheduler.lock
 suggestions_state.json
+suggestions_state.json.lock
+suggestions_state.json.runner.lock
+conversation_history.json.lock
+preferences.json.lock
 
 # HTTPS证书
 cert/
@@ -30,3 +36,4 @@ tests/old/
 tunnel_url.txt
 preferences.json
 logs/
+\n# 测试音频文件\naudio_000.wav\n*.wav\n!cert/*.pem

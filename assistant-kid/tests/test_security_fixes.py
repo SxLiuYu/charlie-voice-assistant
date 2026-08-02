@@ -140,21 +140,21 @@ class TestMcpProcessCleanup:
         assert "重启" in msg
 
     def test_restart_brain_sets_none(self):
-        """restart_brain后_brain为None"""
+        """restart_brain后所有缓存大脑被清空"""
         import voice_agent
-        voice_agent._brain = "fake_brain"
+        voice_agent._brains["test"] = "fake_brain"
         voice_agent.restart_brain()
-        assert voice_agent._brain is None
+        assert voice_agent._brains == {}
 
     def test_record_failure_cleans_up_on_rebuild(self):
         """连续失败达阈值时清理旧大脑"""
         import voice_agent
         # 设置一个假大脑
-        voice_agent._brain = MagicMock_brain()
+        voice_agent._brains["test"] = MagicMock_brain()
         voice_agent._brain_failures = voice_agent._MAX_BRAIN_FAILURES - 1
         # 再失败一次应该触发重建
         voice_agent._record_brain_failure("test error")
-        assert voice_agent._brain is None
+        assert voice_agent._brains == {}
         assert voice_agent._brain_failures == 0
 
 
@@ -201,6 +201,82 @@ class TestRequestSizeLimit:
         assert response.status_code == 413
         data = response.json()
         assert "过大" in data.get("error", "")
+
+
+class TestAuthProxySpoofing:
+    """认证不能信任客户端伪造的代理头。"""
+
+    @staticmethod
+    def _request(headers=None, client=("203.0.113.10", 51234)):
+        from starlette.requests import Request
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/status",
+            "headers": [(name.lower().encode(), value.encode()) for name, value in (headers or [])],
+            "client": client,
+        }
+        return Request(scope)
+
+    def test_spoofed_forwarded_for_does_not_bypass_auth(self, monkeypatch):
+        from app import auth
+
+        monkeypatch.setattr(auth, "AUTH_TOKEN", "secret-token")
+
+        request = self._request([
+            ("X-Forwarded-For", "127.0.0.1"),
+            ("X-Real-IP", "127.0.0.1"),
+        ])
+
+        assert auth._check_auth(request) is False
+
+    def test_loopback_peer_without_proxy_headers_is_local(self, monkeypatch):
+        from app import auth
+
+        monkeypatch.setattr(auth, "AUTH_TOKEN", "secret-token")
+        request = self._request(client=("127.0.0.1", 51234))
+
+        assert auth._check_auth(request) is True
+
+    def test_valid_bearer_token_passes_for_external_peer(self, monkeypatch):
+        from app import auth
+
+        monkeypatch.setattr(auth, "AUTH_TOKEN", "secret-token")
+        request = self._request([("Authorization", "Bearer secret-token")])
+
+        assert auth._check_auth(request) is True
+
+
+class TestSanitizeTextCompiledPatterns:
+    """输入清洗应复用模块级预编译正则，避免每次请求重复编译。"""
+
+    def test_sanitize_reuses_compiled_patterns(self, monkeypatch):
+        import re
+        from app import auth
+
+        compiled_patterns = [
+            value
+            for name, value in vars(auth).items()
+            if name.endswith("_RE") and isinstance(value, re.Pattern)
+        ]
+        assert len(compiled_patterns) >= 4
+
+        calls = []
+
+        def tracked_sub(pattern, repl, string, *args, **kwargs):
+            calls.append(pattern)
+            return original_sub(pattern, repl, string, *args, **kwargs)
+
+        original_sub = re.sub
+        monkeypatch.setattr(re, "sub", tracked_sub)
+
+        result = auth._sanitize_text(
+            '<b></b>onclick = javascript:\x00正常文字'
+        )
+
+        assert result == '正常文字'
+        assert calls == []
 
 
 class TestEnvExampleCompleteness:
