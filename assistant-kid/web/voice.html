@@ -188,7 +188,7 @@ let micStream=null,audioCtx=null,analyser=null,mediaRecorder=null;
 let state='idle',mic=false,autoListen=true,recChunks=[],recStart=0;
 let soundTimer=null,silenceTimer=null,cooldownTimer=null,streamingMsg=null;
 let curVolume=0;
-const SOUND_THRESHOLD=0.2,SILENCE_THRESHOLD=0.3,SOUND_DELAY=300,SILENCE_DELAY=1200,COOLDOWN=800;
+const SOUND_THRESHOLD=0.2,SILENCE_THRESHOLD=0.3,SOUND_DELAY=300,SILENCE_DELAY=600,COOLDOWN=800;
 
 function setState(s,icon,txt){state=s;orb.textContent=icon;orb.className=s;st.textContent=txt;}
 function addMsg(cls,txt,ts){
@@ -253,13 +253,77 @@ async function streamSSE(response,onEvent){
     buf+=dec.decode(value,{stream:true});const lines=buf.split('\n');buf=lines.pop();
     for(const ln of lines)if(ln.startsWith('data: '))try{onEvent(JSON.parse(ln.slice(6)));}catch(e){}}
 }
+// ===== 音乐播放(浏览器内) =====
+let musicAudio=null;
+let audioCtxUnlocked=false;
+// 在用户首次交互时解锁 AudioContext (解决手机浏览器自动播放限制)
+function unlockAudioContext(){
+  if(audioCtxUnlocked)return;
+  try{
+    const ctx=new (window.AudioContext||window.webkitAudioContext)();
+    if(ctx.state==='suspended')ctx.resume();
+    // 播放一段静音来解锁
+    const buf=ctx.createBuffer(1,1,22050);
+    const src=ctx.createBufferSource();
+    src.buffer=buf;
+    src.connect(ctx.destination);
+    src.start(0);
+    audioCtxUnlocked=true;
+    console.log('[audio] AudioContext已解锁');
+  }catch(e){console.log('[audio] 解锁失败:',e);}
+}
+function playMusicUrl(url,name,artist){
+  stopMusicUrl();
+  unlockAudioContext(); // 确保音频上下文已解锁
+  musicAudio=new Audio(url);
+  musicAudio.crossOrigin='anonymous';
+  // 设置音量确保不是静音
+  musicAudio.volume=1.0;
+  musicAudio.play().then(()=>{
+    addMsg('sys','🎵 正在播放：'+name+(artist?' - '+artist:''));
+    // 保持 state='idle' 让自动监听继续工作，用户说话可打断
+    if(state==='idle')setState('idle','🎵','播放中…');
+    else setState('idle','🎵','播放中…');
+  }).catch(e=>{
+    addMsg('sys','⚠️ 播放失败：'+e.message);
+    // 重试: 降级到无 crossOrigin
+    musicAudio=new Audio(url);
+    musicAudio.volume=1.0;
+    musicAudio.play().then(()=>{
+      addMsg('sys','🎵 正在播放：'+name+(artist?' - '+artist:''));
+      setState('idle','🎵','播放中…');
+    }).catch(e2=>{
+      addMsg('sys','⚠️ 播放失败：'+e2.message);
+      setState('idle','🎙️','在听…');
+    });
+  });
+  musicAudio.onended=function(){musicAudio=null;setState('idle','🎙️','在听…');startCooldown();};
+  musicAudio.onerror=function(){musicAudio=null;setState('idle','🎙️','在听…');startCooldown();};
+}
+function stopMusicUrl(){
+  if(musicAudio){musicAudio.pause();musicAudio.src='';musicAudio=null;}
+}
 function handleStreamEvent(data){
   switch(data.type){
-    case'text':addReplyChunk(data.text);break;
+    case'text':
+      // 检查是否是音乐URL
+      if(data.text&&data.text.startsWith('__MUSIC__')){
+        const parts=data.text.split('__');
+        // parts[0]='', parts[1]='MUSIC', parts[2]=URL, parts[3]=歌名, parts[4]=歌手
+        playMusicUrl(parts[2],parts[3]||'',parts[4]||'');
+        break;
+      }
+      if(data.text&&data.text==='__MUSIC_STOP__'){
+        stopMusicUrl();
+        addMsg('sys','⏹️ 音乐已停止');
+        setState('idle','🎙️','在听…');
+        break;
+      }
+      addReplyChunk(data.text);break;
     case'asr':addMsg('u',data.text);streamingMsg=null;setState('thinking','🧠','正在思考…');break;
     case'ack':setState('thinking','👂','嗯，让我想想…');break;
     case'audio':if(state!=='listening'){if(state==='thinking')setState('synthesizing','🎵','正在合成语音…');enqueueAudio(data.audio);}break;
-    case'done':finishReply();if(!isPlaying&&audioQueue.length===0){setState('idle','🎙️','在听…');startCooldown();}break;
+    case'done':finishReply();if(!isPlaying&&audioQueue.length===0&&!musicAudio){setState('idle','🎙️','在听…');startCooldown();}break;
     case'error':addMsg('sys','⚠️ '+(data.message||'错误'));setState('idle','🎙️','在听…');startCooldown();break;
     case'warning':addMsg('sys','🔈 '+(data.message||'语音暂时不可用'));break;
   }
@@ -330,6 +394,8 @@ function toggleAuto(){
 // ===== 自动录音 =====
 function startAutoRecord(){
   if(!micStream||state!=='idle')return;
+  // 如果正在播放音乐，先停止音乐
+  if(musicAudio){stopMusicUrl();addMsg('sys','⏸️ 音乐已暂停');}
   recChunks=[];mediaRecorder=new MediaRecorder(micStream,{mimeType:MediaRecorder.isTypeSupported('audio/webm')?'audio/webm':MediaRecorder.isTypeSupported('audio/mp4')?'audio/mp4':''});
   mediaRecorder.ondataavailable=e=>{if(e.data.size>0)recChunks.push(e.data);};
   mediaRecorder.onstop=onAutoRecordStop;
@@ -525,18 +591,12 @@ function copyTunnelURL(){
   });
 }
 // ===== 唤醒词检测(Charlie) =====
-let wakeMode=false,wakeRec=null;
-const WAKE_WORDS=["charlie","charley","charly","charli","查理","查莉","查利","查里","茶理"];
-// 编辑距离(Levenshtein)：用于 fuzzy match 唤醒词
-function levenshtein(a,b){
-  const m=a.length,n=b.length;
-  const dp=Array.from({length:m+1},()=>Array(n+1).fill(0));
-  for(let i=0;i<=m;i++)dp[i][0]=i;
-  for(let j=0;j<=n;j++)dp[0][j]=j;
-  for(let i=1;i<=m;i++)for(let j=1;j<=n;j++)
-    dp[i][j]=Math.min(dp[i-1][j]+1,dp[i][j-1]+1,dp[i-1][j-1]+(a[i-1]===b[j-1]?0:1));
-  return dp[m][n];
-}
+// 方案: Web Audio API 能量检测 + 后端ASR验证
+// 1. 能量检测到说话声 → 录制1.5秒 → POST /api/asr → 检查是否含"Charlie"
+// 2. 不依赖 webkitSpeechRecognition (Android小米无Google服务不可用)
+let wakeMode=false,wakeStream=null,wakeAudioCtx=null,wakeAnalyser=null,wakeRAF=null;
+let wakeSilentSince=0,wakeChecking=false,wakeFrameCount=0;
+const WAKE_WORDS=['charlie','charley','charly','charli','查理','查莉','查利','查里','茶理','嘞查嘞','嘞查','查嘞']; // 嘞查嘞=中文ASR识别Charlie的典型输出
 function toggleWake(){
   wakeMode=!wakeMode;
   const btn=document.getElementById('wakebtn');
@@ -544,7 +604,7 @@ function toggleWake(){
     btn.textContent='唤醒词 ON';btn.className='active';
     if(!mic){diag.textContent='⚠️ 请先点击球授权麦克风';wakeMode=false;btn.textContent='唤醒词 OFF';btn.className='off';return;}
     startWakeListener();
-    diag.textContent='🎤 唤醒词已开启,说"Charlie"激活对话';
+    diag.textContent='🎤 唤醒词已开启,说"Charlie"激活';
   }else{
     btn.textContent='唤醒词 OFF';btn.className='off';
     stopWakeListener();
@@ -552,54 +612,94 @@ function toggleWake(){
   }
 }
 function startWakeListener(){
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){diag.textContent='⚠️ 浏览器不支持语音识别,请用Chrome';wakeMode=false;return;}
-  wakeRec=new SR();
-  // 用 en-US 而非 zh-CN：Chrome 中文模式识别英文"Charlie"失败率极高
-  // en-US 模式下英文词识别率高，中文指令也能部分识别
-  wakeRec.lang='en-US';wakeRec.continuous=true;wakeRec.interimResults=true;
-  wakeRec.onresult=function(e){
-    for(let i=e.resultIndex;i<e.results.length;i++){
-      const t=e.results[i][0].transcript.toLowerCase().trim();
-      // 调试日志: 追加到诊断栏(保留最近5条)
-      const now=new Date();const ts=now.toLocaleTimeString('zh-CN',{hour12:false});
-      const logs=diag._logs||[];logs.unshift('['+ts+'] '+t);
-      if(logs.length>5)logs.pop();diag._logs=logs;
-      diag.innerHTML=logs.map(l=>l.startsWith('[')?'<div>'+l+'</div>':l).join('');
-      diag.scrollTop=0;
-      // 检测唤醒词 — fuzzy match：编辑距离≤2 都算匹配
-      for(const w of WAKE_WORDS){
-        if(t.includes(w.toLowerCase())||levenshtein(t,w.toLowerCase())<=2){
-          // 唤醒成功!
-          stopWakeListener();
-          diag.textContent='✅ 唤醒成功! 正在聆听...';
-          // TTS播放中→打断, 否则→启动录音
-          if(state==='speaking'){bargeIn();}
-          else{setState('listening','👂','唤醒中...');startAutoRecord();}
-          // 等对话结束(idle)再恢复唤醒监听, 避免TTS回声误唤醒
-          waitForIdleThenWake();
-          return;
-        }
-      }
+  if(!micStream){diag.textContent='⚠️ 麦克风未就绪';wakeMode=false;const btn=document.getElementById('wakebtn');btn.textContent='唤醒词 OFF';btn.className='off';return;}
+  try{
+    wakeStream=micStream;
+    wakeAudioCtx=new(window.AudioContext||window.webkitAudioContext)();
+    const source=wakeAudioCtx.createMediaStreamSource(wakeStream);
+    wakeAnalyser=wakeAudioCtx.createAnalyser();
+    wakeAnalyser.fftSize=512;wakeAnalyser.smoothingTimeConstant=0.3;
+    source.connect(wakeAnalyser);
+    wakeSilentSince=0;wakeChecking=false;
+    wakeLoop();
+  }catch(e){log_err('wake start error:'+(e.message||e));diag.textContent='⚠️ 唤醒启动失败:'+(e.message||e);}
+}
+function wakeLoop(){
+  if(!wakeMode||!wakeAnalyser||wakeChecking)return;
+  // rAF降频: 每3帧执行1次(60fps→20fps), 减少电池消耗
+  wakeFrameCount++;
+  if(wakeFrameCount%3!==0){wakeRAF=requestAnimationFrame(wakeLoop);return;}
+  const buf=new Uint8Array(wakeAnalyser.frequencyBinCount);
+  wakeAnalyser.getByteFrequencyData(buf);
+  // 频段过滤: 只取语音频段(300-3400Hz), 过滤低频噪声和高频干扰
+  const sampleRate=wakeAudioCtx.sampleRate||48000;
+  const binWidth=sampleRate/wakeAnalyser.fftSize;
+  const voiceStart=Math.max(0,Math.floor(300/binWidth));
+  const voiceEnd=Math.min(buf.length-1,Math.ceil(3400/binWidth));
+  let sum=0;for(let i=voiceStart;i<=voiceEnd;i++)sum+=buf[i];
+  const avg=sum/(voiceEnd-voiceStart+1),now=Date.now();
+  const THRESH=40,MIN_DUR=500;
+  const bar='█'.repeat(Math.min(20,Math.floor(avg/5)))+'░'.repeat(Math.max(0,20-Math.floor(avg/5)));
+  diag.textContent='🎤 '+bar+' '+Math.round(avg);
+  if(avg>THRESH){
+    if(wakeSilentSince===0){wakeSilentSince=now;}
+    else if(now-wakeSilentSince>MIN_DUR){
+      // 检测到说话 → 录制1.5秒发后端ASR验证
+      wakeChecking=true;
+      diag.textContent='🔍 识别中...';
+      wakeCheckKeyword();
+      return;
     }
-  };
-  wakeRec.onerror=function(e){
-    if(e.error==='no-speech')return; // 无语音,继续
-    if(e.error==='aborted')return;   // 手动停止
-    log_err('wake error:'+e.error);
-    setTimeout(()=>{if(wakeMode)startWakeListener();},1000);
-  };
-  wakeRec.onend=function(){
-    // 自动重启(浏览器会因静默停止)
-    if(wakeMode)setTimeout(()=>{try{wakeRec.start();}catch(e){}},200);
-  };
-  try{wakeRec.start();}catch(e){}
+  }else{wakeSilentSince=0;}
+  wakeRAF=requestAnimationFrame(wakeLoop);
+}
+async function wakeCheckKeyword(){
+  if(!wakeStream)return;
+  try{
+    // 录制1.5秒音频
+    const mime=MediaRecorder.isTypeSupported('audio/webm;codecs=opus')?'audio/webm;codecs=opus':'audio/webm';
+    const mr=new MediaRecorder(wakeStream,{mimeType:mime});
+    const chunks=[];
+    mr.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
+    const recordPromise=new Promise(r=>{mr.onstop=r;});
+    mr.start();
+    await new Promise(r=>setTimeout(r,1500));
+    mr.stop();
+    await Promise.race([recordPromise,new Promise((_,rej)=>setTimeout(()=>rej(new Error('rec stop timeout')),5000))]);
+    const blob=new Blob(chunks,{type:'audio/webm'});
+    if(blob.size<1000){diag.textContent='🎤 音量太小,继续监听...';wakeChecking=false;wakeSilentSince=0;wakeRAF=requestAnimationFrame(wakeLoop);return;}
+    // 发后端 Vosk 唤醒词检测(带10秒超时)
+    const fd=new FormData();fd.append('file',blob,'wake.webm');
+    const ctrl=new AbortController();const to=setTimeout(()=>ctrl.abort(),10000);
+    const resp=await fetch('/api/wakecheck',{method:'POST',body:fd,signal:ctrl.signal});
+    clearTimeout(to);
+    const data=await resp.json();
+    const text=(data.text||'').toLowerCase().trim();
+    diag.textContent='🔍 Vosk: "'+(data.text||'')+'" w='+data.wake;
+    if(data.wake){
+      diag.textContent='✅ 唤醒成功! '+text.substring(0,20);
+      if(state==='speaking'){bargeIn();}
+      else{setState('listening','👂','唤醒中...');startAutoRecord();}
+      waitForIdleThenWake();
+    }else{
+      diag.textContent='🎤 未听到Charlie,继续监听';
+      wakeChecking=false;wakeSilentSince=0;
+      wakeRAF=requestAnimationFrame(wakeLoop);
+    }
+  }catch(e){
+    log_err('wake check error:'+(e.message||e));
+    diag.textContent='🎤 识别失败,继续监听';
+    wakeChecking=false;wakeSilentSince=0;
+    wakeRAF=requestAnimationFrame(wakeLoop);
+  }
 }
 function stopWakeListener(){
-  if(wakeRec){try{wakeRec.onend=null;wakeRec.stop();wakeRec=null;}catch(e){}}
+  if(wakeRAF){cancelAnimationFrame(wakeRAF);wakeRAF=null;}
+  if(wakeAnalyser){try{wakeAnalyser.disconnect()}catch(e){}wakeAnalyser=null;}
+  if(wakeAudioCtx){try{wakeAudioCtx.close()}catch(e){}wakeAudioCtx=null;}
+  wakeStream=null;wakeSilentSince=0;wakeChecking=false;
 }
 function waitForIdleThenWake(){
-  // 轮询等对话真正结束(idle)再恢复唤醒监听, 避免TTS回声喂给识别器
   if(!wakeMode)return;
   if(state==='idle'){startWakeListener();}
   else{setTimeout(waitForIdleThenWake,300);}
@@ -700,4 +800,7 @@ function startPolling(){
   });
 }
 loadConv().catch(()=>{});loadRems().catch(()=>{});loadPrefs().catch(()=>{});wsConnect();initSSE();loadTunnelURL().catch(()=>{});startPolling();
+// 首次用户交互时解锁音频上下文(手机浏览器自动播放限制)
+document.addEventListener('touchstart',function(){unlockAudioContext();},{once:true});
+document.addEventListener('click',function(){unlockAudioContext();},{once:true});
 </script></body></html>

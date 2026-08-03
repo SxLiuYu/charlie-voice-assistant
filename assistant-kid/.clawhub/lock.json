@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "skills": {
+    "u2-asr-pro": {
+      "version": "1.0.2",
+      "installedAt": 1785751294352
+    },
+    "u2-tts-pro": {
+      "version": "1.0.1",
+      "installedAt": 1785751304051
+    }
+  }
+}

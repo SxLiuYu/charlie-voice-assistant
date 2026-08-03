@@ -4,7 +4,7 @@ Charlie - 语音Agent核心
 连接韧性: Session复用 + 自动重试 + 异常降级
 对话记忆: 跨请求保留历史上下文，支持多轮连续对话，持久化到磁盘
 """
-import os, sys, json, copy, base64, requests, datetime, time, logging, asyncio, re, tempfile, threading, fcntl
+import os, sys, json, copy, base64, requests, datetime, time, logging, asyncio, re, random, tempfile, threading, fcntl
 from typing import Optional, Generator, Tuple, List, Dict, Any, Callable
 from contextlib import contextmanager
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -15,16 +15,29 @@ except ImportError: pass
 log = logging.getLogger("magic")
 
 
-class TTSUnavailableError(RuntimeError):
-    """TTS 上游最终失败或处于短时间失败冷却窗口。"""
-
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", PROJECT_DIR)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 FINNA = os.getenv("FINNA_BASE", "https://www.finna.com.cn/v1")
-TTS_KEY = os.getenv("TTS_KEY", "")
-ASR_KEY = os.getenv("ASR_KEY", "")
+# ASR/TTS 全部使用百度智能云(免费, 0.38s, 零成本)
+# ASR 免费 10h/月, TTS 有免费额度
+BAIDU_APP_ID = os.getenv("BAIDU_APP_ID", "")
+BAIDU_API_KEY = os.getenv("BAIDU_API_KEY", "")
+BAIDU_SECRET_KEY = os.getenv("BAIDU_SECRET_KEY", "")
+_baidu_token = {"token": "", "at": 0.0}
+_baidu_token_lock = threading.Lock()
+BAIDU_TOKEN_FILE = os.path.join(DATA_DIR, ".baidu_token.json")
+# 启动时从磁盘恢复百度 token，避免重启后冷启动
+if os.path.exists(BAIDU_TOKEN_FILE):
+    try:
+        with open(BAIDU_TOKEN_FILE) as f:
+            saved = json.load(f)
+            if isinstance(saved, dict) and saved.get("token"):
+                _baidu_token["token"] = saved["token"]
+                _baidu_token["at"] = saved.get("at", 0.0)
+    except Exception:
+        pass
 # 支持多GLM密钥故障转移(GLM_KEY, GLM_KEY_2, GLM_KEY_3...)
 _glm_keys = [os.getenv("GLM_KEY", "")]
 for i in range(2, 6):
@@ -46,25 +59,19 @@ def _rotate_glm_key() -> bool:
     _glm_key_idx = (_glm_key_idx + 1) % len(_glm_keys)
     log.warning(f"[glm] 密钥故障转移: 切换到密钥#{_glm_key_idx + 1}")
     return True
-TTS_VOICE = os.getenv("TTS_VOICE", "Cherry")
-TTS_MODEL = os.getenv("TTS_MODEL", "qwen3-tts-flash")
 EMPTY_ASR_TEXT = "(未识别到语音)"
 EMPTY_ASR_REPLY = "抱歉，我没听清，请再说一遍。"
 LOW_INTENT_ASR_REPLY = "嗯嗯，我在。"
 MAX_RETRIES = 3
-RETRY_BACKOFF = [5, 15, 30]  # 秒，逐次递增 (429限流退避)
-RETRY_AFTER_CAP = float(os.getenv("ASSISTANT_KID_RETRY_AFTER_CAP", "5"))
-TTS_CACHE_TTL = int(os.getenv("ASSISTANT_KID_TTS_CACHE_TTL", "300"))
-TTS_CACHE_MAX = int(os.getenv("ASSISTANT_KID_TTS_CACHE_MAX", "128"))
-TTS_CACHE_MAX_CHARS = int(os.getenv("ASSISTANT_KID_TTS_CACHE_MAX_CHARS", "80"))
-TTS_FAILURE_COOLDOWN = float(os.getenv("ASSISTANT_KID_TTS_FAILURE_COOLDOWN", "5"))
+RETRY_BACKOFF = [3, 10, 30]  # 秒，429限流退避(第1次3s, 第2次10s, 第3次30s)
+RETRY_AFTER_CAP = float(os.getenv("ASSISTANT_KID_RETRY_AFTER_CAP", "60"))  # 尊重服务端Retry-After, 最大60s
 INTENT_FAILURE_THRESHOLD = int(os.getenv("ASSISTANT_KID_INTENT_FAILURE_THRESHOLD", "2"))
 INTENT_FAILURE_COOLDOWN = float(os.getenv("ASSISTANT_KID_INTENT_FAILURE_COOLDOWN", "30"))
 
 _LOW_INTENT_STRIP_RE = re.compile(
     r"[\s，。！？、,.!?~～…\-—_:：；;\"'“”‘’（）()【】\[\]{}<>《》〈〉]+"
 )
-_LOW_INTENT_FILLER_CHARS = set("嗯哦啊呃哈噢喔诶")
+_LOW_INTENT_FILLER_CHARS = set("嗯哦啊呃哈噢喔诶呀吧呢嘛哎")
 _LOW_INTENT_ENGLISH_RE = re.compile(
     r"^(?:h+m+|u(?:h+|m+|hm+)|a+h+|o+h+|e+r+m?)$"
 )
@@ -80,6 +87,52 @@ def is_low_intent_asr(text: str) -> bool:
     if _LOW_INTENT_ENGLISH_RE.fullmatch(normalized):
         return True
     return all(char in _LOW_INTENT_FILLER_CHARS for char in normalized)
+
+
+# 常见中文虚词/功能词（不成句时大概率是ASR碎片）
+_GARBLED_FILLER_CHARS = set('的了呢吗啊哦呃呀吧哼哈嘿哟哎嗯呜喵喂嗨')
+
+# 有效中文短指令中常见动词/名词（如果文本完全不包含这些，大概率是碎片）
+_VALID_ROOT_CHARS = set('在打开关几现点今明后天气温度电视空调提醒日程搜索文件读写取消停止继续对好好的播放音乐随机首歌听唱暂停换下一首上一首')
+
+# 低意图/碎词语料：这些词虽短但有效，不应判定为乱码
+_VALID_SHORT_TEXTS = {
+    '你好', '谢谢', '好的', '谢谢', '再见', '可以', '不行', '没有',
+    '几点了', '几点啦', '在吗', '在听吗', '打开空调', '关闭空调',
+    '打开电视', '关闭电视', '帮我打开空调', '帮我关闭空调', '开空调', '关空调',
+    '现在几点了', '现在几点', '在听吗', '打开', '关闭',
+    '调温度', '调低', '调高', '搜索', '取消', '停止', '继续',
+    '在不在', '在不在呀', '在不在啊', '你以在吗', '你在吗', '在不在呢',
+    '怎么了', '干嘛', '干啥', '咋了', '啥事', '什么事',
+}
+
+
+def is_garbled_asr(text: str) -> bool:
+    """判断 ASR 输出是否为乱码/碎片（不构成有效指令）。"""
+    if not text:
+        return False
+    stripped = text.strip(" ，。！？、,.!?~～…—_:：；;\"'""''（）()【】[]{}<>《》〈〉\n\r\t")
+    if not stripped:
+        return True
+    length = len(stripped)
+    # 1. 已知的短指令 → 有效
+    if stripped in _VALID_SHORT_TEXTS or stripped.rstrip('。？!') in _VALID_SHORT_TEXTS:
+        return False
+    # 2. 纯虚词/语气词堆叠（≤8字）→ 乱码
+    if length <= 8 and all(c in _GARBLED_FILLER_CHARS for c in stripped):
+        return True
+    # 3. 极短碎片（≤2字且不含有效字符）→ 乱码（如纯标点、纯空格、乱码碎片）
+    if length <= 2 and not any(c in _VALID_ROOT_CHARS for c in stripped):
+        return True
+    # 4. 长文本（≥6字）但不含任何有效动词/名词根 → 乱码
+    if length >= 6 and not any(c in _VALID_ROOT_CHARS for c in stripped):
+        return True
+    # 5. 长度适中但虚词占比 ≥ 60% → 乱码（碎片句）
+    if 5 <= length <= 12:
+        filler_count = sum(1 for c in stripped if c in _GARBLED_FILLER_CHARS)
+        if filler_count >= length * 0.6:
+            return True
+    return False
 
 # ===== 连接池复用(调优: max_connections=10, keep_alive=30s) =====
 import requests.adapters
@@ -128,66 +181,6 @@ def _cache_set(text: str, reply: str, interrupted_reply: str = "") -> None:
     else:
         key = f"text\x00{text.strip().lower()}"
     _cache[key] = (reply, time.time())
-
-# ===== TTS MP3缓存(短句复用, 降低Finna TTS限流概率) =====
-_tts_cache = {}
-_tts_cache_lock = threading.Lock()
-_tts_unavailable_until = 0.0
-_tts_state_lock = threading.Lock()
-_tts_failures = 0          # TTS连续失败计数
-TTS_FAILURE_THRESHOLD = 3  # 连续失败阈值
-
-def _tts_cache_key(text: str, voice: str, model: str) -> str:
-    return f"{voice}\x00{model}\x00{text.strip().lower()}"
-
-def _tts_cache_get(
-    text: str,
-    voice: Optional[str] = None,
-    model: Optional[str] = None,
-    *,
-    cleaned: bool = False,
-) -> Optional[bytes]:
-    """获取短期TTS MP3缓存；只缓存短句，避免长回复占用过多内存。"""
-    voice = voice or TTS_VOICE
-    model = model or TTS_MODEL
-    cleaned_text = text.strip() if cleaned else _clean_for_tts(text).strip()
-    if not cleaned_text or len(cleaned_text) > TTS_CACHE_MAX_CHARS:
-        return None
-    key = _tts_cache_key(cleaned_text, voice, model)
-    now = time.time()
-    with _tts_cache_lock:
-        cached = _tts_cache.get(key)
-        if not cached:
-            return None
-        audio, ts = cached
-        if now - ts < TTS_CACHE_TTL:
-            _tts_cache[key] = (audio, now)
-            return audio
-        _tts_cache.pop(key, None)
-    return None
-
-def _tts_cache_set(
-    text: str,
-    audio: bytes,
-    voice: Optional[str] = None,
-    model: Optional[str] = None,
-    *,
-    cleaned: bool = False,
-) -> None:
-    """只缓存成功生成的非空TTS MP3。"""
-    if not audio or len(audio) < 100:
-        return
-    voice = voice or TTS_VOICE
-    model = model or TTS_MODEL
-    cleaned_text = text.strip() if cleaned else _clean_for_tts(text).strip()
-    if not cleaned_text or len(cleaned_text) > TTS_CACHE_MAX_CHARS:
-        return
-    key = _tts_cache_key(cleaned_text, voice, model)
-    now = time.time()
-    with _tts_cache_lock:
-        if key not in _tts_cache and len(_tts_cache) >= TTS_CACHE_MAX:
-            _tts_cache.pop(next(iter(_tts_cache)))
-        _tts_cache[key] = (audio, now)
 
 # ===== 对话历史(多会话, 跨请求持久化) =====
 _history = []  # 默认会话历史(向后兼容)
@@ -468,7 +461,7 @@ def _trim_history_tokens(hist: list, max_tokens: int = MAX_CONTEXT_TOKENS, sessi
         combined = (old_sum + ", " + new_part) if old_sum else new_part
         _context_summaries[session_id] = combined[-MAX_SUMMARY_LEN:]
         if session_id == "default":
-            invalidate_system_msg_cache()
+            pass
         log.info(f"[context] {session_id[:8]} summary: {_context_summaries[session_id][:60]}")
     log.debug(f"[context] 截断至{len(hist)}条({total}tok, 预算{max_tokens})")
 
@@ -590,7 +583,6 @@ def _refresh_preferences_if_changed() -> bool:
         _preferences_file_signature = new_signature
         _bump_preferences_revision()
 
-    invalidate_system_msg_cache()
     return True
 
 def _save_preferences() -> None:
@@ -656,7 +648,6 @@ def _commit_preferences(mutate: Callable[[dict], Any]) -> Any:
 def set_preference(key: str, value: str) -> str:
     """设置用户偏好(供MCP工具调用)"""
     _commit_preferences(lambda prefs: prefs.__setitem__(key, value))
-    invalidate_system_msg_cache()
     log.info(f"[prefs] 设置偏好: {key}={value[:30]}")
     return f"已记住：{key}={value}"
 
@@ -712,28 +703,61 @@ def del_preference(key: str) -> str:
 
     found = _commit_preferences(remove_key)
     if found:
-        invalidate_system_msg_cache()
         return f"已忘记：{key}"
     return f"未找到偏好：{key}"
 
 _load_preferences()
 
-# 系统提示词缓存(30秒刷新, 省文件I/O)
-_system_msg_cache = ""
-_system_msg_cache_time = 0
+# 系统提示词不含缓存，每次构建时自动刷新时间/待办等动态信息
 
-def invalidate_system_msg_cache() -> None:
-    """偏好、摘要或待办变化后让系统提示词立即重建。"""
-    global _system_msg_cache, _system_msg_cache_time
-    _system_msg_cache = ""
-    _system_msg_cache_time = 0
+# 按意图的工具说明: 每个意图只列出该MCP相关的工具
+_MCP_SYSTEM_PROMPTS = {
+    "amap-maps": (
+        "可用工具：get_detailed_weather(城市)查详细天气+穿衣建议，get_location()获取当前位置。"
+        "调用工具获取真实数据，不要编造天气信息。"
+    ),
+    "magic-music": (
+        "可用工具：play_music(歌名或歌手名)搜索并播放音乐，search_music(关键词)搜索歌曲，"
+        "play_random_music()随机播放一首，stop_music()停止播放，"
+        "list_playlists()列出歌单，play_playlist()播放歌单或每日推荐。"
+        "\\n播放音乐时不要说话，直接调用工具，不要回复任何文字。"
+    ),
+    "magic-reminder": (
+        "可用工具：add_reminder(文本, 时间)设提醒，set_timer(分钟数, 提示语)倒计时，"
+        "get_calendar_today()读取Apple日历。"
+    ),
+    "magic-notes": (
+        "可用工具：save_note(标题, 内容)保存备忘录，list_notes()列出所有备忘录。"
+    ),
+    "magic-system": (
+        "可用工具：set_volume(0-100)调音量，set_speech_speed(slow/normal/fast)调语速，"
+        "system_status()查CPU/内存/磁盘/运行时间。"
+    ),
+    "magic-info": (
+        "可用工具：get_current_time()获取当前时间，get_detailed_weather(城市)查天气+穿衣建议，"
+        "get_news(主题, 条数)查新闻，get_location()获取当前位置，"
+        "translate(文本, 目标语言)翻译，calculate(算式)计算或换算。"
+    ),
+    "magic-life": (
+        "可用工具：open_lifestyle_app(intent)打开外卖/购物/打车等App，"
+        "search_charging_stations(城市)查充电桩，control_tesla_ac(on/off)控特斯拉空调，"
+        "leaving_home()出门场景（关空调+播天气+待办）。"
+    ),
+    "baize-skills": (
+        "可用工具：搜索互联网获取实时信息。调用搜索工具获取真实结果，不要编造。"
+    ),
+    "filesystem": (
+        "可用工具：读写文件。可以读写用户指定路径的文件。"
+    ),
+    "ac-control": (
+        "可用工具：ac_control(on/off/cool/heat/dry/auto)控制空调，tv_control(power/volume_up/...)控制电视。"
+        "工具调用如果没成功，如实说\"没控制成功，可能设备没连上\"。"
+    ),
+}
 
-def _build_system_msg() -> str:
-    global _system_msg_cache, _system_msg_cache_time
+def _build_system_msg(mcp_set: str = "none") -> str:
+    """按意图构建 system prompt: 基础规则 + 相关工具说明"""
     now = datetime.datetime.now()
-    # 30秒内复用缓存(时间变化不大, 没必要每次读文件)
-    if _system_msg_cache and (time.time() - _system_msg_cache_time) < 30:
-        return _system_msg_cache
     weekdays = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
     h = now.hour
     if 5 <= h < 9: period = "清晨"
@@ -742,7 +766,6 @@ def _build_system_msg() -> str:
     elif 14 <= h < 18: period = "下午"
     elif 18 <= h < 23: period = "晚上"
     else: period = "深夜"
-    # 动态加载今日待办数量；复用提醒文件锁和畸形记录过滤。
     try:
         from app.reminders import _load_reminders
         rems = _load_reminders()
@@ -753,7 +776,6 @@ def _build_system_msg() -> str:
         todo_ctx = ""
     ctx = (f"当前时间：{now.strftime('%Y年%m月%d日')} {weekdays[now.weekday()]} "
            f"{period} {now.strftime('%H:%M')}。{todo_ctx}。")
-    # 加载用户偏好到系统提示词
     prefs_ctx = ""
     prefs = list_preferences()
     if prefs:
@@ -761,15 +783,22 @@ def _build_system_msg() -> str:
         prefs_ctx = f"\n用户偏好(请主动应用)：{'，'.join(prefs_items)}。"
     summary = _context_summaries.get("default", "")
     summary_ctx = f"\n之前对话过的内容: {summary}。" if summary else ""
+    # 基础规则(所有意图都适用)
     result = (f"你是Charlie，用户的私人AI助理。{ctx}{prefs_ctx}{summary_ctx}\n"
-            "回复简洁口语化，不超过3句。能用工具就用工具，给真实数据。\n"
-            "你能做的：查天气/地图、设提醒/日程、搜索互联网、读写文件、控制空调/电视。\n"
-            "控制空调用ac_control工具(参数: on/off/cool/heat/dry/auto)，控制电视用tv_control工具(参数: power/volume_up/volume_down/channel_up/channel_down/home/input_source)。\n"
-            "你不能做的：修改自己的代码、打电话/发短信。\n"
-            "如果用户要你做做不到的事，直接说\"这个我做不了\"，不要说\"我帮你记下\"然后不做。\n"
-            "报时间时直接说\"现在是X点X分\"，不要加\"按你设备时间\"等限定前缀。")
-    _system_msg_cache = result
-    _system_msg_cache_time = time.time()
+                "原则：\n"
+                "0. 禁止输出任何占用语（\"让我想想\"\"稍等一下\"\"嗯\"\"让我思考一下\"\"想一想\"\"让我看看\"\"我看看\"\"好的\"\"好\"\"嗯嗯\"等），"
+                "想好了直接说答案，直接输出第一句就是答案。\n"
+                "1. 回复极简，能1句说完不用2句。绝不寒暄——用户说\"你好\"你回\"在呢，说\"，不说\"嘿又见面啦今天怎么样\"。\n"
+            "2. 用户说\"在吗\"只回\"在\"，不多说。\n"
+            "3. 能用工具就用工具，给真实数据。\n"
+            "4. 如果用户要你做做不到的事，直接说\"这个我做不了\"。\n"
+            "5. 工具调用如果没成功，如实说\"没控制成功，可能设备没连上\"，不要假装成功。\n"
+            "6. 报时间直接说\"现在X点X分\"，不加任何前缀。\n"
+            "7. 如果用户输入看起来是ASR误识别（不成句的碎片），回\"没听清，再说一遍？\"。\n")
+    # 按意图追加工具说明
+    tools_doc = _MCP_SYSTEM_PROMPTS.get(mcp_set, "")
+    if tools_doc:
+        result += f"\n{tools_doc}\n"
     return result
 
 # ===== 带重试的请求封装 =====
@@ -823,7 +852,9 @@ def _retry(fn, name: str = "请求") -> Any:
             last_exc = e
             if attempt < MAX_RETRIES - 1:
                 delay = _retry_after_delay(response, attempt)
-                log.warning(f"{name}第{attempt+1}次失败: {message}，{delay:g}秒后重试...")
+                # 加30% jitter防止thundering herd
+                delay += random.uniform(0, delay * 0.3)
+                log.warning(f"{name}第{attempt+1}次失败: {message}，{delay:.0f}秒后重试...")
                 time.sleep(delay)
             else:
                 log.warning(f"{name}第{attempt+1}次失败: {message}，放弃")
@@ -856,124 +887,196 @@ def _retry(fn, name: str = "请求") -> Any:
     raise Exception(f"{name}失败: {_exception_message(last_exc)}") from last_exc
 
 # ===== TTS: 文字 → 音频bytes =====
+def _tts_unisound(text: str) -> bytes:
+    """云知声 U2-TTS (异步上传文本→轮询→下载音频) — 返回 WAV bytes"""
+    import tempfile, subprocess, json as _json
+    from pathlib import Path
+    script = Path(__file__).resolve().parent / "skills" / "u2-tts-pro" / "scripts" / "synthesize_speech.py"
+    if not script.exists():
+        raise RuntimeError(f"云知声TTS技能未安装: {script}")
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        tmp = f.name
+    try:
+        r = subprocess.run(
+            [sys.executable, str(script),
+             "--voice-id", "cn_male_chenyu_fluent",
+             "--text", text,
+             "--format", "pcm",
+             "--audio-sample-rate", "16000",
+             "--output-path", tmp],
+            capture_output=True, timeout=120, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"云知声TTS失败: {r.stderr}")
+        data = _json.loads(r.stdout)
+        path = data.get("summary", {}).get("downloaded_file_path", "")
+        if path and Path(path).exists():
+            return Path(path).read_bytes()
+        raise RuntimeError(f"云知声TTS: 未获取音频文件, 返回 {data.get('summary', {})}")
+    finally:
+        try: os.unlink(tmp)
+        except: pass
+
 def tts(text: str) -> bytes:
-    """文字→语音(WAV bytes), 带重试"""
-    global _tts_unavailable_until
+    """文字→语音(WAV bytes) — 百度智能云 → 云知声(备用)"""
     cleaned = _clean_for_tts(text).strip()
     if not cleaned:
         return b""
-    now = time.time()
-    with _tts_state_lock:
-        unavailable_until = _tts_unavailable_until
-    if now < unavailable_until:
-        raise TTSUnavailableError("TTS服务暂时不可用")
-
-    def _do():
-        r = _session.post(f"{FINNA}/audio/speech",
-            headers={"Authorization": f"Bearer {TTS_KEY}", "Content-Type": "application/json"},
-            json={"model": TTS_MODEL, "input": cleaned, "voice": TTS_VOICE, "pitch": -5},
-            stream=True, timeout=(5, 30))
-        r.raise_for_status()
-        audio = b""
-        for line in r.iter_lines():
-            if not line: continue
-            line = line.decode('utf-8', 'ignore')
-            if line.startswith("data:"):
-                try: d = json.loads(line[5:].strip())
-                except json.JSONDecodeError: continue
-                if "delta" in d.get("type", "") and d.get("audio"):
-                        audio += base64.b64decode(d["audio"])
-        return audio
     try:
-        audio = _retry(_do, "TTS")
+        return _tts_baidu(cleaned)
     except Exception as e:
-        global _tts_failures
-        _tts_failures += 1
-        log.error(f"TTS最终失败(#{_tts_failures}): {e}")
-        with _tts_state_lock:
-            _tts_unavailable_until = time.time() + TTS_FAILURE_COOLDOWN
-        raise TTSUnavailableError(f"TTS服务暂时不可用: {e}") from e
-    with _tts_state_lock:
-        if _tts_unavailable_until:
-            _tts_unavailable_until = 0.0
-    _tts_failures = 0  # 成功后重置计数
-    return audio
+        log.warning(f"百度TTS失败，降级到云知声: {e}")
+    try:
+        return _tts_unisound(cleaned)
+    except Exception as e:
+        log.error(f"TTS最终失败: {e}")
+        return b""
 
 def tts_status() -> Dict[str, Any]:
-    """只读 TTS 冷却状态，供 /api/status 展示。"""
-    now = time.time()
-    with _tts_state_lock:
-        unavailable_until = _tts_unavailable_until
-    remaining = max(0.0, unavailable_until - now)
+    """TTS 状态 (百度在线)"""
     return {
-        "active": remaining > 0,
-        "remaining_seconds": round(remaining, 1),
-        "cooldown_seconds": TTS_FAILURE_COOLDOWN,
-        "consecutive_failures": _tts_failures,
-        "failure_threshold": TTS_FAILURE_THRESHOLD,
+        "active": False,
+        "remaining_seconds": 0,
+        "cooldown_seconds": 0,
+        "consecutive_failures": 0,
+        "failure_threshold": 0,
     }
 
 # ===== ASR: 音频bytes → 文字 =====
-# 本地 SenseVoiceSmall 微服务 (127.0.0.1:8766) 替换 Finna 云端 ASR
-# 延迟: 0.49s (本地) vs 0.98s (Finna), 快 50%, 无 429 限流
-_LOCAL_ASR_URL = os.getenv("LOCAL_ASR_URL", "http://127.0.0.1:8766/asr")
-_LOCAL_ASR_ENABLED = os.getenv("LOCAL_ASR_ENABLED", "1") == "1"
-# 本地 TTS 微服务 (Qwen3-TTS-0.6B-4bit, mlx-audio, 端口 8767)
-_LOCAL_TTS_URL = os.getenv("LOCAL_TTS_URL", "http://127.0.0.1:8767")
-_LOCAL_TTS_ENABLED = os.getenv("LOCAL_TTS_ENABLED", "1") == "1"
+# 百度智能云(免费, 0.38s) → 降级云知声(备用, 1.8亿Credits)
 
-def _asr_local(audio_bytes: bytes, fmt: str = "mp3") -> str:
-    """本地 SenseVoiceSmall ASR (FunASR + MLX)"""
-    # 先转 WAV 格式（本地服务需要 soundfile 可读）
-    if fmt != "wav":
-        try:
-            import subprocess
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"],
-                input=audio_bytes, capture_output=True, timeout=10)
-            audio_bytes = r.stdout if r.stdout and len(r.stdout) > 100 else audio_bytes
-        except Exception:
-            pass  # 转换失败直接送原始音频
-
-    r = _session.post(_LOCAL_ASR_URL,
-        files={"file": ("input.wav", audio_bytes, "audio/wav")},
-        timeout=(3, 5))
-    r.raise_for_status()
-    data = r.json()
-    return data.get("text", "").strip()
-
-def _asr_finna(audio_bytes: bytes, fmt: str = "mp3") -> str:
-    """Finna 云端 ASR (fallback)"""
-    r = _session.post(f"{FINNA}/audio/transcriptions",
-        headers={"Authorization": f"Bearer {ASR_KEY}"},
-        files={"file": (f"input.{fmt}", audio_bytes, f"audio/{fmt}")},
-        data={"model": "qwen3-asr-flash"}, stream=True, timeout=(5, 30))
-    r.raise_for_status()
-    text = ""
-    for line in r.iter_lines():
-        if not line: continue
-        line = line.decode('utf-8', 'ignore')
-        if line.startswith("data:"):
-            try: d = json.loads(line[5:].strip())
-            except json.JSONDecodeError: continue
-            if d.get("type") == "transcript.text.done":
-                text = d.get("text", "")
-            elif d.get("type") == "transcript.text.delta" and not text:
-                text = d.get("delta", "")
-    return text
+def _asr_unisound(audio_bytes: bytes, fmt: str = "mp3") -> str:
+    """云知声 U2-ASR (异步上传→轮询→获取结果)"""
+    import tempfile, subprocess, json as _json
+    from pathlib import Path
+    script = Path(__file__).resolve().parent / "skills" / "u2-asr-pro" / "scripts" / "transcribe_audio.py"
+    if not script.exists():
+        raise RuntimeError(f"云知声ASR技能未安装: {script}")
+    with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as f:
+        f.write(audio_bytes)
+        tmp = f.name
+    try:
+        r = subprocess.run(
+            [sys.executable, str(script), tmp, "--language", "zh-CN"],
+            capture_output=True, timeout=90, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"云知声ASR失败: {r.stderr}")
+        data = _json.loads(r.stdout)
+        preview = data.get("summary", {}).get("transcript_preview", "")
+        return preview.strip()
+    finally:
+        try: os.unlink(tmp)
+        except: pass
 
 def asr(audio_bytes: bytes, fmt: str = "mp3") -> str:
-    """ASR: 优先本地 SenseVoiceSmall, 失败时 fallback 到 Finna 云端"""
-    if _LOCAL_ASR_ENABLED:
-        try:
-            return _asr_local(audio_bytes, fmt)
-        except Exception as e:
-            log.warning(f"本地ASR失败，降级到Finna: {e}")
+    """ASR: 百度智能云 → 云知声(备用)"""
     try:
-        return _retry(lambda: _asr_finna(audio_bytes, fmt), "ASR")
+        return _asr_baidu(audio_bytes, fmt)
+    except Exception as e:
+        log.warning(f"百度ASR失败，降级到云知声: {e}")
+    try:
+        return _asr_unisound(audio_bytes, fmt)
     except Exception as e:
         log.error(f"ASR最终失败: {e}")
         return ""
+
+
+# ===== 百度智能云语音 (免费额度: 实时ASR 10h/月) =====
+def _baidu_get_token() -> str:
+    """获取百度 access_token (缓存到过期前1天)"""
+    now = time.time()
+    with _baidu_token_lock:
+        if _baidu_token["token"] and now - _baidu_token["at"] < 86400 * 28:
+            return _baidu_token["token"]
+    url = "https://aip.baidubce.com/oauth/2.0/token"
+    r = _session.post(url, params={
+        "grant_type": "client_credentials",
+        "client_id": BAIDU_API_KEY,
+        "client_secret": BAIDU_SECRET_KEY,
+    }, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    token = data.get("access_token", "")
+    with _baidu_token_lock:
+        _baidu_token["token"] = token
+        _baidu_token["at"] = now
+    # 持久化到磁盘，重启后热启动
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=DATA_DIR, prefix=".baidu_token_tmp", suffix=".json", delete=False
+        ) as f:
+            json.dump({"token": token, "at": now}, f)
+            f.flush()
+            os.fsync(f.fileno())
+            os.replace(f.name, BAIDU_TOKEN_FILE)
+    except Exception:
+        pass
+    return token
+
+
+def _asr_baidu(audio_bytes: bytes, fmt: str = "mp3") -> str:
+    """百度短语音识别 (REST API, 免费 10万次/企业)"""
+    # 百度 ASR 需要 PCM 格式 (去 WAV header) 或完整 WAV
+    # 先转 16kHz mono PCM
+    import base64
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "16000", "-ac", "1",
+             "-f", "wav", "pipe:1"],
+            input=audio_bytes, capture_output=True, timeout=10)
+        if r.stdout and len(r.stdout) > 100:
+            # 去掉 WAV header (前44字节), 只发 PCM
+            wav = r.stdout
+            audio_bytes = wav[44:] if len(wav) > 44 else wav
+            fmt = "pcm"
+    except Exception:
+        pass
+
+    token = _baidu_get_token()
+    speech_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    speech_len = len(audio_bytes)
+
+    # 注意: token 和 dev_pid 必须放在 JSON body 里, 不能放 URL params
+    # dev_pid 1537 = 普通话近场模型 (默认)
+    r = _session.post("https://vop.baidu.com/server_api",
+         json={
+             "format": fmt, "rate": 16000, "channel": 1,
+             "token": str(token),
+             "cuid": "charlie-mac",
+             "dev_pid": 1537,
+             "speech": speech_b64, "len": speech_len,
+         }, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    err_no = data.get("err_no", -1)
+    if err_no != 0:
+        raise RuntimeError(f"百度ASR错误 {err_no}: {data.get('err_msg', '')}")
+    return data.get("result", [""])[0]
+
+
+def _tts_baidu(text: str) -> bytes:
+    """百度在线 TTS (免费额度, 女声/男声)"""
+    token = _baidu_get_token()
+    # per=0 女声, per=1 男声, per=4 度逍遥(男), per=5 度小丫(女)
+    url = "https://tsn.baidu.com/text2audio"
+    r = _session.post(url, data={
+        "tex": text,
+        "tok": token,
+        "cuid": "charlie-mac",
+        "ctp": 1,
+        "lan": "zh",
+        "spd": 5,
+        "pit": 5,
+        "vol": 9,
+        "per": 3,  # 度逍遥(成熟男声)
+        "aue": 6,  # 6=MP3, 3=WAV
+    }, timeout=15)
+    content_type = r.headers.get("Content-Type", "")
+    if "json" in content_type:
+        err = r.json()
+        raise RuntimeError(f"百度TTS错误 {err.get('err_no', -1)}: {err.get('err_msg', '')}")
+    r.raise_for_status()
+    return r.content
 
 # ===== 大脑: deepseek-v4-flash + Qwen-Agent + MCP =====
 _UNKNOWN_KWARG_RE = re.compile(r"got an unexpected keyword argument '([^']+)'")
@@ -1043,8 +1146,18 @@ def _build_brain(mcp_set="all"):
     all_mcp = {
         "amap-maps": {"command": "npx", "args": ["-y", "@amap/amap-maps-mcp-server"],
             "env": {"AMAP_MAPS_API_KEY": os.getenv("AMAP_KEY", "")}},
-        "magic-phone": {"command": sys.executable,
-            "args": ["mcp_server.py"], "cwd": os.getcwd()},
+        "magic-music": {"command": sys.executable,
+            "args": ["magic-music.py"], "cwd": os.getcwd()},
+        "magic-reminder": {"command": sys.executable,
+            "args": ["magic-reminder.py"], "cwd": os.getcwd()},
+        "magic-notes": {"command": sys.executable,
+            "args": ["magic-notes.py"], "cwd": os.getcwd()},
+        "magic-system": {"command": sys.executable,
+            "args": ["magic-system.py"], "cwd": os.getcwd()},
+        "magic-info": {"command": sys.executable,
+            "args": ["magic-info.py"], "cwd": os.getcwd()},
+        "magic-life": {"command": sys.executable,
+            "args": ["magic-life.py"], "cwd": os.getcwd()},
         "baize-skills": {"command": sys.executable,
             "args": ["baize_skills_mcp.py"], "cwd": os.getcwd(),
             "env": {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", ""),
@@ -1056,7 +1169,7 @@ def _build_brain(mcp_set="all"):
             "args": ["mcp_ir_control.py"], "cwd": os.getcwd()},
     }
     # 按意图路由选择MCP
-    enabled_env = os.getenv("MCP_SERVERS", "amap-maps,magic-phone,baize-skills,filesystem").split(",")
+    enabled_env = os.getenv("MCP_SERVERS", "amap-maps,baize-skills,filesystem,magic-music,magic-reminder,magic-notes,magic-system,magic-info,magic-life").split(",")
     enabled_env = [s.strip() for s in enabled_env if s.strip()]
     if mcp_set == "none":
         mcp_servers = {}
@@ -1067,7 +1180,7 @@ def _build_brain(mcp_set="all"):
     log.info(f"[brain] 构建大脑 mcp_set={mcp_set}, 启用{len(mcp_servers)}个MCP: {list(mcp_servers.keys())}")
     tools = [{"mcpServers": mcp_servers}] if mcp_servers else []
     brain = Assistant(llm=llm_cfg, name='Charlie',
-        system_message=_build_system_msg(),
+        system_message=_build_system_msg(mcp_set),
         function_list=tools)
     _install_openai_compat(brain)
     return brain
@@ -1079,9 +1192,10 @@ _brain_failures = 0       # 连续失败计数
 _brain_total_failures = 0  # 累计失败总数（不重置）
 _brain_last_failure = 0   # 上次失败时间戳
 _brain_last_success = 0   # 上次成功时间戳
-_MAX_BRAIN_FAILURES = 3   # 连续失败3次后自动重建大脑
+_MAX_BRAIN_FAILURES = 5   # 连续失败5次后自动重建大脑(429限流单独阈值10)
 _intent_failures = 0
 _intent_disabled_until = 0.0
+_intent_cache = {}  # 独立意图缓存字典, 不与对话缓存冲突
 
 def intent_classifier_status() -> Dict[str, Any]:
     """只读本地意图分类熔断状态。"""
@@ -1098,8 +1212,8 @@ def intent_classifier_status() -> Dict[str, Any]:
 def _classify_intent(text: str) -> str:
     """用本地Ollama Qwen3快速判断意图(108ms vs Finna 1500ms),返回MCP组合名"""
     global _intent_failures, _intent_disabled_until
-    # 缓存: 相同文本不重复分类
-    cached_intent = _cache_get("__intent__:" + text)
+    # 缓存: 相同文本不重复分类 (使用独立缓存字典, 不与对话缓存冲突)
+    cached_intent = _intent_cache.get(text)
     if cached_intent:
         log.info(f"[intent] 缓存命中: {text[:30]} → {cached_intent}")
         return cached_intent
@@ -1107,11 +1221,57 @@ def _classify_intent(text: str) -> str:
     if now < _intent_disabled_until:
         log.info(f"[intent] 本地分类冷却中，{_intent_disabled_until - now:.0f}秒内默认none")
         return "none"
+    # 快速关键词预判: 如果文本明确包含领域关键词, 直接返回, 跳过Ollama调用
+    _KEYWORD_MAP = [
+        ({"天气", "气温", "下雨", "温度", "几度", "穿什么"}, "amap-maps"),
+        ({"地图", "导航", "附近", "我在哪", "路线", "怎么走", "到哪"}, "amap-maps"),
+        ({"搜索", "搜一下", "查一下", "查查", "百度", "谷歌", "购物", "买东西"}, "baize-skills"),
+        ({"提醒", "定时", "闹钟", "备忘", "日程", "日历", "待办", "记一下", "提醒我"}, "magic-reminder"),
+        ({"笔记", "备忘录", "记下来", "记一下"}, "magic-notes"),
+        ({"音量", "说慢", "说快", "语速", "大声", "小声"}, "magic-system"),
+        ({"状态", "运行", "负载", "设备"}, "magic-system"),
+        ({"新闻", "头条", "热点"}, "magic-info"),
+        ({"时间", "几点", "日期", "星期"}, "magic-info"),
+        ({"翻译", "翻成", "英语说", "怎么说"}, "magic-info"),
+        ({"计算", "算一下", "换算", "等于多少"}, "magic-info"),
+        ({"放歌", "播放", "听歌", "放周杰伦", "音乐", "歌单", "停止播放", "每日推荐", "随机"}, "magic-music"),
+        ({"空调", "电视", "制冷", "制热", "风扇", "开灯", "关灯"}, "ac-control"),
+        ({"文件", "读文件", "写文件", "笔记"}, "filesystem"),
+        ({"外卖", "点餐", "吃饭", "购物", "商品", "查一下", "充电桩", "特斯拉", "出门"}, "magic-life"),
+    ]
+    for keywords, mcp_name in _KEYWORD_MAP:
+        if any(kw in text for kw in keywords):
+            log.info(f"[intent] 关键词命中: '{text[:30]}' → {mcp_name}")
+            _intent_cache[text] = mcp_name
+            return mcp_name
     prompt = (
-        "判断需要哪个工具,只回一个词:none/amap-maps/baize-skills/filesystem/magic-phone/ac-control\n"
-        "none=聊天/计算/常识 amap=天气/地图/导航/我在哪/附近 baize=搜索/互联网/新闻/购物/位置 filesystem=文件 magic=提醒/日程 ac-control=空调/电视/温度/制冷/制热/风扇/开关/音量/频道\n"
-        "示例: 你好→none, 天气→amap-maps, 搜索→baize-skills, 提醒→magic-phone, 打开空调→ac-control, 打开电视→ac-control, 关闭电视→ac-control, 音量调大→ac-control\n"
-        f"输入:{text[:100]} →")
+        "任务: 判断用户输入需要哪个工具, 只回一个词\n"
+        "选项: none | amap-maps | baize-skills | filesystem | magic-music | magic-reminder | magic-notes | magic-system | magic-info | magic-life | ac-control\n"
+        "规则:\n"
+        "- none = 闲聊/问候/常识问答(你好/谢谢/讲个笑话)\n"
+        "- amap-maps = 天气/地图/导航/我在哪/附近/路线/温度/几度\n"
+        "- baize-skills = 搜索互联网/查资料/购物/买东西\n"
+        "- magic-music = 播放/歌单/音乐/随机播放\n"
+        "- magic-reminder = 提醒/日程/定时器/日历\n"
+        "- magic-notes = 备忘录/笔记\n"
+        "- magic-system = 音量/语速/设备状态\n"
+        "- magic-info = 时间/新闻/翻译/计算\n"
+        "- magic-life = 外卖/充电桩/特斯拉/出门\n"
+        "- ac-control = 空调/电视/制冷/制热/风扇/开关/频道/灯光\n"
+        "- filesystem = 文件/读写文件/笔记\n"
+        "示例:\n"
+        "  你好→none\n"
+        "  今天天气怎么样→amap-maps\n"
+        "  北京天气→amap-maps\n"
+        "  搜一下薛之谦→baize-skills\n"
+        "  帮我点杯咖啡→baize-skills\n"
+        "  设提醒→magic-reminder\n"
+        "  放歌→magic-music\n"
+        "  打开空调→ac-control\n"
+        "  音量调大→magic-system\n"
+        "  现在几点→magic-info\n"
+        f"用户输入: {text[:100]}\n"
+        "工具: →")
     try:
         r = _session.post("http://localhost:11434/api/chat",
             json={"model": "qwen3.5:2b",
@@ -1123,22 +1283,58 @@ def _classify_intent(text: str) -> str:
         # 后处理: 模型可能回 "magic"/"baize" 等截断词, 统一映射
         if "amap" in raw or "map" in raw: mcp = "amap-maps"
         elif "baize" in raw or "search" in raw: mcp = "baize-skills"
-        elif "magic" in raw or "remind" in raw: mcp = "magic-phone"
+        elif "music" in raw: mcp = "magic-music"
+        elif "remind" in raw: mcp = "magic-reminder"
+        elif "note" in raw: mcp = "magic-notes"
+        elif "system" in raw: mcp = "magic-system"
+        elif "info" in raw: mcp = "magic-info"
+        elif "life" in raw: mcp = "magic-life"
+        elif "magic" in raw: mcp = "magic-music"
         elif "ac" in raw or "air" in raw or "control" in raw: mcp = "ac-control"
         elif "file" in raw or "fs" in raw: mcp = "filesystem"
         else: mcp = "none"
         _intent_failures = 0
         _intent_disabled_until = 0.0
-        _cache_set("__intent__:" + text, mcp)
+        _intent_cache[text] = mcp
         log.info(f"[intent] '{text[:30]}' → {mcp} ({raw[:15]})")
         return mcp
     except Exception as e:
-        _intent_failures += 1
-        if _intent_failures >= INTENT_FAILURE_THRESHOLD:
-            _intent_disabled_until = now + INTENT_FAILURE_COOLDOWN
-            log.warning(f"[intent] 连续失败{_intent_failures}次，暂停本地分类{INTENT_FAILURE_COOLDOWN:g}秒")
-        log.warning(f"[intent] 本地分类失败,默认none: {e}")
-        return "none"
+        # 1次快速重试(避免偶发超时导致降级)
+        if not isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            # 非超时/连接错误, 不重试
+            _intent_failures += 1
+            if _intent_failures >= INTENT_FAILURE_THRESHOLD:
+                _intent_disabled_until = now + INTENT_FAILURE_COOLDOWN
+                log.warning(f"[intent] 连续失败{_intent_failures}次，暂停本地分类{INTENT_FAILURE_COOLDOWN:g}秒")
+            log.warning(f"[intent] 本地分类失败,默认none: text='{text[:20]}' err={e}")
+            return "none"
+        # 超时/连接错误: 重试1次
+        try:
+            r = _session.post("http://localhost:11434/api/chat",
+                json={"model": "qwen3.5:2b",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "stream": False, "think": False,
+                      "options": {"num_predict": 10, "temperature": 0}},
+                timeout=(3, 15))
+            raw = r.json().get("message", {}).get("content", "").strip().lower()
+            if "amap" in raw or "map" in raw: mcp = "amap-maps"
+            elif "baize" in raw or "search" in raw: mcp = "baize-skills"
+            elif "magic" in raw or "remind" in raw: mcp = "magic-phone"
+            elif "ac" in raw or "air" in raw or "control" in raw: mcp = "ac-control"
+            elif "file" in raw or "fs" in raw: mcp = "filesystem"
+            else: mcp = "none"
+            _intent_failures = 0
+            _intent_disabled_until = 0.0
+            _cache_set("__intent__:" + text, mcp)
+            log.info(f"[intent] '{text[:30]}' → {mcp} ({raw[:15]}) [重试成功]")
+            return mcp
+        except Exception as e2:
+            _intent_failures += 1
+            if _intent_failures >= INTENT_FAILURE_THRESHOLD:
+                _intent_disabled_until = now + INTENT_FAILURE_COOLDOWN
+                log.warning(f"[intent] 连续失败{_intent_failures}次，暂停本地分类{INTENT_FAILURE_COOLDOWN:g}秒")
+            log.warning(f"[intent] 本地分类重试仍失败,默认none: text='{text[:20]}' err={e2}")
+            return "none"
 
 def _get_brain(mcp_set="none"):
     """获取或构建指定MCP组合的大脑(带缓存)。
@@ -1150,7 +1346,7 @@ def _get_brain(mcp_set="none"):
             _brain_build_time = time.time()
         log.info(f"[brain] 大脑构建完成: mcp={mcp_set}, 缓存总数={len(_brains)}")
     # 刷新 system_message(时间、待办等每30s变化一次)
-    _brains[mcp_set].system_message = _build_system_msg()
+    _brains[mcp_set].system_message = _build_system_msg(mcp_set)
     return _brains[mcp_set]
 
 def _ensure_event_loop():
@@ -1166,9 +1362,19 @@ def _record_brain_failure(error: str = ""):
     _brain_failures += 1
     _brain_total_failures += 1
     _brain_last_failure = time.time()
-    log.error(f"[brain] 失败#{_brain_failures}(累计{_brain_total_failures}): {error}")
-    if _brain_failures >= _MAX_BRAIN_FAILURES:
-        log.warning(f"[brain] 连续失败{_brain_failures}次, 清除所有缓存大脑...")
+    # 429限流不应该清缓存(缓存重建代价大, 429是临时性的)
+    is_429 = '429' in error or 'Too Many' in error or 'rate' in error.lower()
+    log.error(f"[brain] 失败#{_brain_failures}(累计{_brain_total_failures}): {error}" +
+              (" [429限流, 不清缓存]" if is_429 else ""))
+    if not is_429 and _brain_failures >= _MAX_BRAIN_FAILURES:
+        log.warning(f"[brain] 连续失败{_brain_failures}次(非限流), 清除所有缓存大脑...")
+        for k, b in list(_brains.items()):
+            _cleanup_brain_processes(b)
+        _brains.clear()
+        _brain_failures = 0
+    elif is_429 and _brain_failures >= 10:
+        # 429连续10次才清(可能模型确实挂了)
+        log.warning(f"[brain] 429连续{ _brain_failures}次, 清除缓存大脑...")
         for k, b in list(_brains.items()):
             _cleanup_brain_processes(b)
         _brains.clear()
@@ -1227,16 +1433,158 @@ def brain_status() -> dict:
         "uptime_since": _dt.datetime.fromtimestamp(_brain_build_time).isoformat() if _brain_build_time else None,
     }
 
+def _ollama_fallback(text: str, messages: list) -> str:
+    """Finna失败时, 用本地Ollama做离线降级对话。无MCP, 纯文本对话。"""
+    try:
+        import requests as _req
+        # 用 qwen3.5:2b 做降级对话(和意图分类同一个模型, 已在Ollama上)
+        # 取最近几轮历史 + 当前输入
+        recent = messages[-6:] if len(messages) > 6 else messages
+        ollama_msgs = [{"role": m["role"], "content": m["content"]} for m in recent]
+        # 确保 system message 存在
+        if not ollama_msgs or ollama_msgs[0]["role"] != "system":
+            ollama_msgs.insert(0, {"role": "system", "content": "你是Charlie，用户的私人AI助理。回复极简，不寒暄。"})
+        r = _req.post("http://localhost:11434/api/chat", json={
+            "model": "qwen3.5:2b",
+            "messages": ollama_msgs,
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0.7, "num_predict": 200}
+        }, timeout=(2, 15))
+        if r.status_code == 200:
+            data = r.json()
+            reply = data.get("message", {}).get("content", "").strip()
+            if reply:
+                return reply
+        return ""
+    except Exception as e:
+        log.warning(f"[brain] Ollama降级也失败: {e}")
+        return ""
+
+_OLLAMA_SIMPLE_SYSTEM_MSG = (
+    "你是Charlie，用户的私人AI助理。当前时间：{time}。"
+    "用自然的中文回复，该长则长该短则短。"
+    "不要自称AI助手，直接回答问题。"
+    "不知道的就说不知道，别编造。"
+)
+
+def _ollama_simple_chat(text: str, session_id: str) -> str:
+    """意图=none 时走本地 Ollama 简单对话，跳过 Finna。"""
+    hist = _get_history(session_id)
+    now = datetime.datetime.now()
+    sys_msg = _OLLAMA_SIMPLE_SYSTEM_MSG.format(time=now.strftime('%Y-%m-%d %H:%M'))
+    msgs = [{"role": "system", "content": sys_msg}]
+    for m in hist[-6:]:
+        msgs.append({"role": m["role"], "content": m["content"]})
+    msgs.append({"role": "user", "content": text})
+    try:
+        r = _session.post("http://localhost:11434/api/chat", json={
+            "model": "qwen3.5:2b",
+            "messages": msgs,
+            "stream": False, "think": False,
+            "options": {"temperature": 0.7, "num_predict": 300}
+        }, timeout=(2, 15))
+        if r.status_code == 200:
+            reply = r.json().get("message", {}).get("content", "").strip()
+            if reply:
+                return reply
+    except Exception as e:
+        log.warning(f"[ollama] 简单对话失败: {e}")
+    return ""
+
+def _direct_music_play(text: str) -> str:
+    """音乐关键词命中时直接调用 ncm-cli，绕过 LLM，避免 429 限流和反复迭代。
+    返回 __MUSIC__url__name__artist 或空字符串(失败时)。"""
+    import subprocess, json as _json, random, re as _re
+    NCM = os.path.expanduser("~/.local/bin/ncm")
+    try:
+        # 判断是随机播放还是指定歌曲
+        is_random = any(kw in text for kw in ('随机', '随便', '来一首', '来首歌', '随便来', '随便播'))
+        
+        if is_random:
+            # 随机播放: 从每日推荐或播放记录中随机选
+            r = subprocess.run([NCM, "recommend", "songs", "--json"], capture_output=True, text=True, timeout=10)
+            songs = []
+            if r.returncode == 0 and r.stdout.strip():
+                data = _json.loads(r.stdout)
+                songs = data.get("recommend", []) or data.get("data", [])
+            if not songs:
+                r = subprocess.run([NCM, "record", "--json", "--limit", "30"], capture_output=True, text=True, timeout=10)
+                if r.returncode == 0 and r.stdout.strip():
+                    data = _json.loads(r.stdout)
+                    songs = data.get("data", []) or data.get("record", [])
+            if not songs:
+                return ""
+            song = random.choice(songs)
+            song_id = song["id"]
+            song_name = song.get("name", "")
+            ars = "/".join(a.get("name", "") for a in song.get("ar", []))
+        else:
+            # 指定歌曲: 从文本提取歌名/歌手名
+            # 去掉常见前缀词
+            keyword = text
+            for prefix in ('播放', '放', '唱', '听', '我想听', '我要听', '来首', '点歌', '点一首'):
+                keyword = keyword.replace(prefix, '')
+            keyword = keyword.strip().rstrip('。.,，！!')
+            if not keyword or len(keyword) < 1:
+                return ""
+            r = subprocess.run([NCM, "search", "song", keyword, "--limit", "1", "--json"], capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return ""
+            data = _json.loads(r.stdout)
+            songs = data.get("result", {}).get("songs", [])
+            if not songs:
+                return ""
+            song_id = songs[0]["id"]
+            song_name = songs[0]["name"]
+            ars = "/".join(a.get("name", "") for a in songs[0].get("ar", []))
+        
+        # 获取播放地址
+        r = subprocess.run([NCM, "url", str(song_id), "--level", "exhigh", "--json"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return ""
+        url_data = _json.loads(r.stdout)
+        _d = url_data.get("data", [])
+        url = _d[0].get("url", "") if isinstance(_d, list) and _d else (_d.get("url", "") if isinstance(_d, dict) else url_data.get("url", ""))
+        if not url:
+            return ""
+        # 强制 https
+        if url.startswith("http://"):
+            url = "https://" + url[7:]
+        elif url.startswith("//"):
+            url = "https:" + url
+        log.info(f"[music] ncm直连成功: {song_name} - {ars} ({len(url)}B URL)")
+        return f"__MUSIC__{url}__{song_name}__{ars}"
+    except Exception as e:
+        log.warning(f"[music] ncm直连异常: {e}")
+        return ""
+
 def brain(text: str, session_id: str = "default") -> str:
-    """大脑推理: 文字→deepseek-v4-flash+MCP→回复文字"""
-    # 缓存命中(60秒内相同查询直接返回)
+    """大脑推理: 意图=none走Ollama(本地,0.25s), ≠none走Finna+MCP(云,2s)"""
+    # 时间类查询直接返回实时时间，绕过LLM(避免缓存/历史污染/限流)
+    TIME_KEYWORDS = ('几点', '几点啦')
+    if any(kw in text for kw in TIME_KEYWORDS):
+        now = datetime.datetime.now()
+        reply = f"现在{now.strftime('%H点%M分')}。"
+        log.info(f"[time] 直接返回实时时间: {reply}")
+        return reply
+    # 音乐播放类查询直接路由到MCP，绕过LLM(避免反复迭代)
+    MUSIC_KEYWORDS = ('播放音乐', '播放歌', '随机播放', '放歌', '唱首歌', '放音乐', '来首歌', '听歌', '点歌', '我想听', '我要听')
+    if any(kw in text for kw in MUSIC_KEYWORDS):
+        log.info(f"[music] 音乐关键词命中，直接调用ncm绕过LLM: {text[:20]}")
+        music_reply = _direct_music_play(text)
+        if music_reply:
+            _append_history(_get_history(session_id), text, music_reply)
+            return music_reply
+        log.warning(f"[music] ncm直连失败，回退到brain")
+    # 缓存命中
     cached = _cache_get(text)
     if cached is not None:
         log.info(f"[cache] 命中: {text[:20]}")
         return cached
-    _ensure_event_loop()
-    # 意图路由: 判断需要哪些MCP
+    # 意图路由: 判断需要哪些MCP，全部走Finna deepseek-v4-flash + MCP
     mcp_set = _classify_intent(text)
+    _ensure_event_loop()
     try:
         brain_instance = _get_brain(mcp_set)
     except Exception as e:
@@ -1249,26 +1597,68 @@ def brain(text: str, session_id: str = "default") -> str:
         final = None
         for rsp in brain_instance.run(messages):
             final = rsp
+            # 检测到 __MUSIC__ 立即短路，避免 brain 反复迭代同一工具
+            if isinstance(rsp, list):
+                for m in rsp:
+                    if isinstance(m, dict) and m.get('role') == 'function' and isinstance(m.get('content'), str) and m['content'].startswith('__MUSIC__'):
+                        break
+                else:
+                    continue
+                break
         _record_brain_success()
     except Exception as e:
         _record_brain_failure(str(e)[:60])
+        # 离线降级: Finna失败时 fallback 到本地 Ollama
+        ollama_reply = _ollama_fallback(text, messages)
+        if ollama_reply:
+            log.info(f"[brain] Finna失败, Ollama降级成功: {ollama_reply[:30]}")
+            _append_history(hist, text, ollama_reply)
+            _cache_set(text, ollama_reply)
+            return ollama_reply
         return f"抱歉，我处理时出错了：{str(e)[:50]}"
 
     reply = "我没听明白"
     if final and isinstance(final, list):
-        for m in reversed(final):
-            if m.get('role') == 'assistant':
-                c = m.get('content')
-                if isinstance(c, str) and c.strip():
-                    reply = c
-                    break
-                elif isinstance(c, list):
-                    for part in c:
-                        if isinstance(part, dict) and part.get('text'):
-                            reply = part['text']
-                            break
-                    if reply != "我没听明白":
+        # 收集所有 function 消息的工具返回内容
+        func_replies = []
+        for m in final:
+            if m.get('role') == 'function' and m.get('content'):
+                c = str(m.get('content', ''))
+                if c.strip():
+                    func_replies.append(c)
+                    if c.startswith('__MUSIC__'):
+                        reply = c
                         break
+        # 如果找到 __MUSIC__ 直接返回
+        if reply.startswith('__MUSIC__'):
+            pass
+        # 没找到 __MUSIC__ 但有其他工具返回内容, 使用第一个非空内容
+        elif reply == "我没听明白" and func_replies:
+            reply = func_replies[0][:200]
+        # 如果没找到工具返回, 找 assistant 文字回复
+        if reply == "我没听明白":
+            for m in reversed(final):
+                if m.get('role') == 'assistant':
+                    c = m.get('content')
+                    if isinstance(c, str) and c.strip():
+                        reply = c
+                        break
+                    elif isinstance(c, list):
+                        for part in c:
+                            if isinstance(part, dict) and part.get('text'):
+                                reply = part['text']
+                                break
+                        if reply != "我没听明白":
+                            break
+        # 如果assistant content为空但有function_call(工具调用了但没生成文字)
+        # 生成一个默认回复
+        if reply == "我没听明白":
+            has_tool_call = any(m.get('function_call') for m in final if isinstance(m, dict))
+            has_music = any('__MUSIC__' in str(m.get('content','')) for m in final if isinstance(m, dict))
+            if has_music:
+                reply = "__MUSIC_PLAYING__"
+            elif has_tool_call:
+                reply = "好的，已执行。"
 
     # 更新历史+缓存
     _append_history(hist, text, reply)
@@ -1289,13 +1679,22 @@ _TTS_INLINE_CODE_RE = re.compile(r'`[^`]*`')
 _TTS_LIST_ITEM_RE = re.compile(r'^[-*+]\s+')
 _TTS_MARKDOWN_LINK_RE = re.compile(r'\[([^\]]*)\]\([^)]*\)')
 _TTS_WHITESPACE_RE = re.compile(r'\s{2,}')
-_MIN_CHUNK = 20  # 逗号处至少积累20字才切割(降低首句延迟)
+_MIN_CHUNK = 15  # 逗号处至少积累15字才切割(降低首句延迟)
 _MAX_CHUNK = 80  # 超过80字强制在下一个标点处切割
 
 def _extract_assistant_text(rsp: Any) -> str:
-    """从brain.run()的中间响应中提取assistant文本(累积)"""
+    """从brain.run()的中间响应中提取assistant文本(累积)。
+    也检查 function 角色的工具返回值(如 __MUSIC__ URL)。"""
     if not isinstance(rsp, list):
         return ""
+    # 1. 优先检查 function 消息(工具返回值, 如 __MUSIC__ 音乐URL)
+    for m in reversed(rsp):
+        if not isinstance(m, dict) or m.get("role") != "function":
+            continue
+        c = m.get("content", "")
+        if isinstance(c, str) and c.startswith("__MUSIC__"):
+            return c
+    # 2. 找 assistant 文字回复
     for m in reversed(rsp):
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
@@ -1346,14 +1745,47 @@ def brain_stream_sentences(
     yield: (sentence:str, full_reply:str)
     最后一次yield后，full_reply是完整回复。
     """
-    # 缓存命中直接返回
+    # 占用语过滤: LLM可能先输出"让我想想"等废话，这些话会被流式TTS立即合成播放
+    # 但最终回复里又不包含，导致用户听到了但历史里看不到。在yield前直接过滤掉。
+    _FILLER_WORDS = {
+        "让我想想", "稍等一下", "稍等", "让我思考一下", "想一想",
+        "让我看看", "我看看", "好的", "好", "嗯嗯", "嗯",
+        "让我想一下", "我想想", "等一下", "稍等下",
+    }
+    def _is_filler(s: str) -> bool:
+        """检查句子是否是纯占用语（去掉标点后完全匹配）"""
+        cleaned = re.sub(r'[，。！？\s]', '', s).strip()
+        is_filler = bool(cleaned) and len(cleaned) <= 6 and cleaned in _FILLER_WORDS
+        log.info(f"[filler] input='{s}' cleaned='{cleaned}' is_filler={is_filler}")
+        return is_filler
+
+    # 时间类查询直接返回实时时间，绕过LLM(避免缓存/历史污染/限流)
+    TIME_KEYWORDS = ('几点', '几点啦')
+    if any(kw in text for kw in TIME_KEYWORDS):
+        now = datetime.datetime.now()
+        reply = f"现在{now.strftime('%H点%M分')}。"
+        log.info(f"[time] 直接返回实时时间: {reply}")
+        yield (reply, reply)
+        return
+    # 音乐播放类查询，直接调用ncm绕过LLM
+    MUSIC_KEYWORDS = ('播放音乐', '播放歌', '随机播放', '放歌', '唱首歌', '放音乐', '来首歌', '听歌', '点歌', '我想听', '我要听')
+    if any(kw in text for kw in MUSIC_KEYWORDS):
+        log.info(f"[music] 音乐关键词命中(流式)，直接调用ncm绕过LLM: {text[:20]}")
+        music_reply = _direct_music_play(text)
+        if music_reply:
+            hist = _get_history(session_id)
+            _append_history(hist, text, music_reply)
+            yield (music_reply, music_reply)
+            return
+        log.warning(f"[music] ncm直连失败(流式)，回退到brain")
+    # 缓存命中
     cached = _cache_get_interrupted(text, interrupted_reply) if interrupted_reply.strip() else _cache_get(text)
     if cached is not None:
         yield (_clean_for_tts(cached), cached)
         return
-    _ensure_event_loop()
-    # 意图路由: 判断需要哪些MCP
+    # 意图路由: 判断需要哪些MCP，全部走Finna deepseek-v4-flash + MCP
     mcp_set = _classify_intent(text)
+    _ensure_event_loop()
     try:
         brain_instance = _get_brain(mcp_set)
     except Exception as e:
@@ -1371,6 +1803,18 @@ def brain_stream_sentences(
 
     try:
         for rsp in brain_instance.run(messages):
+            # 检测到 __MUSIC__ 立即短路，避免反复迭代
+            if isinstance(rsp, list):
+                _has_music = False
+                for _m in rsp:
+                    if isinstance(_m, dict) and _m.get('role') == 'function' and isinstance(_m.get('content'), str) and _m['content'].startswith('__MUSIC__'):
+                        _has_music = True
+                        break
+                if _has_music:
+                    t = _extract_assistant_text(rsp)
+                    if t:
+                        full_reply = t
+                    break
             t = _extract_assistant_text(rsp)
             if not t or len(t) <= sent_len:
                 continue
@@ -1384,7 +1828,9 @@ def brain_stream_sentences(
                     unsent = unsent[m.end():]
                     if sentence:
                         sent_len = len(full_reply) - len(unsent)
-                        yield (_clean_for_tts(sentence), full_reply)
+                        cleaned_sentence = _clean_for_tts(sentence)
+                        if not _is_filler(cleaned_sentence):
+                            yield (cleaned_sentence, full_reply)
                     continue
                 # 句末无标点但已积累较长 → 在逗号处软切割
                 if len(unsent) >= _MIN_CHUNK:
@@ -1394,7 +1840,9 @@ def brain_stream_sentences(
                         unsent = unsent[cm.end():]
                         if sentence:
                             sent_len = len(full_reply) - len(unsent)
-                            yield (_clean_for_tts(sentence), full_reply)
+                            cleaned_sentence = _clean_for_tts(sentence)
+                            if not _is_filler(cleaned_sentence):
+                                yield (cleaned_sentence, full_reply)
                         continue
                 break
             sent_len = len(full_reply) - len(unsent)
@@ -1408,7 +1856,9 @@ def brain_stream_sentences(
     if full_reply and len(full_reply) > sent_len:
         remaining = full_reply[sent_len:].strip()
         if remaining:
-            yield (_clean_for_tts(remaining), full_reply)
+            cleaned_remaining = _clean_for_tts(remaining)
+            if not _is_filler(cleaned_remaining):
+                yield (cleaned_remaining, full_reply)
     elif not full_reply:
         full_reply = "我没听明白"
         yield (full_reply, full_reply)
@@ -1420,48 +1870,21 @@ def brain_stream_sentences(
     _cache_set(text, full_reply, interrupted_reply)
 
 def _tts_cleaned_to_mp3(cleaned: str) -> bytes:
-    """合成已清洗文本；调用方负责确保文本已过 `_clean_for_tts()`。
-    短文本(≤10字)优先走本地 MLX TTS 微服务(0.3-0.9s), 失败降级 Finna。
-    长文本走 Finna 云端(0.7s, 质量更稳定)。
-    """
-    cached = _tts_cache_get(cleaned, cleaned=True)
-    if cached is not None:
-        return cached
-
-    # 短文本尝试本地 TTS (mlx-audio Qwen3-TTS-0.6B-4bit)
-    if len(cleaned) <= 10 and _LOCAL_TTS_ENABLED:
-        try:
-            r = _session.post(f"{_LOCAL_TTS_URL}/tts",
-                json={"text": cleaned}, timeout=(2, 10))
-            if r.status_code == 200 and len(r.content) > 100:
-                wav_bytes = r.content
-                import subprocess
-                try:
-                    r2 = subprocess.run(["ffmpeg", "-y", "-i", "pipe:0", "-b:a", "32k", "-ac", "1", "-f", "mp3", "pipe:1"],
-                               input=wav_bytes, capture_output=True, timeout=10)
-                    result = r2.stdout if r2.stdout and len(r2.stdout) > 100 else wav_bytes
-                except Exception:
-                    result = wav_bytes
-                _tts_cache_set(cleaned, result, cleaned=True)
-                return result
-        except Exception as e:
-            log.warning(f"本地TTS失败,降级Finna: {e}")
-
-    # 长文本或本地失败 → Finna 云端
+    """合成已清洗文本 → WAV转MP3 (32kbps)"""
+    if not cleaned:
+        return b""
     audio = tts(cleaned)
     if not audio or len(audio) < 100:
         return b""
     import subprocess
     try:
-        # 管道: stdin→ffmpeg→stdout, 省临时文件I/O
-        r = subprocess.run(["ffmpeg", "-y", "-i", "pipe:0", "-b:a", "32k", "-ac", "1", "-f", "mp3", "pipe:1"],
-                       input=audio, capture_output=True, timeout=10)
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-b:a", "32k", "-ac", "1", "-f", "mp3", "pipe:1"],
+            input=audio, capture_output=True, timeout=10)
         result = r.stdout if r.stdout and len(r.stdout) > 100 else audio
-        _tts_cache_set(cleaned, result, cleaned=True)
         return result
     except Exception:
-        _tts_cache_set(cleaned, audio, cleaned=True)
-        return audio  # 失败返回原始WAV
+        return audio
 
 def tts_to_mp3(text: str) -> bytes:
     """TTS生成 + WAV转MP3 (供流式端点使用), 管道方式省临时文件"""
@@ -1499,7 +1922,7 @@ def voice_loop(audio_in: bytes, fmt: str = "mp3") -> Tuple[str, str, bytes]:
     reply = brain(text)
     try:
         audio_out = tts(reply)
-    except TTSUnavailableError as e:
+    except Exception as e:
         log.warning(f"voice_loop TTS降级为文字: {e}")
         audio_out = b""
     return text, reply, audio_out
@@ -1534,6 +1957,13 @@ def write_audio_file(path: str, audio: bytes) -> str:
 def runtime_temp_audio_path() -> str:
     """Return a writable directory for short-lived generated audio files."""
     return DATA_DIR
+
+# 预热: 在模块加载时构建一次 none 大脑实例(避免首请求等待 976ms)
+try:
+    _get_brain("none")
+    log.info("[warmup] brain(none) 预热完成")
+except Exception as e:
+    log.warning(f"[warmup] brain(none) 预热失败: {e}")
 
 if __name__ == "__main__":
     import sys

@@ -5,8 +5,8 @@ TTS: Qwen3-TTS-0.6B-4bit (mlx-audio) — 短文本热运行 0.65s
 模型预加载后复用, 避免每次请求重新加载
 """
 import os, time, io, json, tempfile, logging, traceback
-
-from flask import Flask, request, jsonify, Response
+import os, sys, json, time, logging, tempfile, shutil, subprocess, threading
+from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger("local-tts")
@@ -15,6 +15,7 @@ app = Flask(__name__)
 
 _tts_generate = None  # 预加载的 generate_audio 函数
 _tts_model_instance = None  # 预加载的模型实例
+_tts_lock = threading.Lock()  # 推理锁, 防止多线程并发
 
 _LOCAL_TTS_MODEL_PATH = "/Users/sxliuyu/.local/share/models/Qwen3-TTS-12Hz-0.6B-Base-4bit-mlx"
 
@@ -75,14 +76,16 @@ def tts():
         tmpdir = tempfile.mkdtemp()
         output_path = os.path.join(tmpdir, "output")
 
-        generate_fn(
-            text=text,
-            model=model_instance,  # 复用预加载的模型实例
-            lang_code="zh",
-            file_prefix=output_path,
-            join_audio=True,
-            verbose=False,
-        )
+        # 推理锁(防止多线程并发调用 MLX 模型)
+        with _tts_lock:
+            generate_fn(
+                text=text,
+                model=model_instance,  # 复用预加载的模型实例
+                lang_code="zh",
+                file_prefix=output_path,
+                join_audio=True,
+                verbose=False,
+            )
 
         # mlx-audio join_audio=True 生成 <file_prefix>.wav
         wav_path = output_path + ".wav"

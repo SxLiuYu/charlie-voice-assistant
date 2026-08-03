@@ -30,26 +30,33 @@ def parse_time_str(s: str) -> str | None:
     tg = t
     ok = False
 
+    # 相对时间(分钟/小时/天后) 和 绝对日期(明天/后天) 互斥, 不叠加
+    has_relative = False
+    has_absolute_date = False
     # N分钟后
     mm = re.search(r"(\d+)\s*分(?:钟)?后", s)
     if mm:
         tg += datetime.timedelta(minutes=int(mm.group(1)))
         ok = True
+        has_relative = True
     # N小时后
     hh = re.search(r"(\d+)\s*(?:小时|个小时)后", s)
     if hh:
         tg += datetime.timedelta(hours=int(hh.group(1)))
         ok = True
+        has_relative = True
     # N天后
     dd = re.search(r"(\d+)\s*天后", s)
     if dd:
         tg += datetime.timedelta(days=int(dd.group(1)))
         ok = True
-    # 相对日期: 大后天/后天/明天/今天
+        has_relative = True
+    # 相对日期: 大后天/后天/明天/今天 (如果已有相对时间, 跳过)
     for w, n in [("大后天", 3), ("后天", 2), ("明天", 1), ("今天", 0)]:
-        if w in s:
+        if w in s and not has_relative:
             tg += datetime.timedelta(days=n)
             ok = True
+            has_absolute_date = True
             break
     # 具体时刻: 3点/3:30/下午3点/晚上9点半
     tm = re.search(r"(\d{1,2})\s*[点时:：]\s*(\d{0,2})", s)

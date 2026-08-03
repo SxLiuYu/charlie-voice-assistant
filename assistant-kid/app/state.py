@@ -282,6 +282,7 @@ _RATE_GENERAL = 60
 _RATE_VOICE = 10
 _RATE_WINDOW = 60
 _RATE_PER_SESSION = 30
+_RATE_LOCK = threading.Lock()  # 限流计数器锁
 _session_buckets = {}      # {session_id: [ts]}
 
 # ===== 实时连接 =====

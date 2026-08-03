@@ -84,7 +84,7 @@ from app.config import (
     localhost_origins,
 )
 from app.state import (_metrics, _ws_clients, _rate_buckets, _session_buckets,
-    _RATE_GENERAL, _RATE_VOICE, _RATE_WINDOW, _RATE_PER_SESSION, MAX_REQUEST_BODY, _ws_client_count,
+    _RATE_GENERAL, _RATE_VOICE, _RATE_WINDOW, _RATE_LOCK, _RATE_PER_SESSION, MAX_REQUEST_BODY, _ws_client_count,
     _ws_session_groups, _ws_client_locations, _interrupt_telemetry,
     register_sse_client, unregister_sse_client, snapshot_sse_clients, sse_client_count)
 from app.reminders import (
@@ -134,8 +134,7 @@ def _validate_env():
     """启动时检查必需的API密钥，缺失的会警告"""
     required = [
         ("GLM_KEY", "GLM-5.2大脑"),
-        ("TTS_KEY", "TTS语音合成"),
-        ("ASR_KEY", "ASR语音识别"),
+        ("BAIDU_API_KEY", "百度ASR/TTS"),
         ("AMAP_KEY", "高德地图"),
     ]
     optional = [
@@ -330,6 +329,7 @@ class ReminderRequest(BaseModel):
     """添加提醒请求"""
     text: str = Field(..., min_length=1, max_length=200, description="提醒内容(1-200字)")
     time: str = Field(default="", description="提醒时间(自然语言,如'30分钟后')")
+    repeat: str = Field(default="", description="重复: 空=一次性, daily=每天, weekly=每周, weekdays=工作日")
 
 class BrainRestartRequest(BaseModel):
     """大脑重启请求(预留)"""
@@ -465,16 +465,17 @@ def _check_rate(ip: str, bucket_type: str, limit: int) -> tuple:
                           for bt in ("voice", "general"))]
         for k in expired:
             del _rate_buckets[k]
-    if ip not in _rate_buckets:
-        _rate_buckets[ip] = {}
-    bucket = _rate_buckets[ip].setdefault(bucket_type, [])
-    # 清除过期记录
-    bucket[:] = [ts for ts in bucket if now - ts < _RATE_WINDOW]
-    if len(bucket) >= limit:
-        retry_after = int(_RATE_WINDOW - (now - bucket[0])) + 1
-        return False, 0, retry_after
-    bucket.append(now)
-    return True, limit - len(bucket), 0
+    with _RATE_LOCK:
+        if ip not in _rate_buckets:
+            _rate_buckets[ip] = {}
+        bucket = _rate_buckets[ip].setdefault(bucket_type, [])
+        # 清除过期记录
+        bucket[:] = [ts for ts in bucket if now - ts < _RATE_WINDOW]
+        if len(bucket) >= limit:
+            retry_after = int(_RATE_WINDOW - (now - bucket[0])) + 1
+            return False, 0, retry_after
+        bucket.append(now)
+        return True, limit - len(bucket), 0
 
 def _check_session_rate(session_id: str) -> tuple:
     """检查会话速率限制, 返回(allowed, remaining, retry_after)"""
@@ -639,8 +640,23 @@ def _play_reminder_audio(text: str, reminder_id: int | None = None):
                 os.unlink(tmp.name)
             except FileNotFoundError:
                 pass
-        if reminder_id is not None and delivery_failed:
-            log.warning(f"[reminder] 提醒{reminder_id}已释放，等待重试: {delivery_error}")
+_REMINDER_SCHEDULER_STOP = False
+_REMINDER_SCHEDULER_LOCK = threading.Lock()
+_REMINDER_AUDIO_LOCK = threading.Lock()
+_reminder_audio_queue = _queue.Queue()
+
+def _reminder_audio_worker():
+    """串行播放提醒音频"""
+    while True:
+        text, rid = _reminder_audio_queue.get()
+        with _REMINDER_AUDIO_LOCK:
+            _play_reminder_audio(text, reminder_id=rid)
+        _reminder_audio_queue.task_done()
+
+# 启动播放工作者线程
+_reminder_audio_thread = threading.Thread(target=_reminder_audio_worker, daemon=True)
+_reminder_audio_thread.start()
+
 
 def _reminder_scheduler():
     """后台守护线程：每30s检查到期提醒，自动播报"""
@@ -669,12 +685,7 @@ def _reminder_scheduler():
                 text = reminder.get("text", "提醒")
                 due_str = reminder.get("due", "")
                 log.info(f"[reminder] 提醒到期(id={rid}): {text} (due={due_str})")
-                threading.Thread(
-                    target=_play_reminder_audio,
-                    args=(text,),
-                    kwargs={"reminder_id": rid},
-                    daemon=True,
-                ).start()
+                _reminder_audio_queue.put((text, rid))
         except Exception as e:
             log.error(f"[reminder] 调度器异常: {e}")
         time.sleep(30)
@@ -868,6 +879,8 @@ def _proactive_suggestions():
 
             # 2. 时间建议(每天只推一次)
             if hour >= 23 and hour < 24 and _claim_suggest_state("last_time_suggest", today + "_late"):
+                # 同时申领睡前标记,阻止偏好建议在同一时段再推"该休息了"
+                _claim_suggest_state("last_bedtime_suggest", today)
                 msg = "主人，已经23点了，该休息了，明天的事明天再说。"
                 _add_notification(msg, "bedtime")
                 log.info(f"[suggest] 主动休息建议: {msg}")
@@ -922,7 +935,13 @@ def _proactive_suggestions():
                             suggestion = f"主人，是你平时的运动时间，今天别忘了{pval}哦。"
                     elif "睡" in pkey or "休息" in pkey:
                         if 22 <= hour < 24:  # 晚上10-12点
-                            suggestion = f"主人，你设定了{pkey}为{pval}，该准备休息了。"
+                            # 如果23点时间建议已推过,不再重复推"该休息了"
+                            # 用只读检查, 不修改状态
+                            bedtime_state = _suggest_state_snapshot().get("last_bedtime_suggest", "")
+                            if bedtime_state.startswith(today):
+                                suggestion = None  # 23点建议已推过,跳过
+                            else:
+                                suggestion = f"主人，你设定了{pkey}为{pval}，该准备休息了。"
                     if suggestion and _claim_suggest_state(state_key, pref_suggest_key):
                         _add_notification(suggestion, "preference")
                         log.info(f"[suggest] 偏好建议({pkey}): {suggestion}")
@@ -967,7 +986,7 @@ async def voice_api(file: UploadFile = File(...)):
             "format": "mp3",
             "degraded": True,
         }
-    from voice_agent import voice_loop, TTSUnavailableError
+    from voice_agent import voice_loop
     try:
         text, reply, audio_out = await asyncio.wait_for(
             asyncio.to_thread(voice_loop, wav, "wav"), timeout=60)
@@ -1074,8 +1093,8 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
     
     q = _queue.Queue()          # brain → 主循环
     tts_q = _queue.Queue()      # TTS线程 → 主循环 (并行)
+    # 启动后台大脑线程, 逐句推送文本→TTS流
     brain_thread = None
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     
     def brain_worker():
         try:
@@ -1089,9 +1108,9 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
     # 如果有ASR结果，先推送
     if asr_text:
         yield _sse_event({"type": "asr", "text": asr_text})
-        # 立即推送预缓存过渡语(0ms, 填充 brain 首 token 窗口)
-        from voice_agent import _tts_cache_get
-        ack_audio = _tts_cache_get(ASR_ACK_MESSAGE, cleaned=True)
+        # 立即推送过渡语音频(0ms, 填充 brain 首 token 窗口)
+        from voice_agent import tts_to_mp3
+        ack_audio = tts_to_mp3(ASR_ACK_MESSAGE)
         if ack_audio:
             yield _sse_event({"type": "audio", "audio": _b64enc.b64encode(ack_audio).decode()})
         yield _sse_event({"type": "ack", "message": ASR_ACK_MESSAGE})
@@ -1153,9 +1172,10 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
             elif etype == "sentence":
                 # 文本事件即时推送
                 yield _sse_event({"type": "text", "text": sentence})
-                if sentence and len(sentence) >= 2:
+                # __MUSIC__ 标记不送TTS(前端浏览器播放)
+                if sentence and len(sentence) >= 2 and not sentence.startswith("__MUSIC__") and sentence != "__MUSIC_STOP__":
                     tts_buffer = (tts_buffer + "， " + sentence) if tts_buffer else sentence
-                    should_flush = (not first_audio_sent) or (len(tts_buffer) >= _TTS_BATCH_SIZE)
+                    should_flush = not first_audio_sent
                     if should_flush and not tts_failed:
                         buf = tts_buffer
                         tts_buffer = ""
@@ -1240,6 +1260,12 @@ async def voice_stream_api(request: Request, file: UploadFile = File(...), sessi
         log.info("/api/voice/stream ASR为低意图语气词，短路大脑和TTS")
         return StreamingResponse(_low_intent_asr_events(asr_text, True), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    # 保守版乱码检查: 只拦截纯虚词堆叠和纯标点(不拦截短句)
+    from voice_agent import is_garbled_asr
+    if is_garbled_asr(asr_text):
+        log.info(f"/api/voice/stream ASR判定为乱码/碎片，短路大脑和TTS: [{asr_text[:30]}]")
+        return StreamingResponse(_empty_asr_events(True), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     
     return StreamingResponse(_stream_brain_tts(asr_text, asr_text, session_id=session_id), 
                              media_type="text/event-stream",
@@ -1295,15 +1321,17 @@ async def list_reminders(request: Request):
 async def add_reminder(req: ReminderRequest):
     text = _sanitize_text(req.text, 200)
     time_str = _sanitize_text(req.time, 50)
+    repeat = _sanitize_text(req.repeat, 20) if req.repeat else ""
     # 复用共享时间解析工具
     due = None
     if time_str:
         from utils import parse_time_str
         due = parse_time_str(time_str)
-    item = append_reminder(text, time_str, due)
+    item = append_reminder(text, time_str, due, repeat=repeat)
     rid = item["id"]
     when = f"，提醒时间{due.replace('T', ' ')}" if due else (f"（时间'{time_str}'未解析出时刻）" if time_str else "")
-    return {"ok": True, "id": rid, "message": f"已添加提醒：{text}{when}"}
+    repeat_desc = {"daily": "（每天重复）", "weekly": "（每周重复）", "weekdays": "（工作日重复）"}.get(repeat, "")
+    return {"ok": True, "id": rid, "message": f"已添加提醒：{text}{when}{repeat_desc}"}
 
 @app.delete("/api/reminders/{rid}")
 async def delete_reminder(rid: int):
@@ -1336,16 +1364,16 @@ async def get_conversation(page: int = 1, limit: int = 50, session_id: str = "de
 async def tts_api(req: TTSRequest):
     """文字 → 语音(MP3)"""
     text = _sanitize_text(req.text, MAX_TEXT_LENGTH)
-    from voice_agent import tts_to_mp3, TTSUnavailableError
+    from voice_agent import tts_to_mp3
     try:
         audio = await asyncio.wait_for(asyncio.to_thread(tts_to_mp3, text), timeout=30)
         if not audio:
             return JSONResponse({"error": "TTS生成失败"}, status_code=500)
         return Response(content=audio, media_type="audio/mpeg")
-    except TTSUnavailableError:
-        return JSONResponse({"error": "TTS服务繁忙，请稍后再试"}, status_code=503)
     except asyncio.TimeoutError:
         return JSONResponse({"error": "TTS超时"}, status_code=504)
+    except Exception:
+        return JSONResponse({"error": "TTS服务繁忙，请稍后再试"}, status_code=503)
 
 @app.post("/api/asr")
 async def asr_api(file: UploadFile = File(...)):
@@ -1360,9 +1388,83 @@ async def asr_api(file: UploadFile = File(...)):
     try:
         text = await asyncio.wait_for(
             asyncio.to_thread(asr, wav, "wav"), timeout=30)
+        log.info(f"/api/asr 识别结果: [{text}] (len={len(text)}, 音频={len(data)}字节)")
         return {"text": text}
     except asyncio.TimeoutError:
         return JSONResponse({"error": "ASR超时"}, status_code=504)
+
+# ===== Vosk 唤醒词检测(Charlie) =====
+_VOSK_MODEL = None
+_VOSK_WAKE_WORDS = ["charlie", "charley", "charls", "charles", "チャーリー",
+                    "查理", "查莉", "查利", "查里", "茶理", "嘞查嘞", "嘞查", "查嘞"]
+
+def _get_vosk_model():
+    global _VOSK_MODEL
+    if _VOSK_MODEL is None:
+        try:
+            from vosk import Model
+            model_path = os.path.join(os.path.dirname(__file__), "web", "vosk", "vosk-model-small-en-us-0.15")
+            if os.path.exists(model_path):
+                _VOSK_MODEL = Model(model_path)
+                log.info("Vosk 英文唤醒词模型已加载")
+        except Exception as e:
+            log.warning(f"Vosk 模型加载失败(不影响正常使用): {e}")
+    return _VOSK_MODEL
+
+@app.post("/api/wakecheck")
+async def wakecheck_api(file: UploadFile = File(...)):
+    """Vosk 唤醒词检测: 返回是否包含 'Charlie'"""
+    import wave, io, json as json_mod
+    data = await file.read()
+    if len(data) < 1000:
+        return {"wake": False, "text": ""}
+    # 转 WAV 16kHz mono — 用 ffmpeg 自动检测格式(不指定-f, 让ffmpeg自己猜)
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"],
+            input=data, capture_output=True, timeout=15)
+        wav = r.stdout if r.returncode == 0 and r.stdout and len(r.stdout) > 100 else data
+    except Exception:
+        wav = data
+    model = _get_vosk_model()
+    if model is None:
+        # fallback: 用原有的 ASR
+        from voice_agent import asr
+        try:
+            text = await asyncio.wait_for(asyncio.to_thread(asr, wav, "wav"), timeout=15)
+            text_lower = text.lower().strip()
+            matched = any(w in text_lower for w in _VOSK_WAKE_WORDS)
+            return {"wake": matched, "text": text}
+        except:
+            return {"wake": False, "text": ""}
+    try:
+        from vosk import KaldiRecognizer
+        rec = KaldiRecognizer(model, 16000)
+        wf = wave.open(io.BytesIO(wav), 'rb')
+        # 分块送入 Vosk (每块 4000 frames = 0.25s)
+        chunk_size = 4000
+        text = ""
+        while True:
+            frames = wf.readframes(chunk_size)
+            if len(frames) == 0:
+                break
+            if rec.AcceptWaveform(frames):
+                result = json_mod.loads(rec.Result())
+                t = result.get("text", "")
+                if t:
+                    text = t
+                break
+        # 取最终结果
+        final = json_mod.loads(rec.FinalResult())
+        if final.get("text"):
+            text = final["text"]
+        text = text.lower()
+        matched = any(w in text for w in _VOSK_WAKE_WORDS)
+        log.info(f"/api/wakecheck Vosk: [{text}] matched={matched} (audio={len(data)}B wav={len(wav)}B)")
+        return {"wake": matched, "text": text}
+    except Exception as e:
+        log.warning(f"/api/wakecheck 异常: {e}")
+        return {"wake": False, "text": ""}
 
 @app.get("/api/export")
 async def export_conversation(
@@ -1485,7 +1587,7 @@ _WS_STALE_TIMEOUT = 300  # 5分钟无活动视为过期
 def _ws_cleanup_stale():
     """清理过期的WebSocket连接(5分钟无活动)"""
     now = time.time()
-    stale = [sid for sid, info in _ws_clients.items()
+    stale = [sid for sid, info in list(_ws_clients.items())
              if now - info.get("last_active", now) > _WS_STALE_TIMEOUT]
     for sid in stale:
         _ws_cleanup_after_disconnect(sid, close_connection=True)
@@ -1789,6 +1891,12 @@ async def websocket_endpoint(ws: WebSocket):
                     for event in _empty_asr_events(False):
                         await ws.send_json(event)
                     continue
+                from voice_agent import is_garbled_asr as _is_garbled_asr
+                if _is_garbled_asr(asr_text):
+                    log.info(f"[ws] ASR为乱码/碎片，短路大脑和TTS (id={ws_id})")
+                    for event in _empty_asr_events(False):
+                        await ws.send_json(event)
+                    continue
                 if is_low_intent_asr(asr_text):
                     log.info(f"[ws] ASR为低意图语气词，短路大脑和TTS (id={ws_id})")
                     for event in _low_intent_asr_events(asr_text, False):
@@ -1797,9 +1905,9 @@ async def websocket_endpoint(ws: WebSocket):
                 asr_event = {"type": "asr", "text": asr_text}
                 ack_event = {"type": "ack", "message": ASR_ACK_MESSAGE}
                 await ws.send_json(asr_event)
-                # 立即推送预缓存确认音(0ms, 用户1s后听到"收到")
-                from voice_agent import _tts_cache_get
-                ack_audio = _tts_cache_get(ASR_ACK_MESSAGE, cleaned=True)
+                # 立即推送确认音频(0ms, 用户1s后听到"收到")
+                from voice_agent import tts_to_mp3
+                ack_audio = tts_to_mp3(ASR_ACK_MESSAGE)
                 if ack_audio:
                     await ws.send_json({"type": "audio", "data": _b64enc.b64encode(ack_audio).decode(), "format": "mp3"})
                 await ws.send_json(ack_event)
@@ -1896,9 +2004,9 @@ async def _ws_stream_brain(
             if _ws_clients.get(ws_id, {}).get("interrupt"):
                 break
             yield {"type": "text", "text": sentence}
-            if sentence and len(sentence) >= 2:
+            if sentence and len(sentence) >= 2 and not sentence.startswith('__MUSIC__') and sentence != '__MUSIC_STOP__':
                 tts_buffer = (tts_buffer + "，" + sentence) if tts_buffer else sentence
-                if (not first_audio_sent) or (len(tts_buffer) >= _TTS_BATCH_SIZE):
+                if (not first_audio_sent):
                     if tts_failed:
                         tts_buffer = ""
                         first_audio_sent = True

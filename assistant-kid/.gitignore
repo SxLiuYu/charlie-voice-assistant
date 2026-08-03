@@ -37,3 +37,4 @@ tunnel_url.txt
 preferences.json
 logs/
 \n# 测试音频文件\naudio_000.wav\n*.wav\n!cert/*.pem
+.baidu_token.json

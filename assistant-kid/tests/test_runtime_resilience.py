@@ -66,6 +66,7 @@ def test_runtime_files_use_configured_data_dir():
     assert os.path.exists(os.path.join(data_dir, "conversation_history.json"))
 
 
+@pytest.mark.skip(reason="baize_skills_mcp 已拆分，提醒/偏好工具移到 app/reminders + voice_agent")
 def test_baize_mcp_files_use_configured_data_dir():
     """独立 MCP 子进程必须复用同一份提醒和偏好数据目录。"""
     data_dir = os.environ["ASSISTANT_KID_DATA_DIR"]
@@ -88,6 +89,7 @@ def test_baize_mcp_files_use_configured_data_dir():
     assert prefs["mcp_key"] == "mcp_value"
 
 
+@pytest.mark.skip(reason="system_status 已移到 mcp_server.py(magic-phone MCP)")
 def test_mcp_system_status_uses_nonblocking_cpu_sample(monkeypatch):
     """MCP 系统状态不能每次固定阻塞 1 秒采样 CPU。"""
     import baize_skills_mcp
@@ -120,6 +122,7 @@ def test_mcp_system_status_uses_nonblocking_cpu_sample(monkeypatch):
     assert cpu_intervals == [None]
 
 
+@pytest.mark.skip(reason="list_reminders 已从 baize_skills_mcp 删除")
 def test_baize_mcp_ignores_malformed_reminders(tmp_path, monkeypatch):
     """MCP 提醒列表必须和主服务一样，忽略 None、非 dict 和空文本记录。"""
     import json
@@ -139,6 +142,7 @@ def test_baize_mcp_ignores_malformed_reminders(tmp_path, monkeypatch):
     assert "MCP正常提醒" in baize_skills_mcp.list_reminders()
 
 
+@pytest.mark.skip(reason="add_reminder 已从 baize_skills_mcp 删除")
 def test_baize_mcp_add_reminder_uses_shared_reminder_lock(tmp_path, monkeypatch):
     """MCP 子进程写提醒时必须和主服务共用 reminders.json.lock，避免读改写丢更新。"""
     import fcntl
@@ -174,6 +178,7 @@ def test_baize_mcp_add_reminder_uses_shared_reminder_lock(tmp_path, monkeypatch)
     assert [item["text"] for item in stored] == ["已有提醒", "MCP锁内提醒"]
 
 
+@pytest.mark.skip(reason="add_reminder 已从 baize_skills_mcp 删除")
 def test_baize_mcp_reminder_write_is_atomic(tmp_path, monkeypatch):
     """MCP 提醒保存必须写临时文件后原子替换，不能直接截断 reminders.json。"""
     import json
@@ -209,6 +214,7 @@ def test_baize_mcp_reminder_write_is_atomic(tmp_path, monkeypatch):
     assert len(replace_calls) == 1
 
 
+@pytest.mark.skip(reason="add_reminder/_locked_store 已从 baize_skills_mcp 删除")
 def test_baize_mcp_add_reminder_holds_exclusive_lock_for_read_modify_write(tmp_path, monkeypatch):
     """MCP 添加提醒必须在同一个排他锁内完成读改写，避免并发添加丢更新。"""
     import json
@@ -238,6 +244,7 @@ def test_baize_mcp_add_reminder_holds_exclusive_lock_for_read_modify_write(tmp_p
     assert [item["text"] for item in stored] == ["MCP事务提醒"]
 
 
+@pytest.mark.skip(reason="set_preference 已从 baize_skills_mcp 删除")
 def test_baize_mcp_preference_write_is_atomic(tmp_path, monkeypatch):
     """MCP 偏好保存必须写临时文件后原子替换，不能直接截断 preferences.json。"""
     import json
@@ -270,6 +277,7 @@ def test_baize_mcp_preference_write_is_atomic(tmp_path, monkeypatch):
     assert len(replace_calls) == 1
 
 
+@pytest.mark.skip(reason="set_preference/_locked_prefs 已从 baize_skills_mcp 删除")
 def test_baize_mcp_set_preference_holds_exclusive_lock_for_read_modify_write(tmp_path, monkeypatch):
     """MCP 设置偏好必须在同一个排他锁内完成读改写，避免并发写丢 key。"""
     import json
@@ -301,6 +309,7 @@ def test_baize_mcp_set_preference_holds_exclusive_lock_for_read_modify_write(tmp
     assert stored == {"old_pref": "old_value", "mcp_pref": "mcp_value"}
 
 
+@pytest.mark.skip(reason="set_preference 已从 baize_skills_mcp 删除")
 def test_baize_mcp_set_preference_waits_for_shared_preference_lock(tmp_path, monkeypatch):
     """MCP 偏好写事务必须等待共享 preferences.json.lock。"""
     import fcntl
@@ -668,6 +677,7 @@ def test_magic_phone_cli_reply_write_failure_keeps_existing_audio(tmp_path, monk
     assert list(tmp_path.glob(".cli_reply*.tmp")) == []
 
 
+@pytest.mark.skip(reason="baize_skills_mcp.set_preference 已删除，跨进程偏好测试不再适用")
 def test_preference_writers_from_separate_processes_do_not_lose_keys(tmp_path):
     """主进程和 MCP 子进程并发写偏好时，共用文件锁必须保住双方写入的 key。"""
     import json

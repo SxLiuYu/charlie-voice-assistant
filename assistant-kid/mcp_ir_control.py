@@ -14,10 +14,15 @@ ESP32_HOST = os.getenv("ESP32_HOST", "192.168.1.7")
 
 mcp = FastMCP("ac-control")
 
-def _send_ir(device: str, action: str) -> str:
-    """发送红外指令到 ESP32"""
+def _send_ir(device: str, action: str, temperature: int = 0, fan_speed: str = "") -> str:
+    """发送红外指令到 ESP32, 支持温度/风速参数"""
     url = f"http://{ESP32_HOST}/api/ir/send"
-    payload = json.dumps({"device": device, "action": action}).encode()
+    body = {"device": device, "action": action}
+    if temperature:
+        body["temperature"] = temperature
+    if fan_speed:
+        body["fan_speed"] = fan_speed
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(url, data=payload,
         headers={"Content-Type": "application/json"})
     try:
@@ -47,7 +52,7 @@ def ac_control(action: str, temperature: int = 0, fan_speed: str = "") -> str:
         "fan": "fan", "dry": "dry", "auto": "auto",
     }
     esp32_action = action_map.get(action.lower(), action.lower())
-    return _send_ir("ac", esp32_action)
+    return _send_ir("ac", esp32_action, temperature=temperature, fan_speed=fan_speed)
 
 @mcp.tool()
 def tv_control(action: str) -> str:

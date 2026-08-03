@@ -217,8 +217,11 @@ def _save_reminders(data):
         _write_locked_reminders(data)
 
 
-def append_reminder(text: str, time_str: str = "", due: str | None = None) -> dict:
-    """在排他锁内完成新增提醒的读改写，返回写入后的提醒副本。"""
+def append_reminder(text: str, time_str: str = "", due: str | None = None, repeat: str = "") -> dict:
+    """在排他锁内完成新增提醒的读改写，返回写入后的提醒副本。
+
+    repeat: ""=一次性, "daily"=每天, "weekly"=每周, "weekdays"=工作日
+    """
     now = dt.datetime.now()
     with _locked_reminders():
         reminders = _read_locked_reminders()
@@ -235,6 +238,7 @@ def append_reminder(text: str, time_str: str = "", due: str | None = None) -> di
             "time": time_str,
             "due": due,
             "done": False,
+            "repeat": repeat if repeat in ("daily", "weekly", "weekdays") else "",
         }
         reminders.append(item)
         reminders, removed = _cleanup_old_reminders(reminders)
@@ -306,7 +310,7 @@ def release_failed_reminder(reminder_id: int, claimed_at, error: str = ""):
 
 
 def complete_reminder_delivery(reminder_id: int):
-    """播报成功后标记完成。"""
+    """播报成功后标记完成；如果是循环提醒，生成下一次到期。"""
     now = dt.datetime.now()
     with _locked_reminders():
         reminders = _read_locked_reminders()
@@ -321,6 +325,43 @@ def complete_reminder_delivery(reminder_id: int):
             reminder.pop("retry_after", None)
             reminder.pop("last_delivery_error", None)
             changed = True
+
+            # 循环提醒：生成下一次到期时间
+            repeat = reminder.get("repeat", "")
+            due_str = reminder.get("due", "")
+            if repeat and due_str:
+                try:
+                    old_due = dt.datetime.fromisoformat(due_str)
+                    if repeat == "daily":
+                        next_due = old_due + dt.timedelta(days=1)
+                    elif repeat == "weekly":
+                        next_due = old_due + dt.timedelta(weeks=1)
+                    elif repeat == "weekdays":
+                        next_due = old_due + dt.timedelta(days=1)
+                        while next_due.weekday() >= 5:
+                            next_due += dt.timedelta(days=1)
+                    else:
+                        next_due = None
+                    if next_due:
+                        next_id = int(now.timestamp())
+                        for r in reminders:
+                            try:
+                                next_id = max(next_id, int(r.get("id", 0)))
+                            except (TypeError, ValueError):
+                                continue
+                        next_id += 1
+                        new_item = {
+                            "id": next_id,
+                            "text": reminder["text"],
+                            "time": reminder.get("time", ""),
+                            "due": next_due.isoformat(),
+                            "done": False,
+                            "repeat": repeat,
+                        }
+                        reminders.append(new_item)
+                        log.info(f"[reminders] 循环提醒{reminder_id}已生成下次: id={next_id} due={next_due.isoformat()}")
+                except Exception as e:
+                    log.warning(f"[reminders] 循环提醒{reminder_id}生成下次失败: {e}")
             break
 
         if changed:

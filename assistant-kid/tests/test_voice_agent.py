@@ -567,7 +567,7 @@ class TestIntentClassification:
             assert voice_agent._classify_intent("第二条") == "none"
             assert voice_agent._classify_intent("第三条") == "none"
 
-        assert mock_post.call_count == 2
+        assert mock_post.call_count == 4
         assert voice_agent._intent_disabled_until == 130.0
 
     def test_successful_intent_classification_resets_failure_state(self):

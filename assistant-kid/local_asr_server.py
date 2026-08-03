@@ -18,6 +18,7 @@ log = logging.getLogger("local-asr")
 app = Flask(__name__)
 
 _asr_model = None
+_asr_lock = threading.Lock()
 
 def _load_asr():
     global _asr_model
@@ -63,7 +64,9 @@ def asr():
         if np.abs(wav).max() > 1.0:
             wav = wav / 32768.0
         
-        result = model.generate(input=wav, language='zh', use_itn=True)
+        # 推理锁(防止多线程并发调用模型)
+        with _asr_lock:
+            result = model.generate(input=wav, language="zh", use_itn=True)
         
         # 清理特殊标记
         import re
