@@ -59,7 +59,6 @@ def mp3_to_opus_packets(mp3_data: bytes, sample_rate: int = 24000,
         raise RuntimeError("opuslib not available")
     pcm = _mp3_to_pcm(mp3_data, sample_rate)
     encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_AUDIO)
-    encoder.bitrate = 24000
     frame_samples = sample_rate * frame_duration // 1000
     frame_bytes = frame_samples * 2
     packets: list[bytes] = []
