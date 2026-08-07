@@ -75,6 +75,7 @@ for _lg in (_logging.getLogger(), _logging.getLogger("uvicorn"),
 log.info(f"文件日志已启用: {os.path.join(_LOG_DIR, 'app.log')}")
 # ===== 抽取到app模块(Phase1: 纯函数) =====
 from app.audio import likely_empty_audio, to_wav, _wav_to_mp3, MAX_AUDIO_SIZE
+from app.xiaozhi_ws import register_xiaozhi_routes
 from app.auth import _client_ip, _is_local_request, _check_auth, _sanitize_text, AUTH_TOKEN
 from app.brain_health import _brain_is_warm, _warmup_brain
 from app.config import (
@@ -2881,6 +2882,10 @@ async def toggle_mcp_server(server_id: str = "", enabled: bool = True):
     from voice_agent import restart_brain
     restart_brain()
     return {"ok": True, "server_id": server_id, "enabled": enabled, "enabled_list": enabled_list}
+
+
+# Register xiaozhi-compatible WebSocket endpoint
+register_xiaozhi_routes(app)
 
 
 if __name__ == "__main__":
