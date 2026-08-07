@@ -1926,16 +1926,21 @@ def _ws_cleanup_after_disconnect(ws_id: int, close_connection: bool = False):
             except RuntimeError:
                 pass
 
-@app.get("/xiaozhi/ota")
+@app.api_route("/xiaozhi/ota", methods=["GET", "POST"])
 async def xiaozhi_ota(request: Request):
     """OTA config endpoint for xiaozhi firmware. Returns websocket connection info
-    so the device skips activation and connects directly to /ws/xiaozhi."""
+    so the device skips activation and connects directly to /ws/xiaozhi.
+    The firmware POSTs board info here; we ignore the body and return WS config."""
     host = request.url.hostname or "192.168.1.3"
     ws_url = f"ws://{host}:8000/ws/xiaozhi"
     return JSONResponse({
         "websocket": {
             "url": ws_url,
             "version": 1,
+        },
+        "server_time": {
+            "timestamp": int(datetime.datetime.now().timestamp()),
+            "timezone_offset": 480,
         }
     })
 
