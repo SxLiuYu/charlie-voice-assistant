@@ -195,6 +195,8 @@ def _build_brain(mcp_set="all"):
             "args": ["--mcp", "magic-summary"] if _is_frozen else ["magic-summary.py"], "cwd": _mcp_cwd},
         "magic-wardrobe": {"command": _py,
             "args": ["--mcp", "magic-wardrobe"] if _is_frozen else ["magic-wardrobe.py"], "cwd": _mcp_cwd},
+        "magic-recipe": {"command": _py,
+            "args": ["--mcp", "magic-recipe"] if _is_frozen else ["magic-recipe.py"], "cwd": _mcp_cwd},
         "magic-browser": {"command": _py,
             "args": ["--mcp", "magic-browser"] if _is_frozen else ["magic-browser.py"], "cwd": _mcp_cwd},
         "baize-skills": {"command": _py,
@@ -207,7 +209,7 @@ def _build_brain(mcp_set="all"):
             "args": ["--mcp", "ac-control"] if _is_frozen else ["mcp_ir_control.py"], "cwd": _mcp_cwd},
     }
     # 按意图路由选择MCP
-    enabled_env = os.getenv("MCP_SERVERS", "amap-maps,baize-skills,filesystem,magic-music,magic-reminder,magic-notes,magic-system,magic-info,magic-life,magic-scenes,magic-evolution,magic-summary,magic-wardrobe,magic-browser,magic-apps,magic-feishu,magic-douyin,magic-taobao").split(",")
+    enabled_env = os.getenv("MCP_SERVERS", "amap-maps,baize-skills,filesystem,magic-music,magic-reminder,magic-notes,magic-system,magic-info,magic-life,magic-scenes,magic-evolution,magic-summary,magic-wardrobe,magic-browser,magic-apps,magic-feishu,magic-douyin,magic-taobao,magic-recipe").split(",")
     enabled_env = [s.strip() for s in enabled_env if s.strip()]
     if mcp_set == "none":
         mcp_servers = {}
@@ -295,7 +297,8 @@ def _classify_intent(text: str) -> str:
         ({"放歌", "放一首", "放个", "播放", "听歌", "放周杰伦", "放毛不易", "音乐", "歌单", "停止播放", "每日推荐", "随机", "来一首", "播一首", "点一首", "放首", "放点", "整首", "整点", "循环", "单曲", "来首", "点歌", "唱首歌", "放音乐"}, "magic-music"),
         ({"空调", "电视", "制冷", "制热", "风扇", "开灯", "关灯", "关闭空调", "关闭电视"}, "ac-control"),
         ({"文件", "读文件", "写文件", "笔记"}, "filesystem"),
-        ({"外卖", "点餐", "吃饭", "购物", "商品", "查一下", "充电桩", "特斯拉", "出门"}, "magic-life"),
+        ({"外卖", "点餐", "购物", "商品", "查一下", "充电桩", "特斯拉", "出门"}, "magic-life"),
+        ({"做菜", "菜谱", "食谱", "做什么菜", "食材", "吃什么", "吃饭", "怎么做", "做法", "怎么煮", "怎么炒", "今天吃啥", "今晚吃啥", "中午吃啥", "推荐个菜", "推荐一道菜", "凉菜", "热菜", "汤", "主食", "下饭", "买菜", "番茄炒蛋", "可乐鸡翅"}, "magic-recipe"),
         ({"学习", "进化", "自进化", "优化", "自我优化", "自学习", "学习进度", "进化状态"}, "magic-evolution"),
         ({"淘宝", "京东", "比价", "商品", "价格对比", "买东西", "购物", "买"}, "magic-taobao"),
         ({"浏览器", "打开网页", "打开网站", "访问", "浏览", "爬取", "截图", "页面", "网页", "百度"}, "magic-browser"),
@@ -322,7 +325,7 @@ def _classify_intent(text: str) -> str:
             return mcp_name
     prompt = (
         "任务: 判断用户输入需要哪个工具, 只回一个词\n"
-        "选项: none | amap-maps | baize-skills | filesystem | magic-music | magic-reminder | magic-notes | magic-system | magic-info | magic-life | ac-control\n"
+        "选项: none | amap-maps | baize-skills | filesystem | magic-music | magic-reminder | magic-notes | magic-system | magic-info | magic-life | ac-control | magic-recipe\n"
         "规则:\n"
         "- none = 闲聊/问候/常识问答(你好/谢谢/讲个笑话)\n"
         "- amap-maps = 天气/地图/导航/我在哪/附近/路线/温度/几度\n"
@@ -333,6 +336,7 @@ def _classify_intent(text: str) -> str:
         "- magic-system = 音量/语速/设备状态\n"
         "- magic-info = 时间/新闻/翻译/计算\n"
         "- magic-life = 外卖/充电桩/特斯拉/出门\n"
+        "- magic-recipe = 做菜/菜谱/食谱/食材/吃什么/怎么做/今日推荐菜\n"
         "- magic-scenes = 晚安/早安/电影/出门场景\n"
         "- magic-evolution = 学习/优化/自进化\n"
         "- magic-browser = 浏览器/打开网页/搜索/截图/百度\n"
@@ -358,6 +362,8 @@ def _classify_intent(text: str) -> str:
         "  打开百度/搜索百度→magic-browser\n"
         "  学习我→magic-evolution\n"
         "  打开空调→ac-control\n"
+        "  番茄炒蛋怎么做→magic-recipe\n"
+        "  今天吃什么→magic-recipe\n"
         "  音量调大→magic-system\n"
         "  现在几点→magic-info\n"
         f"用户输入: {text[:100]}\n"
@@ -388,6 +394,7 @@ def _classify_intent(text: str) -> str:
         elif "feishu" in raw: mcp = "magic-feishu"
         elif "douyin" in raw: mcp = "magic-douyin"
         elif "taobao" in raw: mcp = "magic-taobao"
+        elif "recipe" in raw or "cook" in raw or "菜" in raw or "食谱" in raw: mcp = "magic-recipe"
         elif "magic" in raw: mcp = "magic-music"
         elif "ac" in raw or "air" in raw or "control" in raw: mcp = "ac-control"
         elif "file" in raw or "fs" in raw: mcp = "filesystem"
@@ -424,6 +431,7 @@ def _classify_intent(text: str) -> str:
             elif "feishu" in raw: mcp = "magic-feishu"
             elif "douyin" in raw: mcp = "magic-douyin"
             elif "taobao" in raw: mcp = "magic-taobao"
+            elif "recipe" in raw or "cook" in raw or "菜" in raw or "食谱" in raw: mcp = "magic-recipe"
             elif "magic" in raw or "remind" in raw: mcp = "magic-music"
             elif "ac" in raw or "air" in raw or "control" in raw: mcp = "ac-control"
             elif "file" in raw or "fs" in raw: mcp = "filesystem"
