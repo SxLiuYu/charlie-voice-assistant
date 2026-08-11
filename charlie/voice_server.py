@@ -108,10 +108,15 @@ _start_time = time.time()  # 服务启动时间(用于健康检查uptime)
 _scheduler_lock_handle = None
 
 
+# 专用有界线程池: ASR/TTS/brain 等阻塞 I/O 隔离, 避免占满默认 executor 拖垮其他协程
+_io_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="charlie-io")
+
+
 @asynccontextmanager
 async def lifespan(app):
     """启动+关闭生命周期"""
     # === 启动 ===
+    asyncio.get_running_loop().set_default_executor(_io_pool)  # asyncio.to_thread 自动用此池
     if os.environ.get("SKIP_BACKGROUND") == "1":
         log.info("后台调度器跳过(SKIP_BACKGROUND=1，由HTTP进程管理)")
     else:
@@ -137,6 +142,7 @@ async def lifespan(app):
         _save_history()
     except Exception:
         pass
+    _io_pool.shutdown(wait=False, cancel_futures=True)
 
 def _validate_env():
     """启动时检查必需的API密钥，缺失的会警告"""
@@ -1573,8 +1579,12 @@ async def asr_api(file: UploadFile = File(...)):
 
 # ===== Vosk 唤醒词检测(Charlie) =====
 _VOSK_MODEL = None
-_VOSK_WAKE_WORDS = ["charlie", "charley", "charls", "charles", "チャーリー", "查理", "查里", "chali", "chali", "charli",
-                    "查理", "查莉", "查利", "查里", "茶理", "嘞查嘞", "嘞查", "查嘞"]
+# 支持 WAKE_WORDS env 自定义(逗号分隔)，默认英文charlie + 中文谐音
+_VOSK_VARIONS = ["charlie", "charley", "charls", "charles", "チャーリー", "查理", "查里", "chali", "chali", "charli",
+                "查理", "查莉", "查利", "查里", "茶理", "嘞查嘞", "嘞查", "查嘞"]
+_VOSK_WAKE_WORDS = [w.strip().lower() for w in
+                    os.getenv("WAKE_WORDS", ",".join(_VOSK_VARIONS)).split(",")
+                    if w.strip()] or _VOSK_VARIONS
 
 def _get_vosk_model():
     global _VOSK_MODEL
@@ -1930,7 +1940,14 @@ def _ws_cleanup_after_disconnect(ws_id: int, close_connection: bool = False):
 async def xiaozhi_ota(request: Request):
     """OTA config endpoint for xiaozhi firmware. Returns websocket connection info
     so the device skips activation and connects directly to /ws/xiaozhi.
-    The firmware POSTs board info here; we ignore the body and return WS config."""
+    The firmware POSTs board info here; we log the body (device self-report)
+    and return WS config."""
+    try:
+        body = await request.body()
+        if body:
+            log.info("[xiaozhi] OTA device self-report: %s", body[:500].decode("utf-8", "replace"))
+    except Exception as e:
+        log.warning("[xiaozhi] OTA body read error: %s", e)
     host = request.url.hostname or "192.168.1.3"
     ws_url = f"ws://{host}:8000/ws/xiaozhi"
     return JSONResponse({
