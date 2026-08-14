@@ -9,7 +9,7 @@ log = logging.getLogger("magic")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 3, 10]
-RETRY_AFTER_CAP = float(__import__("os").environ.get("ASSISTANT_KID_RETRY_AFTER_CAP", "60"))
+RETRY_AFTER_CAP = float(__import__("os").environ.get("ASSISTANT_KID_RETRY_AFTER_CAP") or "60")
 
 def _http_error_message(exc: requests.exceptions.HTTPError, name: str) -> str:
     response = getattr(exc, "response", None)

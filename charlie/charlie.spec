@@ -137,18 +137,18 @@ def _find_ncm():
 ffmpeg_path = _find_ffmpeg()
 if ffmpeg_path:
     datas.append((ffmpeg_path, 'bin'))
-    print(f"[spec] 找到 ffmpeg: {ffmpeg_path}")
+    print(f"[spec] ffmpeg found: {ffmpeg_path}")
 else:
-    print("[spec] ⚠️ 未找到 ffmpeg，音频转码将不可用！")
+    print("[spec] WARNING: ffmpeg not found, audio transcoding unavailable!")
     print("[spec]   macOS: brew install ffmpeg")
-    print("[spec]   Windows: choco install ffmpeg 或手动下载")
+    print("[spec]   Windows: choco install ffmpeg or manual download")
 
 ncm_path = _find_ncm()
 if ncm_path:
     datas.append((ncm_path, 'bin'))
-    print(f"[spec] 找到 ncm: {ncm_path}")
+    print(f"[spec] ncm found: {ncm_path}")
 else:
-    print("[spec] ⚠️ 未找到 ncm-cli，音乐播放将不可用！")
+    print("[spec] WARNING: ncm-cli not found, music playback unavailable!")
     print("[spec]   macOS: pip install ncm-cli")
     print("[spec]   Windows: pip install ncm-cli")
 
