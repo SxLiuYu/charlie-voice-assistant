@@ -154,27 +154,40 @@ else:
 
 # opus DLL (xiaozhi_codec/opuslib needs native libopus)
 def _find_opus():
-    """查找系统 opus 动态库路径"""
+    """查找系统 opus 动态库完整路径"""
     import ctypes.util
-    # Windows: find_library('opus') looks for opus.dll
-    loc = ctypes.util.find_library('opus')
-    if loc:
-        return loc
-    # macOS common paths
-    for p in ['/opt/homebrew/lib/libopus.dylib', '/usr/local/lib/libopus.dylib',
-              '/usr/lib/libopus.dylib', '/opt/local/lib/libopus.dylib']:
-        if os.path.isfile(p):
-            return p
-    # Linux common paths
-    for p in ['/usr/lib/x86_64-linux-gnu/libopus.so.0', '/usr/lib/libopus.so.0',
-              '/usr/lib64/libopus.so.0']:
-        if os.path.isfile(p):
-            return p
-    # Windows: check venv site-packages or _internal
+    # Windows: find_library('opus') looks for opus.dll (returns full path on Win)
     if platform.system() == 'Windows':
+        loc = ctypes.util.find_library('opus')
+        if loc and os.path.isfile(loc):
+            return loc
         for p in [os.path.join(os.getcwd(), '_internal', 'opus.dll'),
                   os.path.join(os.getcwd(), 'opus.dll'),
                   os.path.join(os.getcwd(), '_internal', 'libopus-0.dll')]:
+            if os.path.isfile(p):
+                return p
+    # macOS common paths
+    if platform.system() == 'Darwin':
+        for p in ['/opt/homebrew/lib/libopus.dylib', '/usr/local/lib/libopus.dylib',
+                  '/usr/lib/libopus.dylib', '/opt/local/lib/libopus.dylib']:
+            if os.path.isfile(p):
+                return p
+    # Linux: try ldconfig for full path, then common paths
+    if platform.system() == 'Linux':
+        try:
+            import subprocess
+            r = subprocess.run(['ldconfig', '-p'], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.split('\n'):
+                if 'libopus.so' in line:
+                    parts = line.strip().split('->')
+                    if len(parts) == 2:
+                        p = parts[1].strip()
+                        if os.path.isfile(p):
+                            return p
+        except Exception:
+            pass
+        for p in ['/usr/lib/x86_64-linux-gnu/libopus.so.0', '/usr/lib/libopus.so.0',
+                  '/usr/lib64/libopus.so.0', '/usr/lib/aarch64-linux-gnu/libopus.so.0']:
             if os.path.isfile(p):
                 return p
     return None
