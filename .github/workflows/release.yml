@@ -148,9 +148,10 @@ jobs:
           path: 'esp32-src'
 
       - name: 构建公版固件 (OOTB)
+        shell: bash
         run: |
-          # espressif/idf 容器：export.sh 设置 IDF_PATH 和 PATH
-          . /opt/esp/idf/export.sh
+          # espressif/idf 容器：export.sh 需要 bash（[[ 语法）
+          source /opt/esp/idf/export.sh
           cd esp32-src
           # 使用公版板型配置
           cat > sdkconfig.defaults << 'EOF'
