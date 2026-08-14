@@ -143,8 +143,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: 'SxLiuYu/xiaozhi-esp32'
-          ref: 'charlie-lc-s3-v2'
+          repository: '78/xiaozhi-esp32'
+          ref: 'main'
           path: 'esp32-src'
 
       - name: 构建公版固件 (OOTB)
@@ -153,8 +153,6 @@ jobs:
           # espressif/idf 容器：export.sh 需要 bash（[[ 语法）
           source /opt/esp/idf/export.sh
           cd esp32-src
-          # 删除分支自带的 sdkconfig（可能为更高 IDF 版本生成，与 v5.1.4 容器不兼容）
-          rm -f sdkconfig sdkconfig.old
           # 使用公版板型配置
           cat > sdkconfig.defaults << 'EOF'
           CONFIG_BOARD_TYPE_XINGZHI_CUBE_1_54TFT_WIFI=y
