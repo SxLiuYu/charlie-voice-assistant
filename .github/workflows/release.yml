@@ -171,6 +171,8 @@ jobs:
           python -m PyInstaller --version
           echo "=== Build start ==="
           python -m PyInstaller charlie.spec --noconfirm 2>&1 || { echo "BUILD FAILED"; exit 1; }
+
+      - name: 打包 tar.gz
         run: |
           cd charlie/dist
           tar -czf Charlie-linux.tar.gz charlie/
