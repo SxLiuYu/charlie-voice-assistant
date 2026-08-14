@@ -163,9 +163,14 @@ jobs:
       - name: 构建
         run: |
           cd charlie
-          pyinstaller charlie.spec --noconfirm
-
-      - name: 打包 tar.gz
+          echo "=== Python version ==="
+          python --version
+          echo "=== Find opus ==="
+          find / -name "libopus*" 2>/dev/null || true
+          echo "=== PyInstaller version ==="
+          python -m PyInstaller --version
+          echo "=== Build start ==="
+          python -m PyInstaller charlie.spec --noconfirm 2>&1 || { echo "BUILD FAILED"; exit 1; }
         run: |
           cd charlie/dist
           tar -czf Charlie-linux.tar.gz charlie/
