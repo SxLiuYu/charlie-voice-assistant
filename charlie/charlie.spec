@@ -66,8 +66,8 @@ datas = [
     # 注: skills/ 下的 u2-asr-pro/u2-tts-pro 是 ClawHub 技能，Charlie 不加载，不打包
     ('.env.example', '.'),             # 配置模板
     ('fcntl_compat.py', '.'),          # Windows fcntl 垫片
-    # ESP32 干净固件（已擦除 NVS，无任何 WiFi/服务器信息；用户通过 AP 热点门户配网）
-    ('../firmware/charlie-esp32-flash-16MB.bin', 'firmware'),
+    # ESP32 firmware (only include if available — not in git, may be added locally)
+    *([('../firmware/charlie-esp32-flash-16MB.bin', 'firmware')] if os.path.isfile('../firmware/charlie-esp32-flash-16MB.bin') else []),
     # MCP 源码文件 (文件名带连字符, 无法作为模块 import, 需作为数据文件打包, 运行时按路径加载)
     ('magic-info.py', '.'),
     ('magic-music.py', '.'),

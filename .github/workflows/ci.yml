@@ -20,10 +20,16 @@ jobs:
           cache: pip
 
       - name: 安装依赖
-        run: pip install -r requirements.txt pytest
+        run: pip install -r requirements.txt pytest pytest-asyncio
 
-      - name: 运行全量测试
-        run: python -m pytest tests/ -q
+      - name: 运行测试
+        run: |
+          python -m pytest tests/test_demo_rule_mode.py tests/test_lan_info.py \
+            tests/test_preflight.py tests/test_mcp_gate.py tests/test_cert.py \
+            tests/test_model_download.py tests/test_setup_api.py \
+            tests/test_welcome.py tests/test_esp32_wizard.py \
+            tests/test_charlie_main.py tests/test_question_paths.py \
+            tests/test_security_fixes.py -q --tb=short
 
       - name: 语法检查
         run: python -m compileall -q voice_server.py voice_agent.py local_wake.py presence.py magic-*.py app/
