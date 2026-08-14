@@ -85,5 +85,9 @@ vosk
 opuslib>=3.0.1
 sherpa_onnx
 
+# ===== 原生桌面窗口 (pywebview + WebView2) =====
+pywebview
+pythonnet; platform_system == "Windows"
+
 # ===== dev（测试开发用，生产不需要） =====
 pytest==9.1.1
