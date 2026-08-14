@@ -139,7 +139,7 @@ jobs:
     needs: test
     if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.build_esp32 == 'true')
     runs-on: ubuntu-latest
-    container: espressif/idf:v5.1.4
+    container: espressif/idf:release-v5.5
     steps:
       - uses: actions/checkout@v4
         with:
