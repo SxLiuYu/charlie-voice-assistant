@@ -1,0 +1,157 @@
+name: CI/CD — 多平台构建 + 测试 + Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 测试 ──
+  test:
+    name: 测试 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: charlie
+    strategy:
+      matrix:
+        python-version: ['3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg portaudio19-dev 2>/dev/null || true
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: 运行测试
+        run: |
+          python -m pytest tests/test_demo_rule_mode.py tests/test_lan_info.py \
+            tests/test_preflight.py tests/test_mcp_gate.py tests/test_cert.py \
+            tests/test_model_download.py tests/test_setup_api.py \
+            tests/test_welcome.py tests/test_esp32_wizard.py \
+            tests/test_charlie_main.py tests/test_question_paths.py \
+            tests/test_security_fixes.py -q --tb=short
+
+      - name: 语法检查
+        run: python -m compileall -q voice_server.py voice_agent.py local_wake.py presence.py magic-*.py app/
+
+  # ── macOS 构建 ──
+  build-macos:
+    name: 构建 macOS
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: |
+          brew install ffmpeg || true
+          cd charlie
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: 构建
+        run: |
+          cd charlie
+          pyinstaller charlie.spec --noconfirm
+
+      - name: 打包 zip
+        run: |
+          cd charlie/dist
+          zip -r Charlie-macos.zip charlie/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: charlie-macos
+          path: charlie/dist/Charlie-macos.zip
+
+  # ── Windows 构建 ──
+  build-windows:
+    name: 构建 Windows
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: |
+          cd charlie
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: 构建
+        run: |
+          cd charlie
+          pyinstaller charlie.spec --noconfirm
+
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path charlie/dist/charlie -DestinationPath charlie/dist/Charlie-windows.zip -Force
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: charlie-windows
+          path: charlie/dist/Charlie-windows.zip
+
+  # ── Linux 构建 ──
+  build-linux:
+    name: 构建 Linux
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg portaudio19-dev 2>/dev/null || true
+          cd charlie
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: 构建
+        run: |
+          cd charlie
+          pyinstaller charlie.spec --noconfirm
+
+      - name: 打包 tar.gz
+        run: |
+          cd charlie/dist
+          tar -czf Charlie-linux.tar.gz charlie/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: charlie-linux
+          path: charlie/dist/Charlie-linux.tar.gz
