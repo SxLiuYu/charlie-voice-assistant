@@ -82,7 +82,7 @@ class TestWeatherFastPath:
             "dayweather": "多云", "nightweather": "晴",
             "daytemp": "31", "nighttemp": "21",
         }]}]}
-        with patch.object(voice_agent, "requests") as m_req:
+        with patch("agent.weather.requests") as m_req:
             m_req.get.return_value.json.return_value = payload
             with patch.dict("os.environ", {"AMAP_KEY": "test-key"}, clear=False):
                 reply = voice_agent._direct_weather_play("今天天气咋样")

@@ -60,6 +60,8 @@ hidden_imports = [
     # 跨平台系统控制/截图(可选，缺失自动降级)
     'mss', 'comtypes', 'pycaw', 'pycaw.pycaw',
     'fcntl_compat',
+    # voice_agent 拆分的快路径模块
+    'agent.music', 'agent.weather', 'agent.vision', 'agent.device_control',
 ]
 
 # 收集数据文件 (前端HTML, 模板, 配置)
