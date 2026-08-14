@@ -79,3 +79,6 @@ pycaw; platform_system == "Windows"
 comtypes; platform_system == "Windows"
 # 跨平台截图(Win/Linux)
 mss
+# 原生桌面窗口 (pywebview + WebView2)
+pywebview
+pythonnet; platform_system == "Windows"

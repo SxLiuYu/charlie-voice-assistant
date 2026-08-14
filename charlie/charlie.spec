@@ -152,6 +152,43 @@ else:
     print("[spec]   macOS: pip install ncm-cli")
     print("[spec]   Windows: pip install ncm-cli")
 
+# opus DLL (xiaozhi_codec/opuslib needs native libopus)
+def _find_opus():
+    """查找系统 opus 动态库路径"""
+    import ctypes.util
+    # Windows: find_library('opus') looks for opus.dll
+    loc = ctypes.util.find_library('opus')
+    if loc:
+        return loc
+    # macOS common paths
+    for p in ['/opt/homebrew/lib/libopus.dylib', '/usr/local/lib/libopus.dylib',
+              '/usr/lib/libopus.dylib', '/opt/local/lib/libopus.dylib']:
+        if os.path.isfile(p):
+            return p
+    # Linux common paths
+    for p in ['/usr/lib/x86_64-linux-gnu/libopus.so.0', '/usr/lib/libopus.so.0',
+              '/usr/lib64/libopus.so.0']:
+        if os.path.isfile(p):
+            return p
+    # Windows: check venv site-packages or _internal
+    if platform.system() == 'Windows':
+        for p in [os.path.join(os.getcwd(), '_internal', 'opus.dll'),
+                  os.path.join(os.getcwd(), 'opus.dll'),
+                  os.path.join(os.getcwd(), '_internal', 'libopus-0.dll')]:
+            if os.path.isfile(p):
+                return p
+    return None
+
+opus_path = _find_opus()
+if opus_path:
+    binaries.append((opus_path, '.'))
+    print(f"[spec] opus found: {opus_path}")
+else:
+    print("[spec] WARNING: opus library not found, xiaozhi codec will be unavailable!")
+    print("[spec]   macOS: brew install opus")
+    print("[spec]   Linux: apt install libopus0")
+    print("[spec]   Windows: download opus.dll to _internal/")
+
 binaries = []
 if ffmpeg_path:
     binaries.append((ffmpeg_path, 'bin'))
