@@ -32,7 +32,7 @@ jobs:
       - name: 安装系统依赖
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg portaudio19-dev 2>/dev/null || true
+          sudo apt-get install -y -qq ffmpeg portaudio19-dev libopus-dev libopus0 2>/dev/null || true
 
       - name: 安装依赖
         run: |
@@ -66,7 +66,7 @@ jobs:
 
       - name: 安装依赖
         run: |
-          brew install ffmpeg || true
+          brew install ffmpeg opus || true
           cd charlie
           python -m pip install -r requirements.txt pyinstaller
 
@@ -104,6 +104,27 @@ jobs:
           cd charlie
           python -m pip install -r requirements.txt pyinstaller
 
+      - name: 下载 opus.dll (Windows)
+        shell: pwsh
+        run: |
+          $url = "https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-opus-1.5.2-1-any.pkg.tar.zst"
+          $tmp = "$env:TEMP\opus.tar.zst"
+          Invoke-WebRequest -Uri $url -OutFile $tmp
+          pip install zstandard
+          python -c "
+          import zstandard, tarfile, os, shutil
+          with open(r'$tmp', 'rb') as f:
+              dctx = zstandard.ZstdDecompressor()
+              with dctx.stream_reader(f) as reader:
+                  with tarfile.open(fileobj=reader, mode='r|') as tar:
+                      tar.extractall(path='$env:TEMP\opus-extract')
+          src = os.path.join(os.environ['TEMP'], 'opus-extract', 'mingw64', 'bin', 'libopus-0.dll')
+          dst = 'charlie/_internal/opus.dll'
+          os.makedirs(os.path.dirname(dst), exist_ok=True)
+          shutil.copy(src, dst)
+          print('opus.dll downloaded')
+          "
+
       - name: 构建
         run: |
           cd charlie
@@ -136,7 +157,7 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg portaudio19-dev 2>/dev/null || true
+          sudo apt-get install -y -qq ffmpeg portaudio19-dev libopus-dev libopus0 2>/dev/null || true
           cd charlie
           python -m pip install -r requirements.txt pyinstaller
 
