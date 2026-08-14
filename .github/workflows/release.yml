@@ -153,6 +153,8 @@ jobs:
           # espressif/idf 容器：export.sh 需要 bash（[[ 语法）
           source /opt/esp/idf/export.sh
           cd esp32-src
+          # 删除分支自带的 sdkconfig（可能为更高 IDF 版本生成，与 v5.1.4 容器不兼容）
+          rm -f sdkconfig sdkconfig.old
           # 使用公版板型配置
           cat > sdkconfig.defaults << 'EOF'
           CONFIG_BOARD_TYPE_XINGZHI_CUBE_1_54TFT_WIFI=y
