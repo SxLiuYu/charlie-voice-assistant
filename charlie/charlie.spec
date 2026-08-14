@@ -30,6 +30,10 @@ hidden_imports = [
     'mcp_common', 'app.audio', 'app.brain_health', 'app.state',
     'app.reminders', 'app.config', 'app.env_catalog', 'app.preflight',
     'app.cert', 'app.mcp_gate', 'utils',
+    # 拆分后的新模块 (voice_server.py 重构)
+    'app.http_helpers', 'app.notifications', 'app.cors', 'app.schedulers',
+    'app.routes', 'app.routes.system', 'app.routes.conversation',
+    'app.routes.reminders', 'app.routes.websocket', 'app.routes.manage',
     # qwen_agent 隐式依赖
     'qwen_agent', 'qwen_agent.agents', 'qwen_agent.tools',
     'qwen_agent.tools.mcp_manager',
