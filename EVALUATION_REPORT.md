@@ -1,13 +1,42 @@
 # Charlie 语音助手 — 代码评估报告
 
+## 0. 已完成的修复
+
+| 修复 | 文件 | 提交 | 影响 |
+|------|------|------|------|
+| **拆分 voice_server.py** (3821→232行, 94%减少) | 9个新模块 | `fc879a6` | God-File 反模式消除 |
+| **charlie.spec hidden_imports** | `charlie.spec` | `9f3bd3b` | PyInstaller 打包含新模块 |
+| **UTF-8 编码** | `tests/test_security_fixes.py` | `7d9e1b9` | Windows GBK 测试崩溃 |
+| **opus 库查找** | `charlie.spec` | `0c535dd` | Linux CI 构建失败 |
+| **空默认值** | `app/env_catalog.py` | `f4dad9a` | `int("")`/`float("")` 崩溃 |
+| **pywebview 依赖** | `requirements.txt` | `e91f166` | CI 构建缺原生 GUI |
+
+### 拆分后的模块结构
+
+```
+voice_server.py (232行)      — 精简入口: 日志→FastAPI→中间件→路由→启动
+├── app/http_helpers.py (149行)   — ETag/JSON/HTML/SSE 响应辅助
+├── app/notifications.py (220行)  — 通知队列/飞书/ntfy/SSE/提醒音频/xiaozhi推送
+├── app/cors.py (107行)           — 动态CORS + 限流
+├── app/schedulers.py (425行)     — 提醒/主动建议/自进化/决策引擎/唤醒词
+├── app/routes/
+│   ├── system.py (355行)         — 只读系统状态路由 (已存在)
+│   ├── conversation.py (478行)  — 语音/文字/流式/ASR/TTS/搜索/导出
+│   ├── reminders.py (150行)     — 提醒/通知/SSE/lan-info/OTA
+│   ├── websocket.py (379行)     — WebSocket双向通信
+│   └── manage.py (712行)        — 配置/PWA/ESP32/偏好/行为/协议/MCP
+```
+
+**116 测试全部通过 ✅**
+
 ## 1. 项目结构
 
-### 1.1 God-File 反模式（严重）
+### 1.1 God-File 反模式（已修复）
 
-| 文件 | 行数 | 函数数 | 问题 |
-|------|------|--------|------|
-| `voice_server.py` | 3,415 | 155 | 路由 + 业务逻辑 + 调度器 + SSE + CORS + 飞书推送 + 天气 + 提醒 全在一个文件 |
-| `voice_agent.py` | 1,440 | ~40 | LLM 调用 + 缓存 + 音乐 + 天气 + 提醒 全在一个文件 |
+| 文件 | 原行数 | 现行数 | 状态 |
+|------|--------|--------|------|
+| `voice_server.py` | 3,821 | 232 | ✅ 已拆分为 9 个模块 |
+| `voice_agent.py` | 1,555 | 1,555 | 待后续拆分 |
 | `app/xiaozhi_ws.py` | 915 | ~30 | WebSocket + 音频编解码 + VAD + 唤醒 全在一个文件 |
 
 **建议拆分方案：**
