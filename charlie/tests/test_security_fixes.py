@@ -104,7 +104,7 @@ class TestBrainStatusNoDeadCode:
     def test_brain_status_has_no_unreachable_code(self):
         """验证brain_status函数体内return之后没有死代码"""
         import voice_agent
-        source = open(voice_agent.__file__).read()
+        source = open(voice_agent.__file__, encoding='utf-8').read()
         tree = ast.parse(source)
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "brain_status":
@@ -283,7 +283,8 @@ class TestEnvExampleCompleteness:
     def test_all_env_vars_documented(self):
         """所有代码中使用的env变量都在.env.example中有文档"""
         env_example = open(
-            os.path.join(PROJECT_DIR, ".env.example")
+            os.path.join(PROJECT_DIR, ".env.example"),
+            encoding='utf-8'
         ).read()
 
         # 收集代码中所有os.getenv调用的变量名
@@ -292,7 +293,7 @@ class TestEnvExampleCompleteness:
         for pyfile in ["voice_agent.py", "voice_server.py", "baize_skills_mcp.py", "mcp_server.py"]:
             path = os.path.join(PROJECT_DIR, pyfile)
             if os.path.exists(path):
-                content = open(path).read()
+                content = open(path, encoding='utf-8').read()
                 # 匹配 os.getenv("VAR_NAME") 和 os.environ.get("VAR_NAME")
                 for m in re.finditer(r'os\.(?:getenv|environ\.get)\(["\'](\w+)["\']', content):
                     env_vars_used.add(m.group(1))
