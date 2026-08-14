@@ -181,7 +181,6 @@ def _find_opus():
 
 opus_path = _find_opus()
 if opus_path:
-    binaries.append((opus_path, '.'))
     print(f"[spec] opus found: {opus_path}")
 else:
     print("[spec] WARNING: opus library not found, xiaozhi codec will be unavailable!")
@@ -194,6 +193,8 @@ if ffmpeg_path:
     binaries.append((ffmpeg_path, 'bin'))
 if ncm_path:
     binaries.append((ncm_path, 'bin'))
+if opus_path:
+    binaries.append((opus_path, '.'))
 binaries = [(s, d) for (s, d) in binaries if not _is_cache(s, d)]
 
 a = Analysis(
