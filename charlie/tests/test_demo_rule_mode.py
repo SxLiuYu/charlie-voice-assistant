@@ -20,14 +20,14 @@ class TestDemoRuleMode:
     def _demo_mode(self):
         """进入 Demo 模式（ARK_KEY 空 + Ollama 离线）的 patch 上下文"""
         return (
-            patch.object(voice_agent, "_demo_mode_active", return_value=True),
-            patch.object(voice_agent, "_ollama_online", return_value=False),
+            patch("agent.llm._demo_mode_active", return_value=True),
+            patch("agent.llm._ollama_online", return_value=False),
         )
 
     def test_demo_mode_time_query_returns_time(self):
         """Demo 模式下'几点了'返回当前时间，不调 LLM。"""
         p1, p2 = self._demo_mode()
-        with p1, p2, patch.object(voice_agent, "_get_brain") as mock_brain:
+        with p1, p2, patch("agent.llm._get_brain") as mock_brain:
             reply = voice_agent.brain("几点了")
         assert "点" in reply and "分" in reply
         mock_brain.assert_not_called()
@@ -35,7 +35,7 @@ class TestDemoRuleMode:
     def test_demo_mode_time_query_format(self):
         """时间快路径返回格式'现在X点Y分'。"""
         p1, p2 = self._demo_mode()
-        with p1, p2, patch.object(voice_agent, "_get_brain"):
+        with p1, p2, patch("agent.llm._get_brain"):
             reply = voice_agent.brain("几点啦")
         assert reply.startswith("现在")
         assert reply.endswith("分。")
@@ -43,7 +43,7 @@ class TestDemoRuleMode:
     def test_demo_mode_scene_trigger_goodnight(self):
         """Demo 模式下'晚安'触发 goodnight 场景，不返回 Demo 拦截提示，不调 LLM。"""
         p1, p2 = self._demo_mode()
-        with p1, p2, patch.object(voice_agent, "_get_brain") as mock_brain:
+        with p1, p2, patch("agent.llm._get_brain") as mock_brain:
             reply = voice_agent.brain("晚安")
         assert reply, "晚安应返回非空场景结果"
         assert "Demo 模式能力有限" not in reply, f"晚安应触发场景，实际返回: {reply}"
@@ -56,7 +56,7 @@ class TestDemoRuleMode:
         Demo 模式应返回含'Demo'或'配置'的提示串，而非'大脑启动失败'。
         """
         p1, p2 = self._demo_mode()
-        with p1, p2, patch.object(voice_agent, "_get_brain") as mock_brain:
+        with p1, p2, patch("agent.llm._get_brain") as mock_brain:
             reply = voice_agent.brain("讲个笑话")
         assert ("Demo" in reply or "配置" in reply or "key" in reply.lower()), \
             f"应返回引导配置提示，实际: {reply}"
@@ -64,8 +64,8 @@ class TestDemoRuleMode:
 
     def test_non_demo_mode_unmatched_calls_brain(self):
         """非 Demo 模式（ARK_KEY 已配）下未命中快路径应正常调 LLM。"""
-        with patch.object(voice_agent, "_demo_mode_active", return_value=False), \
-             patch.object(voice_agent, "_get_brain") as mock_brain:
+        with patch("agent.llm._demo_mode_active", return_value=False), \
+             patch("agent.llm._get_brain") as mock_brain:
             mock_brain.return_value = MagicMock()
             mock_brain.return_value.run = MagicMock(return_value=["笑话来了"])
             try:

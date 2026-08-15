@@ -146,10 +146,10 @@ class TestMcpProcessCleanup:
 
     def test_record_failure_cleans_up_on_rebuild(self):
         """连续失败达阈值时清理旧大脑"""
-        import voice_agent
+        import voice_agent, agent.llm_state
         # 设置一个假大脑
         voice_agent._brains["test"] = MagicMock_brain()
-        voice_agent._brain_failures = voice_agent._MAX_BRAIN_FAILURES - 1
+        agent.llm_state.brain_failures = voice_agent._MAX_BRAIN_FAILURES - 1
         # 再失败一次应该触发重建
         voice_agent._record_brain_failure("test error")
         assert voice_agent._brains == {}

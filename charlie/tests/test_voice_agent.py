@@ -400,8 +400,8 @@ class TestBrainStreamSentences:
              {"role": "assistant", "content": "你好。我是Charlie，很高兴为你服务！"}]
         ])
 
-        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
-             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=mock_brain):
             voice_agent.reset_history()
             sentences = list(voice_agent.brain_stream_sentences("你好"))
 
@@ -414,8 +414,8 @@ class TestBrainStreamSentences:
 
     def test_stream_brain_not_built(self):
         """大脑未构建且无法构建时返回错误"""
-        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
-             patch.object(voice_agent, '_get_brain', side_effect=Exception("mock build failed")):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", side_effect=Exception("mock build failed")):
                 sentences = list(voice_agent.brain_stream_sentences("test"))
                 assert len(sentences) >= 1
                 assert "失败" in sentences[0][0] or "未" in sentences[0][0]
@@ -426,8 +426,8 @@ class TestBrainStreamSentences:
             {"role": "assistant", "content": "我会接着刚才被打断的内容说明。"}
         ]])
 
-        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
-             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=mock_brain):
             list(voice_agent.brain_stream_sentences(
                 "那明天呢？",
                 interrupted_reply="我正准备说明明天的天气和出门建议。"
@@ -452,8 +452,8 @@ class TestBrainStreamSentences:
         mock_brain = MagicMock()
         mock_brain.run = MagicMock(side_effect=replies)
 
-        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
-             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=mock_brain):
             first = list(voice_agent.brain_stream_sentences(
                 "那明天呢？",
                 interrupted_reply="我正准备说明明天的天气。",
@@ -610,14 +610,15 @@ class TestIntentClassification:
     """本地意图分类在 Ollama 不稳定时要快速降级并自动恢复。"""
 
     def setup_method(self):
-        voice_agent._intent_failures = 0
-        voice_agent._intent_disabled_until = 0.0
+        import agent.llm_state
+        agent.llm_state.intent_failures = 0
+        agent.llm_state.intent_disabled_until = 0.0
 
     def test_consecutive_local_intent_failures_trip_short_circuit(self):
         # 用不含领域关键词的长句, 绕过关键词/短句短路, 走真实LLM分类通道
         sentence = "顺带给我讲讲古筝这几种流派的发展脉络"
-        with patch.object(voice_agent, "INTENT_FAILURE_THRESHOLD", 2), \
-             patch.object(voice_agent, "INTENT_FAILURE_COOLDOWN", 30), \
+        with patch("agent.llm.INTENT_FAILURE_THRESHOLD", 2), \
+             patch("agent.llm.INTENT_FAILURE_COOLDOWN", 30), \
              patch.object(voice_agent.time, "time", return_value=100.0), \
              patch.object(voice_agent._session, "post", side_effect=requests.exceptions.Timeout("slow")) as mock_post:
             voice_agent._intent_cache.clear()
@@ -630,7 +631,8 @@ class TestIntentClassification:
             assert mock_post.call_count == 2
 
     def test_successful_intent_classification_resets_failure_state(self):
-        voice_agent._intent_failures = 1
+        import agent.llm_state
+        agent.llm_state.intent_failures = 1
         response = MagicMock()
         response.json.return_value = {
             "choices": [{"message": {"content": "amap-maps"}}]
@@ -1161,8 +1163,8 @@ class TestTimestamps:
         ])
         voice_agent.reset_history()
         voice_agent._cache.clear()  # 清除缓存, 确保走真实brain路径
-        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
-             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=mock_brain):
             voice_agent.brain("你好")
         hist = voice_agent._get_history("default")
         assert len(hist) >= 2
@@ -1184,8 +1186,8 @@ class TestTimestamps:
              {"role": "user", "content": "test"},
              {"role": "assistant", "content": "reply"}]
         ])
-        with patch.object(voice_agent, '_classify_intent', return_value="none"), \
-             patch.object(voice_agent, '_get_brain', return_value=mock_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=mock_brain):
             voice_agent.brain("test")
         
         # 验证brain.run收到的消息没有ts字段

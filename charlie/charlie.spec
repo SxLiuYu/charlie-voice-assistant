@@ -62,6 +62,7 @@ hidden_imports = [
     'fcntl_compat',
     # voice_agent 拆分的快路径模块
     'agent.music', 'agent.weather', 'agent.vision', 'agent.device_control',
+    'agent.llm_state', 'agent.llm',
 ]
 
 # 收集数据文件 (前端HTML, 模板, 配置)

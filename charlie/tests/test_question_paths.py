@@ -24,8 +24,8 @@ def _clean_state():
 # --------------------------------------------------------------------------- #
 class TestTimeFastPath:
     def test_brain_stream_time_bypasses_llm(self):
-        with patch.object(voice_agent, "_get_brain") as m_get_brain, \
-             patch.object(voice_agent, "_classify_intent") as m_cls:
+        with patch("agent.llm._get_brain") as m_get_brain, \
+             patch("agent.llm._classify_intent") as m_cls:
             sentences = list(voice_agent.brain_stream_sentences("现在几点啦"))
         assert m_get_brain.call_count == 0
         assert m_cls.call_count == 0
@@ -35,15 +35,15 @@ class TestTimeFastPath:
         assert "点" in s and "分" in s
 
     def test_brain_time_fast_path(self):
-        with patch.object(voice_agent, "_get_brain") as m_get_brain, \
-             patch.object(voice_agent, "_classify_intent", return_value="none"):
+        with patch("agent.llm._get_brain") as m_get_brain, \
+             patch("agent.llm._classify_intent", return_value="none"):
             reply = voice_agent.brain("几点了")
         assert m_get_brain.call_count == 0
         assert reply.startswith("现在") and ":" not in reply
 
     def test_time_does_not_pollute_cache(self):
         """时间结果必须实时, 不能被缓存污染。"""
-        with patch.object(voice_agent, "_get_brain"):
+        with patch("agent.llm._get_brain"):
             r1 = voice_agent.brain("现在几点")
         assert "现在" in r1
         # 缓存写入不覆盖"几点"条目
@@ -57,8 +57,8 @@ class TestTimeFastPath:
 class TestWeatherFastPath:
     def test_direct_weather_success(self):
         with patch.object(voice_agent, "_direct_weather_play", return_value="今天多云转晴,31到21度。") as m_w, \
-             patch.object(voice_agent, "_get_brain") as m_brain, \
-             patch.object(voice_agent, "_classify_intent") as m_cls:
+             patch("agent.llm._get_brain") as m_brain, \
+             patch("agent.llm._classify_intent") as m_cls:
             sentences = list(voice_agent.brain_stream_sentences("今天天气咋样"))
         assert m_w.call_count == 1
         assert m_brain.call_count == 0 and m_cls.call_count == 0
@@ -70,8 +70,8 @@ class TestWeatherFastPath:
             {"role": "assistant", "content": "查不到天气,建议出门看天。"}
         ]])
         with patch.object(voice_agent, "_direct_weather_play", return_value=""), \
-             patch.object(voice_agent, "_classify_intent", return_value="none"), \
-             patch.object(voice_agent, "_get_brain", return_value=fake_brain):
+             patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=fake_brain):
             sentences = list(voice_agent.brain_stream_sentences("今天天气"))
         assert len(sentences) >= 1
         assert "看天" in sentences[-1][1]
@@ -98,7 +98,7 @@ class TestWeatherFastPath:
 # --------------------------------------------------------------------------- #class TestMusicFastPath:
     def test_music_direct_route(self):
         with patch.object(voice_agent, "_direct_music_play", return_value="__MUSIC__播放好听的歌") as m_m, \
-             patch.object(voice_agent, "_get_brain") as m_brain:
+             patch("agent.llm._get_brain") as m_brain:
             sentences = list(voice_agent.brain_stream_sentences("播放音乐"))
         assert m_m.call_count == 1
         assert m_brain.call_count == 0
@@ -110,8 +110,8 @@ class TestWeatherFastPath:
             {"role": "assistant", "content": "好的,为您打开音乐。"}
         ]])
         with patch.object(voice_agent, "_direct_music_play", return_value=""), \
-             patch.object(voice_agent, "_classify_intent", return_value="music"), \
-             patch.object(voice_agent, "_get_brain", return_value=fake_brain):
+             patch("agent.llm._classify_intent", return_value="music"), \
+             patch("agent.llm._get_brain", return_value=fake_brain):
             sentences = list(voice_agent.brain_stream_sentences("来首歌"))
         assert len(sentences) >= 1
 
@@ -122,7 +122,7 @@ class TestWeatherFastPath:
 class TestAcFastPath:
     def test_stream_ac_direct_hit(self):
         with patch.object(voice_agent, "_direct_ac_control", return_value="空调已打开，制冷，26度。") as m_ac, \
-             patch.object(voice_agent, "_get_brain") as m_brain:
+             patch("agent.llm._get_brain") as m_brain:
             sentences = list(voice_agent.brain_stream_sentences("打开空调制冷26度"))
         assert m_ac.call_count == 1
         assert m_brain.call_count == 0
@@ -130,7 +130,7 @@ class TestAcFastPath:
 
     def test_brain_ac_direct_hit(self):
         with patch.object(voice_agent, "_direct_ac_control", return_value="空调已打开，制冷。") as m_ac, \
-             patch.object(voice_agent, "_get_brain") as m_brain:
+             patch("agent.llm._get_brain") as m_brain:
             reply = voice_agent.brain("空调制冷")
         assert m_ac.call_count == 1
         assert m_brain.call_count == 0
@@ -143,15 +143,15 @@ class TestAcFastPath:
             {"role": "assistant", "content": "好的，空调已打开。"}
         ]])
         with patch.object(voice_agent, "_direct_ac_control", return_value=""), \
-             patch.object(voice_agent, "_classify_intent", return_value="ac-control"), \
-             patch.object(voice_agent, "_get_brain", return_value=fake_brain):
+             patch("agent.llm._classify_intent", return_value="ac-control"), \
+             patch("agent.llm._get_brain", return_value=fake_brain):
             reply = voice_agent.brain("打开空调")
         assert reply == "好的，空调已打开。"
         assert fake_brain.run.call_count == 1
 
     def test_direct_ac_parses_weather_safe(self):
         """含『天气』的问句不得被 AC 快路径拦截(走天气), 即使包含『温度』。"""
-        with patch.object(voice_agent, "_get_brain"):
+        with patch("agent.llm._get_brain"):
             voice_agent.brain_stream_sentences("今天天气温度多少")
         # 不含天气词则需有 AC 关键词才触发；此处仅验证不误入AC快路径
 
@@ -168,26 +168,26 @@ class TestSmartCommand:
     """跨平台: patch platform.system 为 Darwin 以走 osascript 分支，subprocess.run 打桩。"""
 
     def test_volume_up(self):
-        with patch("voice_agent.platform.system", return_value="Darwin"), \
+        with patch("agent.device_control.platform.system", return_value="Darwin"), \
              patch("subprocess.run") as m_run:
             reply = voice_agent._handle_smart_command("音量大一点")
         assert reply == "音量已调大。"
         m_run.assert_called_once()
 
     def test_volume_down(self):
-        with patch("voice_agent.platform.system", return_value="Darwin"), \
+        with patch("agent.device_control.platform.system", return_value="Darwin"), \
              patch("subprocess.run"):
             assert voice_agent._handle_smart_command("音量小一点") == "音量已调小。"
 
     def test_mute(self):
-        with patch("voice_agent.platform.system", return_value="Darwin"), \
+        with patch("agent.device_control.platform.system", return_value="Darwin"), \
              patch("subprocess.run") as m:
             assert voice_agent._handle_smart_command("静音") == "已静音。"
         m.assert_called_once()
 
     def test_stop_ack(self):
         # "停止/闭嘴" 只回复确认，不再静音系统音量
-        with patch("voice_agent.platform.system", return_value="Darwin"), \
+        with patch("agent.device_control.platform.system", return_value="Darwin"), \
              patch("subprocess.run") as m:
             assert voice_agent._handle_smart_command("闭嘴") == "好的，我停。"
         m.assert_not_called()
@@ -200,7 +200,7 @@ class TestSmartCommand:
 
     def test_volume_failure_gives_feedback(self):
         # 系统音量控制失败时应给明确反馈，而不是静默 None
-        with patch("voice_agent.platform.system", return_value="Darwin"), \
+        with patch("agent.device_control.platform.system", return_value="Darwin"), \
              patch("subprocess.run", side_effect=subprocess.TimeoutExpired("osascript", 3)):
             assert voice_agent._handle_smart_command("音量大") == "系统音量控制不可用，请手动调节。"
 
@@ -243,16 +243,16 @@ class TestCachePath:
         fake_brain.run = MagicMock(return_value=[[
             {"role": "assistant", "content": "这是缓存的回答。"}
         ]])
-        with patch.object(voice_agent, "_classify_intent", return_value="none"), \
-             patch.object(voice_agent, "_get_brain", return_value=fake_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=fake_brain):
             r1 = voice_agent.brain("讲个笑话")
             r2 = voice_agent.brain("讲个笑话")
         assert fake_brain.run.call_count == 1
         assert r1 == r2
 
     def test_stream_cache_hit(self):
-        with patch.object(voice_agent, "_cache_set", wraps=voice_agent._cache_set) as m_set, \
-             patch.object(voice_agent, "_get_brain") as m_brain:
+        with patch("agent.llm._cache_set", wraps=voice_agent._cache_set) as m_set, \
+             patch("agent.llm._get_brain") as m_brain:
             list(voice_agent.brain_stream_sentences("讲个笑话"))
         m_set.assert_called_once()
 
@@ -266,8 +266,8 @@ class TestLLMChitchat:
         fake_brain.run = MagicMock(return_value=[[
             {"role": "assistant", "content": "你好。很高兴见到你,给你讲个小故事。"}
         ]])
-        with patch.object(voice_agent, "_classify_intent", return_value="none"), \
-             patch.object(voice_agent, "_get_brain", return_value=fake_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=fake_brain):
             sentences = list(voice_agent.brain_stream_sentences("你好"))
         assert len(sentences) >= 1
         assert sentences[-1][1].startswith("你好。")
@@ -278,8 +278,8 @@ class TestLLMChitchat:
         fake_brain.run = MagicMock(return_value=[[
             {"role": "assistant", "content": "让我想想。这是你的答案。"}
         ]])
-        with patch.object(voice_agent, "_classify_intent", return_value="none"), \
-             patch.object(voice_agent, "_get_brain", return_value=fake_brain):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=fake_brain):
             sentences = list(voice_agent.brain_stream_sentences("有个问题想问你"))
         joined = "".join(s[0] for s in sentences)
         assert "让我想想" not in joined
@@ -291,17 +291,17 @@ class TestLLMChitchat:
 # --------------------------------------------------------------------------- #
 class TestDegradation:
     def test_brain_build_failure(self):
-        with patch.object(voice_agent, "_classify_intent", return_value="none"), \
-             patch.object(voice_agent, "_get_brain", side_effect=Exception("boot fail")):
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", side_effect=Exception("boot fail")):
             sentences = list(voice_agent.brain_stream_sentences("测试"))
         assert sentences and "失败" in sentences[0][0]
 
     def test_ollama_fallback_on_run_error(self):
         fake_brain = MagicMock()
         fake_brain.run = MagicMock(side_effect=Exception("run error"))
-        with patch.object(voice_agent, "_classify_intent", return_value="none"), \
-             patch.object(voice_agent, "_get_brain", return_value=fake_brain), \
-             patch.object(voice_agent, "_ollama_fallback", return_value="本地回答") as m_oll:
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._get_brain", return_value=fake_brain), \
+             patch("agent.llm._ollama_fallback", return_value="本地回答") as m_oll:
             reply = voice_agent.brain("你好")
         assert reply == "本地回答"
         m_oll.assert_called_once()
