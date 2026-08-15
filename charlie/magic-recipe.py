@@ -207,7 +207,7 @@ def _call_ark_llm(system_prompt: str, user_message: str, max_tokens: int = 1024)
 
 def _parse_llm_recipe(text: str) -> dict:
     """从 LLM 返回提取 JSON 菜谱(原样移植自 recipe_core)"""
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if m:
         text = m.group(1)
     try:

@@ -170,25 +170,43 @@ _DECISION_RULES = [
 
 # ===== 反馈数据 =====
 
+_feedback_cache: dict | None = None
+_feedback_cache_mtime: float = 0
+
+
 def _load_feedback() -> dict:
     """加载反馈数据: {rule_id: {positive: N, negative: N}}
-    注意: 调用方必须已持有 _decision_lock"""
+    注意: 调用方必须已持有 _decision_lock。带文件 mtime 缓存。"""
+    global _feedback_cache, _feedback_cache_mtime
+    try:
+        mtime = os.path.getmtime(FEEDBACK_FILE) if os.path.exists(FEEDBACK_FILE) else 0
+    except OSError:
+        mtime = 0
+    if _feedback_cache is not None and mtime == _feedback_cache_mtime:
+        return _feedback_cache
     try:
         if os.path.exists(FEEDBACK_FILE):
             with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+        else:
+            data = {}
     except Exception as e:
         log.debug(f"[decision] 加载反馈失败: {e}")
-    return {}
+        data = {}
+    _feedback_cache = data
+    _feedback_cache_mtime = mtime
+    return data
 
 
 def _save_feedback(feedback: dict):
     """保存反馈数据。注意: 调用方必须已持有 _decision_lock"""
+    global _feedback_cache
     try:
         with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
             json.dump(feedback, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.warning(f"[decision] 保存反馈失败: {e}")
+    _feedback_cache = None  # 使缓存失效
 
 
 def record_feedback(rule_id: str, is_positive: bool):

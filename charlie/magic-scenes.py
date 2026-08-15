@@ -63,8 +63,19 @@ _BUILTIN_PROTOCOLS = {
 }
 
 
+_protocols_cache: dict | None = None
+_protocols_cache_mtime: float = 0
+
+
 def _load_protocols() -> dict:
-    """加载所有 Protocol (内置 + 用户自定义)"""
+    """加载所有 Protocol (内置 + 用户自定义) — 带文件 mtime 缓存"""
+    global _protocols_cache, _protocols_cache_mtime
+    try:
+        mtime = os.path.getmtime(PROTOCOLS_FILE) if os.path.exists(PROTOCOLS_FILE) else 0
+    except OSError:
+        mtime = 0
+    if _protocols_cache is not None and mtime == _protocols_cache_mtime:
+        return _protocols_cache
     protocols = dict(_BUILTIN_PROTOCOLS)
     try:
         if os.path.exists(PROTOCOLS_FILE):
@@ -73,24 +84,31 @@ def _load_protocols() -> dict:
                     custom = _json.load(f)
             if isinstance(custom, dict):
                 protocols.update(custom)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"[scenes] 加载自定义协议失败: {e}")
+    _protocols_cache = protocols
+    _protocols_cache_mtime = mtime
     return protocols
 
 
 def _save_custom_protocol(key: str, protocol: dict):
     """保存用户自定义 Protocol"""
+    global _protocols_cache
     with _protocols_lock:
         custom = {}
         try:
             if os.path.exists(PROTOCOLS_FILE):
                 with open(PROTOCOLS_FILE, 'r', encoding='utf-8') as f:
                     custom = _json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(f"[scenes] 读取自定义协议失败: {e}")
         custom[key] = protocol
-        with open(PROTOCOLS_FILE, 'w', encoding='utf-8') as f:
-            _json.dump(custom, f, ensure_ascii=False, indent=2)
+        try:
+            with open(PROTOCOLS_FILE, 'w', encoding='utf-8') as f:
+                _json.dump(custom, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning(f"[scenes] 保存自定义协议失败: {e}")
+    _protocols_cache = None  # 使缓存失效
 
 
 def _get_weather() -> str:

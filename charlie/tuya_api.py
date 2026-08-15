@@ -21,6 +21,7 @@ from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import quote
 
 __all__ = ["TuyaAPI", "TuyaAPIError"]
 
@@ -552,7 +553,10 @@ class TuyaCloudAPI:
         content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest().lower()
         url = path
         if params:
-            url += "?" + "&".join(f"{k}={params[k]}" for k in sorted(params))
+            url += "?" + "&".join(
+                f"{quote(str(k), safe='')}={quote(str(params[k]), safe='')}"
+                for k in sorted(params)
+            )
         return f"{method}\n{content_sha256}\n\n{url}", str(int(time.time() * 1000))
 
     def _signed_headers(self, method: str, path: str, params: dict = None,
