@@ -626,9 +626,18 @@ class TuyaCloudAPI:
         Issues power first, then mode/temp/wind each as separate IR send.
         power: 0 off / 1 on; mode: 0 cool/1 heat/2 auto/3 fan/4 dry;
         temp: 16-30; wind: 0 auto/1 low/2 medium/3 high.
+
+        When power=0 (off), only the power-off command is sent — temp/wind/mode
+        are skipped to avoid the AC interpreting them as "turn on at 26°C".
         """
         ok = True
-        for code, value in [("power", power), ("mode", mode), ("temp", temp), ("wind", wind)]:
+        commands = [("power", power)]
+        if power == 0:
+            # 关机时只发 power=0，跳过 mode/temp/wind
+            commands = [("power", 0)]
+        else:
+            commands = [("power", power), ("mode", mode), ("temp", temp), ("wind", wind)]
+        for code, value in commands:
             if value is None:
                 continue
             r = self._request(

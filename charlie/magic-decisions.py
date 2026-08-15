@@ -266,8 +266,8 @@ def _load_pending() -> dict | None:
                     return data
                 else:
                     os.remove(PENDING_FILE)
-    except Exception:
-        pass
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        log.debug(f"[decision] op failed: {e}")
     return None
 
 
@@ -281,8 +281,8 @@ def _save_pending(rule_id: str, text: str):
     try:
         with open(PENDING_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
-    except Exception:
-        pass
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        log.debug(f"[decision] op failed: {e}")
 
 
 def set_pending_confirmation(rule_id: str, text: str):
@@ -301,8 +301,8 @@ def clear_pending_confirmation():
     try:
         if os.path.exists(PENDING_FILE):
             os.remove(PENDING_FILE)
-    except Exception:
-        pass
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        log.debug(f"[decision] op failed: {e}")
 
 
 # ===== 决策历史 =====
@@ -313,8 +313,8 @@ def _load_decision_history() -> dict:
             if os.path.exists(DECISIONS_FILE):
                 with open(DECISIONS_FILE, 'r', encoding='utf-8') as f:
                     return json.load(f)
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            log.debug(f"[decision] op failed: {e}")
         return {}
 
 
@@ -323,8 +323,8 @@ def _save_decision_history(history: dict):
         try:
             with open(DECISIONS_FILE, 'w', encoding='utf-8') as f:
                 json.dump(history, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            log.debug(f"[decision] op failed: {e}")
 
 
 def _check_cooldown(rule_id: str, history: dict) -> bool:
@@ -395,10 +395,12 @@ def _calendar_check() -> str | None:
                     loc = e.get("location", "")
                     loc_str = f" ({loc})" if loc else ""
                     return f"会议即将开始: {summary}{loc_str}"
-            except Exception:
+            except (KeyError, TypeError, ValueError) as e:
+                log.debug(f"[decision] 日历事件解析跳过: {e}")
                 continue
         return None
-    except Exception:
+    except (OSError, KeyError, TypeError) as e:
+        log.debug(f"[decision] 日历检查失败: {e}")
         return None
 
 def _deadline_check() -> str | None:
@@ -535,8 +537,8 @@ def _arrive_home_check() -> str | None:
                        if not r.get("completed") and r.get("due_date", "") <= today]
                 if due:
                     parts.append(f"还有{len(due)}项待办")
-            except Exception:
-                pass
+            except (OSError, KeyError, TypeError) as e:
+                log.debug(f"[decision] 待办检查跳过: {e}")
             return "，".join(parts) + "。"
     except Exception as e:
         log.debug(f"[decision] arrive_home 异常: {e}")
@@ -554,8 +556,8 @@ def _contextual_greeting_check() -> str | None:
             w = get_weather_text()
             if w and ("雨" in w or "雪" in w):
                 parts.append(f"外面{w}，记得带伞")
-        except Exception:
-            pass
+        except (OSError, TypeError) as e:
+            log.debug(f"[decision] 天气检查跳过: {e}")
 
         # 待办提醒
         try:
@@ -565,8 +567,8 @@ def _contextual_greeting_check() -> str | None:
                    if not r.get("completed") and r.get("due_date", "") <= today]
             if due:
                 parts.append(f"你还有{len(due)}项待办没完成")
-        except Exception:
-            pass
+        except (OSError, KeyError, TypeError) as e:
+            log.debug(f"[decision] 待办检查跳过: {e}")
 
         if parts:
             return "，".join(parts) + "。"
@@ -595,7 +597,8 @@ def evaluate(user_state: dict, protocol_executor=None) -> list:
         _is_holiday = is_holiday()
         if _is_holiday:
             log.info("[decision] 今天是公共假日，跳过工作相关规则")
-    except Exception:
+    except (ImportError, OSError, TypeError) as e:
+        log.debug(f"[decision] 假日检查跳过: {e}")
         _is_holiday = False
 
     for rule in _DECISION_RULES:

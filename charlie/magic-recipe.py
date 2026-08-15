@@ -44,8 +44,8 @@ def _load_recipes() -> list:
         try:
             with open(RECIPE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            log.debug(f"[recipe] 加载菜谱失败: {e}")
     return []
 
 
@@ -62,8 +62,8 @@ def _load_profile() -> dict:
         try:
             with open(PROFILE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            log.debug(f"[recipe] 加载画像失败: {e}")
     return default
 
 
@@ -72,8 +72,8 @@ def _load_history() -> dict:
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            log.debug(f"[recipe] 加载历史失败: {e}")
     return {"orders": []}
 
 
@@ -81,8 +81,8 @@ def _save_recipes(recipes: list):
     try:
         with open(RECIPE_FILE, "w", encoding="utf-8") as f:
             json.dump(recipes, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except OSError as e:
+        log.warning(f"[recipe] 保存菜谱失败: {e}")
 
 
 # ── 格式化 ──
@@ -201,7 +201,8 @@ def _call_ark_llm(system_prompt: str, user_message: str, max_tokens: int = 1024)
                 "extra_body": {"enable_thinking": False},
             }, timeout=30)
         return r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    except Exception:
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        log.debug(f"[recipe] LLM 调用失败: {e}")
         return ""
 
 
@@ -390,8 +391,8 @@ def recommend_daily() -> str:
         try:
             if datetime.fromisoformat(order["ordered_at"]) > cutoff:
                 recently.add(order["dish"])
-        except Exception:
-            pass
+        except (ValueError, KeyError, TypeError) as e:
+            log.debug(f"[recipe] 订单解析跳过: {e}")
 
     # 打分排序
     candidates = []

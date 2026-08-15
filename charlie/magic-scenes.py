@@ -114,9 +114,10 @@ def _save_custom_protocol(key: str, protocol: dict):
 def _get_weather() -> str:
     """获取今天天气摘要"""
     AMAP = os.getenv("AMAP_KEY", "")
+    AMAP_CITY = os.getenv("AMAP_CITY", "110000")  # 默认北京，可通过环境变量覆盖
     try:
         r = requests.get("https://restapi.amap.com/v3/weather/weatherInfo",
-            params={"city": "110000", "key": AMAP, "extensions": "all"}, timeout=10).json()
+            params={"city": AMAP_CITY, "key": AMAP, "extensions": "all"}, timeout=10).json()
         casts = (r.get("forecasts") or [{}])[0].get("casts", [])
         if casts:
             today = casts[0]
@@ -130,8 +131,8 @@ def _get_weather() -> str:
                     weather_parts.append(w)
             weather = "转".join(weather_parts) if len(weather_parts) > 1 else (weather_parts[0] if weather_parts else "")
             return f"今天{weather}，{day_temp}到{night_temp}度"
-    except Exception:
-        pass
+    except (OSError, KeyError, ValueError) as e:
+        log.debug(f"[scenes] 天气获取失败: {e}")
     return ""
 
 
