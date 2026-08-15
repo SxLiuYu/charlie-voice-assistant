@@ -593,6 +593,7 @@ class TuyaCloudAPI:
                 return
             # 换 token 时 message 不含 access_token → 先清空
             self.access_token = ""
+            self._token_expire = 0  # 防止其他线程看到过期时间仍有效
             result = self._request("GET", "/v1.0/token",
                                    params={"grant_type": "1"}, _is_token_call=True)
             self.access_token = result["access_token"]

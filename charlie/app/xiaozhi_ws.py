@@ -780,6 +780,7 @@ def register_xiaozhi_routes(app: FastAPI):
                                 pass
                             break
                     # Decode + energy once per frame (also fills the rolling tail)
+                    pcm = b""
                     try:
                         pcm = decoder.decode(pkt, FRAME_SAMPLES)
                         rms = audioop.rms(pcm, 2)
@@ -790,6 +791,10 @@ def register_xiaozhi_routes(app: FastAPI):
                     if frame_count % 300 == 0:
                         log.info("[xiaozhi] debug rms=%d speech=%d silence=%d pktlen=%d active=%s",
                                  rms, speech_count, silence_count, len(pkt), utterance_active)
+
+                    # Skip VAD if decode failed (pcm is empty)
+                    if not pcm:
+                        continue
 
                     if not utterance_active:
                         # Not speaking yet: keep a short rolling tail, discard the
@@ -827,9 +832,10 @@ def register_xiaozhi_routes(app: FastAPI):
                             buf_frames = list(tail)
                             speech_count = 1
                             silence_count = 0
+                            _hot_at_start = hot_frames
                             hot_frames = 0
                             log.info("[xiaozhi] speech start (%d tail frames carried, thr=%.0f, hot=%d)",
-                                     len(buf_frames), thr, hot_frames)
+                                     len(buf_frames), thr, _hot_at_start)
                         else:
                             hot_frames = 0
                         continue

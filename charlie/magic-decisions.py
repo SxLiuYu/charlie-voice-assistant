@@ -171,24 +171,24 @@ _DECISION_RULES = [
 # ===== 反馈数据 =====
 
 def _load_feedback() -> dict:
-    """加载反馈数据: {rule_id: {positive: N, negative: N}}"""
-    with _decision_lock:
-        try:
-            if os.path.exists(FEEDBACK_FILE):
-                with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return {}
+    """加载反馈数据: {rule_id: {positive: N, negative: N}}
+    注意: 调用方必须已持有 _decision_lock"""
+    try:
+        if os.path.exists(FEEDBACK_FILE):
+            with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        log.debug(f"[decision] 加载反馈失败: {e}")
+    return {}
 
 
 def _save_feedback(feedback: dict):
-    with _decision_lock:
-        try:
-            with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
-                json.dump(feedback, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    """保存反馈数据。注意: 调用方必须已持有 _decision_lock"""
+    try:
+        with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
+            json.dump(feedback, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"[decision] 保存反馈失败: {e}")
 
 
 def record_feedback(rule_id: str, is_positive: bool):
@@ -208,7 +208,8 @@ def record_feedback(rule_id: str, is_positive: bool):
 
 def _get_feedback_score(rule_id: str) -> float:
     """获取规则的反馈评分: 0~1, 越高越好。无反馈数据的规则默认 0.5"""
-    feedback = _load_feedback()
+    with _decision_lock:
+        feedback = _load_feedback()
     entry = feedback.get(rule_id, {})
     pos = entry.get("positive", 0)
     neg = entry.get("negative", 0)
@@ -722,7 +723,8 @@ def execute_decision(rule: dict, protocol_executor) -> str:
 def decisions_summary() -> str:
     """返回决策引擎状态摘要"""
     history = _load_decision_history()
-    feedback = _load_feedback()
+    with _decision_lock:
+        feedback = _load_feedback()
     lines = [f"决策规则: {len(_DECISION_RULES)} 条"]
     now = time.time()
     for rule in _DECISION_RULES:
@@ -747,7 +749,8 @@ def decisions_summary() -> str:
 
 def get_feedback_summary() -> dict:
     """返回反馈摘要给前端"""
-    feedback = _load_feedback()
+    with _decision_lock:
+        feedback = _load_feedback()
     result = {}
     for rule in _DECISION_RULES:
         rid = rule["id"]

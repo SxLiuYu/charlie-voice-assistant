@@ -9,7 +9,7 @@ v2 改进:
 - execute_protocol() 支持条件分支和步骤间延迟
 """
 from mcp.server.fastmcp import FastMCP
-import os, requests, datetime, subprocess, json as _json, threading, time, logging
+import os, requests, datetime, subprocess, json as _json, threading, time, logging, re
 
 log = logging.getLogger("magic")
 
@@ -471,19 +471,17 @@ def _parse_steps_keyword(steps_description: str) -> list:
             steps.append({"action": "tv_control", "params": {"action": "power_off"}})
         elif "音量" in desc or "调音" in desc:
             level = 50
-            for word in desc:
-                if word.isdigit():
-                    level = int(word)
-                    break
+            nums = re.findall(r'\d+', desc)
+            if nums:
+                level = int(nums[0])
             steps.append({"action": "volume", "params": {"level": level}})
         elif "提醒" in desc:
             steps.append({"action": "reminder", "params": {"text": desc, "time": ""}})
         elif "等待" in desc or "等" in desc:
             seconds = 5
-            for word in desc:
-                if word.isdigit():
-                    seconds = int(word)
-                    break
+            nums = re.findall(r'\d+', desc)
+            if nums:
+                seconds = int(nums[0])
             steps.append({"action": "wait", "params": {"seconds": seconds}})
         elif "如果" in desc or "要是" in desc:
             steps.append({"action": "if_condition", "params": {"condition": "weather_contains=雨", "then": [{"action": "tts", "params": {"template": desc}}]}})

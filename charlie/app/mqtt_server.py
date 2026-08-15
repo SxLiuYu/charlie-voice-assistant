@@ -15,7 +15,8 @@ ESP32 通过 OTA 切换到 MqttProtocol 后:
 - 维护 {device_id: publish_topic} 和 {addr: device_id} 映射
 - push_tts/push_notification 广播到所有活跃设备
 """
-import os, json, asyncio, socket, struct, secrets, logging, threading, time, re
+import os, json, asyncio, socket, struct, secrets, logging, threading, time, re, array
+from collections import deque
 from typing import Optional, Callable
 
 log = logging.getLogger("magic")
@@ -257,9 +258,11 @@ class MqttXiaozhiServer:
         if not lan_ip:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                lan_ip = s.getsockname()[0]
-                s.close()
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    lan_ip = s.getsockname()[0]
+                finally:
+                    s.close()
             except Exception:
                 lan_ip = "127.0.0.1"
 
@@ -432,7 +435,6 @@ class MqttXiaozhiServer:
                 pcm = opus_decode_to_wav([opus_frame], UPLINK_SAMPLE_RATE)
 
                 # RMS 能量
-                import array
                 samples = array.array('h', pcm[:len(pcm) - len(pcm) % 2])
                 if samples:
                     rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
@@ -445,10 +447,11 @@ class MqttXiaozhiServer:
                     from app.xiaozhi_ws import _is_speech_vad, _load_silero_vad
                     vad_model = _load_silero_vad()
                     if vad_model:
-                        vad_speech = _is_speech_vad(vad_model, pcm, rms, 0.5)
+                        vad_speech = _is_speech_vad(pcm, rms, 0.5)
                     else:
                         vad_speech = rms > 500
-                except Exception:
+                except Exception as e:
+                    log.debug("[mqtt] VAD check failed, using RMS fallback: %s", e)
                     vad_speech = rms > 500
 
                 is_hot = vad_speech or rms > 500
@@ -458,7 +461,7 @@ class MqttXiaozhiServer:
                     _utterance_state[device_id] = {
                         "buf_frames": [], "speech_count": 0, "silence_count": 0,
                         "utterance_active": False, "hot_frames": 0,
-                        "tail": __import__('collections').deque(maxlen=12),
+                        "tail": deque(maxlen=12),
                     }
                 st = _utterance_state[device_id]
 
@@ -672,6 +675,11 @@ def init_server(loop: asyncio.AbstractEventLoop) -> bool:
     global _server
     if _server and _server.is_connected():
         return True
+    if _server:
+        try:
+            _server.stop()
+        except Exception:
+            pass
     _server = MqttXiaozhiServer()
     return _server.start(loop)
 

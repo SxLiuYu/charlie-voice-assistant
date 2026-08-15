@@ -16,9 +16,11 @@ from mcp.server.fastmcp import FastMCP
 import logging
 log = logging.getLogger("magic")
 
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+# 注意: 不在此处 os.chdir() — 它会全局改变工作目录，破坏其他模块的相对路径
 try:
-    from dotenv import load_dotenv; load_dotenv()
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(_env_path)
 except ImportError: pass
 
 mcp = FastMCP("magic-recipe")
@@ -30,7 +32,10 @@ DATA_DIR = os.path.join(RECIPE_DIR, "data")
 RECIPE_FILE = os.path.join(DATA_DIR, "recipes.json")
 PROFILE_FILE = os.path.join(DATA_DIR, "wife_profile.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "order_history.json")
-os.makedirs(DATA_DIR, exist_ok=True)
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except OSError as e:
+    log.warning(f"[recipe] 创建数据目录失败: {e}")
 
 
 # ── 数据加载(扁平 list, 照 smart_recommend 写法; recipe_core 的 {"recipes":[]} 与真实数据不匹配) ──
@@ -97,6 +102,17 @@ def _format_recipe(r: dict) -> str:
     return "\n".join(lines)
 
 
+# ── 菜系关键词 — 模块级常量避免每次调用重建 ──
+_CUISINE_KEYWORDS = {
+    "川菜": ["麻辣", "豆瓣酱", "花椒", "干辣椒", "红油", "水煮", "鱼香", "宫保", "回锅"],
+    "粤菜": ["蚝油", "清蒸", "白切", "煲", "虾饺", "叉烧"],
+    "湘菜": ["剁椒", "腊肉", "酸豆角"],
+    "东北菜": ["酸菜", "炖", "锅包肉", "地三鲜"],
+    "江浙菜": ["糖醋", "红烧", "东坡"],
+    "西北菜": ["孜然", "羊肉", "拉面"],
+}
+
+
 # ── 打分(基于口味画像, 移植自 smart_recommend._score_recipe) ──
 def _score_recipe(recipe: dict, profile: dict) -> int:
     score = 50
@@ -114,36 +130,28 @@ def _score_recipe(recipe: dict, profile: dict) -> int:
     fav_ingredients = pref.get("favorite_ingredients", [])
     for ing in ingredients:
         for fi in fav_ingredients:
-            if fi in ing or ing in fi:
+            if fi == ing or fi in ing.split():
                 score += 15
                 break
 
     disliked_ingredients = pref.get("disliked_ingredients", [])
     for ing in ingredients:
         for di in disliked_ingredients:
-            if di in ing or ing in di:
+            if di == ing or di in ing.split():
                 score -= 40
                 break
 
     allergies = pref.get("allergies", [])
     for ing in ingredients:
         for allergy in allergies:
-            if allergy in ing or ing in allergy:
+            if allergy == ing or allergy in ing.split():
                 return -100
 
     fav_cuisines = pref.get("favorite_cuisines", [])
     all_text = " ".join(ingredients) + name
-    cuisine_keywords = {
-        "川菜": ["麻辣", "豆瓣酱", "花椒", "干辣椒", "红油", "水煮", "鱼香", "宫保", "回锅"],
-        "粤菜": ["蚝油", "清蒸", "白切", "煲", "虾饺", "叉烧"],
-        "湘菜": ["剁椒", "腊肉", "酸豆角"],
-        "东北菜": ["酸菜", "炖", "锅包肉", "地三鲜"],
-        "江浙菜": ["糖醋", "红烧", "东坡"],
-        "西北菜": ["孜然", "羊肉", "拉面"],
-    }
     for cuisine in fav_cuisines:
-        if cuisine in cuisine_keywords:
-            for kw in cuisine_keywords[cuisine]:
+        if cuisine in _CUISINE_KEYWORDS:
+            for kw in _CUISINE_KEYWORDS[cuisine]:
                 if kw in all_text:
                     score += 10
                     break
