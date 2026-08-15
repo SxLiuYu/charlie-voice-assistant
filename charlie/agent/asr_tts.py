@@ -29,7 +29,7 @@ _baidu_token_lock = threading.Lock()
 BAIDU_TOKEN_FILE = os.path.join(DATA_DIR, ".baidu_token.json")
 if os.path.exists(BAIDU_TOKEN_FILE):
     try:
-        with open(BAIDU_TOKEN_FILE) as f:
+        with open(BAIDU_TOKEN_FILE, encoding="utf-8") as f:
             saved = json.load(f)
             if isinstance(saved, dict) and saved.get("token"):
                 _baidu_token["token"] = saved["token"]

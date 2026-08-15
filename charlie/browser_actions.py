@@ -61,7 +61,7 @@ def _get_feishu_token() -> str:
     if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
         return ""
     r = requests.post(f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal",
-                      json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET})
+                      json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, timeout=(5, 15))
     return r.json().get("tenant_access_token", "")
 
 def send_feishu_text(text: str, open_id: str = None) -> bool:
@@ -78,7 +78,7 @@ def send_feishu_text(text: str, open_id: str = None) -> bool:
         f"{FEISHU_BASE}/im/v1/messages?receive_id_type=open_id",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={"receive_id": open_id, "msg_type": "text",
-              "content": json.dumps({"text": text})}
+              "content": json.dumps({"text": text})}, timeout=(5, 15)
     )
     ok = r.json().get("code", -1) == 0
     if ok:
@@ -100,7 +100,7 @@ def send_feishu_image(image_path: str, caption: str = "", open_id: str = None) -
         r = requests.post(f"{FEISHU_BASE}/im/v1/images",
                           headers={"Authorization": f"Bearer {token}"},
                           data={"image_type": "message"},
-                          files={"image": f})
+                          files={"image": f}, timeout=(5, 15))
     image_key = r.json().get("data", {}).get("image_key", "")
     if not image_key:
         print(f"⚠️ 图片上传失败: {r.json()}")
@@ -109,12 +109,12 @@ def send_feishu_image(image_path: str, caption: str = "", open_id: str = None) -
                   headers={"Authorization": f"Bearer {token}",
                            "Content-Type": "application/json"},
                   json={"receive_id": open_id, "msg_type": "image",
-                        "content": json.dumps({"image_key": image_key})})
+                        "content": json.dumps({"image_key": image_key})}, timeout=(5, 15))
     if caption:
         requests.post(f"{FEISHU_BASE}/im/v1/messages?receive_id_type=open_id",
                       headers={"Authorization": f"Bearer {token}",
                                "Content-Type": "application/json"},
                       json={"receive_id": open_id, "msg_type": "text",
-                            "content": json.dumps({"text": caption})})
+                            "content": json.dumps({"text": caption})}, timeout=(5, 15))
     print(f"✅ 飞书图片已发送: {image_path}")
     return True

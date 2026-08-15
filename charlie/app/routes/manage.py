@@ -262,7 +262,7 @@ async def decisions_config():
         feedback_file = os.path.join(PROJECT_DIR, "data", "decision_feedback.json")
         feedback = {}
         try:
-            with open(feedback_file, "r") as f:
+            with open(feedback_file, "r", encoding="utf-8") as f:
                 feedback = json.load(f)
         except Exception:
             pass
@@ -278,7 +278,7 @@ async def behaviors_status():
         history = {}
         try:
             hf = os.path.join(PROJECT_DIR, "data", "decision_history.json")
-            with open(hf, "r") as f:
+            with open(hf, "r", encoding="utf-8") as f:
                 history = json.load(f)
         except Exception:
             pass
@@ -297,7 +297,7 @@ async def behaviors_status():
         feedback = {}
         try:
             ff = os.path.join(PROJECT_DIR, "data", "decision_feedback.json")
-            with open(ff, "r") as f:
+            with open(ff, "r", encoding="utf-8") as f:
                 feedback = json.load(f)
         except Exception:
             pass
