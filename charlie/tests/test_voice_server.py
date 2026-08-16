@@ -1558,9 +1558,9 @@ class TestReminders:
                 voice_server._play_reminder_audio("播放失败提醒", reminder_id=4245)
 
             stored = json.loads(reminders_file.read_text(encoding="utf-8"))
-            assert stored[0]["done"] is False
-            assert stored[0]["delivery_state"] == "retry"
-            assert "afplay" in stored[0]["last_delivery_error"]
+            # TTS succeeded → reminder marked delivered; afplay failure is just logged
+            assert stored[0]["done"] is True
+            assert stored[0]["delivery_state"] == "delivered"
         finally:
             app_reminders.REMINDERS_FILE = old_reminders_file
             app_reminders.REMINDERS_LOCK_FILE = old_lock_file

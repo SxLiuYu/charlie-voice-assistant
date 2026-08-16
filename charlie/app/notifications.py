@@ -139,7 +139,7 @@ def play_reminder_audio(text: str, reminder_id: int | None = None):
             tmp.close()
             log.info(f"[reminder] 播放提醒语音 {len(audio)}字节(MP3): {text}")
             threading.Thread(
-                target=lambda: _afplay_and_cleanup(tmp.name, reminder_id),
+                target=lambda: _afplay_and_cleanup(tmp.name),
                 daemon=True,
             ).start()
         else:
@@ -147,29 +147,24 @@ def play_reminder_audio(text: str, reminder_id: int | None = None):
             audio_b64 = _b64enc.b64encode(audio).decode()
             push_notification_to_sse(sse_event({"type": "audio", "audio": audio_b64, "source": "reminder"}))
             log.info(f"[reminder] 通过SSE推送提醒语音 {len(audio)}字节: {text}")
-            # 非afplay平台: TTS生成成功即完成投递
-            if reminder_id is not None:
-                from app.reminders import complete_reminder_delivery
-                complete_reminder_delivery(reminder_id)
+
+        # TTS生成成功即完成投递（不等afplay结束，避免调度器超时重试）
+        if reminder_id is not None:
+            from app.reminders import complete_reminder_delivery
+            complete_reminder_delivery(reminder_id)
     except Exception as e:
         log.error(f"[reminder] 播放失败: {e}")
         if reminder_id is not None:
             from app.reminders import release_failed_reminder
             release_failed_reminder(reminder_id, datetime.datetime.now(), str(e))
 
-def _afplay_and_cleanup(tmp_path: str, reminder_id: int | None = None):
-    """独立线程执行 afplay + 清理临时文件 + 标记提醒投递结果"""
+def _afplay_and_cleanup(tmp_path: str):
+    """独立线程执行 afplay + 清理临时文件"""
     try:
         subprocess.run(["afplay", tmp_path], timeout=30, capture_output=True)
         log.info("[reminder] 播放完成")
-        if reminder_id is not None:
-            from app.reminders import complete_reminder_delivery
-            complete_reminder_delivery(reminder_id)
     except Exception as e:
         log.debug(f"[reminder] afplay失败: {e}")
-        if reminder_id is not None:
-            from app.reminders import release_failed_reminder
-            release_failed_reminder(reminder_id, datetime.datetime.now(), f"afplay失败: {e}")
     finally:
         try:
             os.unlink(tmp_path)
