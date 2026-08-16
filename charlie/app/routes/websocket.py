@@ -242,6 +242,8 @@ async def _ws_stream_brain(ws_id, text, session_id="default", interrupted_reply=
 
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    from app.audit_log import audit_log
+    audit_log("ws:connect", input_data="websocket", action="connect")
     await ws.accept()
     if AUTH_TOKEN:
         ci = ws.client.host if ws.client else ""

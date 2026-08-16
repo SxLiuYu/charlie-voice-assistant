@@ -257,16 +257,22 @@ async def voice_api(file: UploadFile = File(...)):
 
 @router.post("/api/chat/stream")
 async def chat_stream_api(req: ChatRequest):
+    from app.audit_log import audit_log
     text = _sanitize_text(req.message, MAX_TEXT_LENGTH)
     session_id = req.session_id
     allowed, remaining, retry_after = _check_session_rate(session_id)
     if not allowed:
+        audit_log("api:chat_stream", input_data=text, success=False, error="rate_limited",
+                  action="429", session_id=session_id)
         return JSONResponse({"error": f"请求过于频繁, 请{retry_after}秒后重试"}, status_code=429, headers={"Retry-After": str(retry_after)})
+    audit_log("api:chat_stream", input_data=text, action="start", session_id=session_id)
     return StreamingResponse(_stream_brain_tts(text, session_id=session_id), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 @router.post("/api/voice/stream")
 async def voice_stream_api(request: Request, file: UploadFile = File(...), session_id: str = "default"):
+    from app.audit_log import audit_log
+    audit_log("api:voice_stream", input_data="start", action="start", session_id=session_id)
     data = await file.read()
     ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
     if len(data) > MAX_AUDIO_SIZE:
@@ -324,8 +330,10 @@ async def chat_api(req: ChatRequest):
 
 @router.post("/api/reset")
 async def reset_conversation(session_id: str = "default"):
+    from app.audit_log import audit_log
     from voice_agent import reset_history
     reset_history(session_id)
+    audit_log("api:reset", input_data=session_id, output_data="reset", action="reset")
     return {"ok": True, "message": "对话已重置", "session_id": session_id}
 
 @router.get("/api/conversation")
@@ -340,30 +348,50 @@ async def get_conversation(page: int = 1, limit: int = 50, session_id: str = "de
 
 @router.post("/api/tts")
 async def tts_api(req: TTSRequest):
+    import time as _t
+    from app.audit_log import audit_log
+    _start = _t.time()
     text = _sanitize_text(req.text, MAX_TEXT_LENGTH)
     from voice_agent import tts_to_mp3
     try:
         audio = await asyncio.wait_for(asyncio.to_thread(tts_to_mp3, text), timeout=30)
         if not audio:
+            audit_log("api:tts", input_data=text, success=False, error="empty_audio",
+                      action="synthesize", duration_ms=(_t.time()-_start)*1000)
             return JSONResponse({"error": "TTS生成失败"}, status_code=500)
+        audit_log("api:tts", input_data=text, output_data=f"{len(audio)}bytes",
+                  action="synthesize", duration_ms=(_t.time()-_start)*1000)
         return Response(content=audio, media_type="audio/mpeg")
     except asyncio.TimeoutError:
+        audit_log("api:tts", input_data=text, success=False, error="timeout",
+                  action="synthesize", duration_ms=(_t.time()-_start)*1000)
         return JSONResponse({"error": "TTS超时"}, status_code=504)
-    except Exception:
+    except Exception as e:
+        audit_log("api:tts", input_data=text, success=False, error=str(e),
+                  action="synthesize", duration_ms=(_t.time()-_start)*1000)
         return JSONResponse({"error": "TTS服务繁忙，请稍后再试"}, status_code=503)
 
 @router.post("/api/asr")
 async def asr_api(file: UploadFile = File(...)):
+    import time as _t
+    from app.audit_log import audit_log as _al
+    _start = _t.time()
     data = await file.read()
     ext = (file.filename or "audio.wav").rsplit(".", 1)[-1].lower()
     wav = to_wav(data, ext)
     if likely_empty_audio(wav):
+        _al("api:asr", input_data=f"{len(data)}bytes {ext}", output_data="empty",
+            action="recognize", duration_ms=(_t.time()-_start)*1000)
         return {"text": ""}
     from voice_agent import asr
     try:
         text = await asyncio.wait_for(asyncio.to_thread(asr, wav, "wav"), timeout=30)
+        _al("api:asr", input_data=f"{len(data)}bytes {ext}", output_data=text,
+            action="recognize", duration_ms=(_t.time()-_start)*1000)
         return {"text": text}
     except asyncio.TimeoutError:
+        _al("api:asr", input_data=f"{len(data)}bytes {ext}", success=False, error="timeout",
+            action="recognize", duration_ms=(_t.time()-_start)*1000)
         return JSONResponse({"error": "ASR超时"}, status_code=504)
 
 # ===== Vosk wake word detection =====
@@ -528,7 +556,9 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
 
 @router.post("/api/brain/restart")
 async def restart_brain_api():
+    from app.audit_log import audit_log
     from voice_agent import restart_brain
     msg = restart_brain()
     log.info(f"[brain] 手动重启: {msg}")
+    audit_log("api:brain_restart", input_data="restart", output_data=msg, action="restart")
     return {"ok": True, "message": msg}

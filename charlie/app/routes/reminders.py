@@ -61,6 +61,7 @@ async def list_reminders(request: Request):
 
 @router.post("/api/reminders")
 async def add_reminder(req: ReminderRequest):
+    from app.audit_log import audit_log
     text = _sanitize_text(req.text, 200)
     time_str = _sanitize_text(req.time, 50)
     repeat = _sanitize_text(req.repeat, 20) if req.repeat else ""
@@ -75,17 +76,25 @@ async def add_reminder(req: ReminderRequest):
     rid = item["id"]
     when = f"，提醒时间{due.replace('T', ' ')}" if due else (f"（时间'{time_str}'未解析出时刻）" if time_str else "")
     repeat_desc = {"daily": "（每天重复）", "weekly": "（每周重复）", "weekdays": "（工作日重复）"}.get(repeat, "")
+    audit_log("api:reminders", input_data=f"text={text} time={time_str} repeat={repeat}",
+              output_data=f"id={rid}", action="add")
     return {"ok": True, "id": rid, "message": f"已添加提醒：{text}{when}{repeat_desc}"}
 
 @router.delete("/api/reminders/{rid}")
 async def delete_reminder(rid: int):
+    from app.audit_log import audit_log
     if not complete_reminder(rid):
+        audit_log("api:reminders", input_data=f"rid={rid}", success=False,
+                  error="not_found", action="delete")
         raise HTTPException(404, "提醒不存在")
+    audit_log("api:reminders", input_data=f"rid={rid}", output_data="completed", action="delete")
     return {"ok": True, "message": f"提醒{rid}已标记完成"}
 
 @router.get("/api/notifications")
 async def get_notifications():
+    from app.audit_log import audit_log
     notifs = drain_notifications()
+    audit_log("api:notifications", input_data="poll", output_data=f"{len(notifs)}items", action="poll")
     return {"count": len(notifs), "notifications": notifs}
 
 @router.get("/api/events")
@@ -129,6 +138,8 @@ async def lan_info():
 @router.api_route("/xiaozhi/ota", methods=["GET", "POST"])
 async def xiaozhi_ota(request: Request):
     """OTA config endpoint for xiaozhi firmware."""
+    from app.audit_log import audit_log
+    audit_log("api:xiaozhi_ota", input_data=request.method, action="ota_config")
     try:
         body = await request.body()
         if body:
