@@ -227,8 +227,13 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
 
 @router.post("/api/voice")
 async def voice_api(file: UploadFile = File(...)):
+    import time as _t
+    from app.audit_log import audit_log
+    _start = _t.time()
     data = await file.read()
     ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
+    audit_log("api:voice", input_data=f"audio={len(data)}bytes fmt={ext}",
+              action="start", session_id="voice")
     if len(data) > MAX_AUDIO_SIZE:
         return JSONResponse({"error": f"音频过大({len(data)//1024}KB), 上限{MAX_AUDIO_SIZE//1024//1024}MB"}, status_code=413)
     log.info(f"/api/voice 收到音频: {len(data)}字节, 格式={ext}")
@@ -241,6 +246,8 @@ async def voice_api(file: UploadFile = File(...)):
         text, reply, audio_out = await asyncio.wait_for(asyncio.to_thread(voice_loop, wav, "wav"), timeout=60)
         mp3_out = _wav_to_mp3(audio_out)
         degraded = not mp3_out
+        audit_log("api:voice", input_data=text, output_data=reply[:100],
+                  action="complete", session_id="voice", duration_ms=(_t.time()-_start)*1000)
         return {"text": text, "reply": reply, "audio": _b64enc.b64encode(mp3_out).decode(), "format": "mp3", "degraded": degraded}
     except asyncio.TimeoutError:
         return JSONResponse({"error": "处理超时，请重试"}, status_code=504)
@@ -291,17 +298,28 @@ async def voice_stream_api(request: Request, file: UploadFile = File(...), sessi
 
 @router.post("/api/chat")
 async def chat_api(req: ChatRequest):
+    import time as _t
+    from app.audit_log import audit_log
+    _start = _t.time()
     text = _sanitize_text(req.message, MAX_TEXT_LENGTH)
     allowed, remaining, retry_after = _check_session_rate(req.session_id)
     if not allowed:
+        audit_log("api:chat", input_data=text, success=False, error="rate_limited",
+                  action="429", session_id=req.session_id, duration_ms=(_t.time()-_start)*1000)
         return JSONResponse({"error": f"请求过于频繁, 请{retry_after}秒后重试"}, status_code=429, headers={"Retry-After": str(retry_after)})
     from voice_agent import brain
     try:
         reply = await asyncio.wait_for(asyncio.to_thread(brain, text, req.session_id), timeout=60)
+        audit_log("api:chat", input_data=text, output_data=reply,
+                  action="success", session_id=req.session_id, duration_ms=(_t.time()-_start)*1000)
         return {"reply": reply}
     except asyncio.TimeoutError:
+        audit_log("api:chat", input_data=text, success=False, error="timeout",
+                  action="504", session_id=req.session_id, duration_ms=(_t.time()-_start)*1000)
         return JSONResponse({"error": "思考超时，请重试"}, status_code=504)
-    except Exception:
+    except Exception as e:
+        audit_log("api:chat", input_data=text, success=False, error=str(e),
+                  action="degraded", session_id=req.session_id, duration_ms=(_t.time()-_start)*1000)
         return {"reply": "抱歉，我现在有点忙不过来，请稍等一下再试。", "degraded": True}
 
 @router.post("/api/reset")

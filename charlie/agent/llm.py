@@ -161,6 +161,12 @@ def _classify_intent(text: str) -> str:
     for keywords, mcp_name in _KEYWORD_MAP:
         if any(kw in text for kw in keywords):
             log.info(f"[intent] 关键词命中: '{text[:30]}' → {mcp_name}")
+            try:
+                from app.audit_log import audit_log
+                audit_log("intent", input_data=text, output_data=mcp_name,
+                          action="keyword_match", session_id="intent")
+            except Exception:
+                pass
             _intent_cache_set(text, mcp_name)
             return mcp_name
     prompt = (
@@ -213,6 +219,13 @@ def _classify_intent(text: str) -> str:
             _st.intent_disabled_until = 0.0
         _intent_cache_set(text, mcp)
         log.info(f"[intent] '{text[:30]}' → {mcp} ({raw[:15]})")
+        try:
+            from app.audit_log import audit_log
+            audit_log("intent", input_data=text, output_data=mcp,
+                      action="llm_classify", session_id="intent",
+                      duration_ms=(time.time()-now)*1000)
+        except Exception:
+            pass
         return mcp
     except Exception as e:
         with _st.intent_cache_lock:

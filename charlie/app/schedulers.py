@@ -156,6 +156,44 @@ def _forecast_for_date(casts, target_date):
         return casts[0]
     return {}
 
+
+_magic_scenes_mod = None
+
+def _magic_scenes():
+    """延迟加载 magic-scenes 模块以复用 _ac_sleep / _tv_control。
+
+    magic-scenes.py 文件名含连字符无法直接 import，用 importlib 按路径加载并缓存。
+    """
+    global _magic_scenes_mod
+    if _magic_scenes_mod is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "magic-scenes.py")
+        spec = importlib.util.spec_from_file_location("magic_scenes_runtime", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _magic_scenes_mod = mod
+    return _magic_scenes_mod
+
+
+def _sleep_scene_message() -> str:
+    """睡眠场景：根据夜间天气处理空调（热天保留/凉天关闭）并关闭电视，返回与实际操作一致的播报。
+
+    不再说“已关闭空调和电视”这种与实际不符的套话——空调是否关闭取决于夜间温度。
+    """
+    parts = ["检测到你已休息，晚安。"]
+    try:
+        sc = _magic_scenes()
+        ac_result = sc._ac_sleep()
+        sc._tv_control("power_off")
+        parts.append(ac_result)
+        parts.append("电视已关闭。")
+        log.info(f"[suggest] 睡眠设备处理: ac={ac_result}")
+    except Exception as e:
+        log.warning(f"[suggest] 睡眠设备处理失败: {e}")
+        parts.append("电视已关闭。")
+    return "".join(parts)
+
+
 def _preference_state_key(pkey, pval):
     fingerprint = hashlib.sha256(f"{pkey}\0{pval}".encode("utf-8")).hexdigest()[:16]
     return f"last_pref_{fingerprint}", fingerprint
@@ -187,6 +225,13 @@ def _reminder_scheduler():
                 text = reminder.get("text", "提醒")
                 due_str = reminder.get("due", "")
                 log.info(f"[reminder] 提醒到期(id={rid}): {text} (due={due_str})")
+                try:
+                    from app.audit_log import audit_log
+                    audit_log("scheduler:reminder", input_data=f"id={rid} text={text} due={due_str}",
+                              output_data="delivered", action="reminder_due",
+                              session_id="system", source="system")
+                except Exception:
+                    pass
                 add_notification(f"⏰ 提醒：{text}", "reminder")
                 play_reminder_audio(text, reminder_id=rid)
         except Exception as e:
@@ -265,7 +310,7 @@ def _proactive_suggestions():
                         play_reminder_audio(msg)
             if state == "home_sleeping" and state_changed:
                 if _claim_suggest_state("last_sleep_scene", today):
-                    msg = "检测到你已休息，晚安。已关闭空调和电视。"
+                    msg = _sleep_scene_message()
                     add_notification(msg, "sleep")
                     play_reminder_audio(msg)
             elif state == "away" and state_changed and _claim_suggest_state("last_away_scene", today):

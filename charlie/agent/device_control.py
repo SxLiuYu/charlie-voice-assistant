@@ -13,10 +13,25 @@ def direct_ac_control(text: str) -> str:
     解析: 开/关 + 模式(制冷/制热/除湿/送风/自动) + 温度(X度) + 风速(高/中/低)。
     返回自然语言回复,无明确指令或调用失败时返回空串(回退 brain)。
     """
+    import time as _t
+    _ac_start = _t.time()
+    try:
+        from app.audit_log import audit_log
+        audit_log("ac_control", input_data=text, action="voice_command",
+                  session_id="voice", source="user")
+    except Exception:
+        pass
     try:
         from tuya_api import TuyaCloudAPI
     except Exception as e:
         log.warning(f"[ac] tuya_api 导入失败: {e}")
+        try:
+            from app.audit_log import audit_log
+            audit_log("ac_control", input_data=text, success=False, error=str(e),
+                      action="import_failed", session_id="voice", source="user",
+                      duration_ms=(_t.time()-_ac_start)*1000)
+        except Exception:
+            pass
         return ""
     infrared_id = os.getenv("TUYA_IR_DEVICE_ID", "")
     remote_id = os.getenv("TUYA_AC_DEVICE_ID", "")
@@ -37,6 +52,13 @@ def direct_ac_control(text: str) -> str:
             log.info(f"[ac] 操作前状态: power={cur.get('power')} mode={cur.get('mode')} temp={cur.get('temp')}°C wind={cur.get('wind')}")
             api.ac_scenes_command(infrared_id, remote_id, power=0)
             log.info(f"[ac] 直连关机: ASR={t[:20]} → power=0")
+            try:
+                from app.audit_log import audit_log
+                audit_log("ac_control", input_data=t, output_data="power=0",
+                          action="power_off", session_id="voice", source="user",
+                          duration_ms=(_t.time()-_ac_start)*1000)
+            except Exception:
+                pass
             return "好的，空调已关闭。"
         except Exception as e:
             log.warning(f"[ac] 关机失败: {e}")
@@ -93,6 +115,13 @@ def direct_ac_control(text: str) -> str:
             log.info(f"[ac] 操作前状态: power={cur.get('power')} mode={cur.get('mode')} temp={cur.get('temp')}°C wind={cur.get('wind')}")
             log.info(f"[ac] 发送指令: power=1 mode={mode} temp={eff_temp} wind={fan} (ASR={t[:30]})")
             api.ac_scenes_command(infrared_id, remote_id, power=1, mode=mode, temp=eff_temp, wind=fan)
+            try:
+                from app.audit_log import audit_log
+                audit_log("ac_control", input_data=t, output_data=f"power=1 mode={mode} temp={eff_temp} wind={fan}",
+                          action="power_on", session_id="voice", source="user",
+                          duration_ms=(_t.time()-_ac_start)*1000)
+            except Exception:
+                pass
             parts = ["空调已打开"]
             if mode is not None:
                 parts.append({0: "制冷", 1: "制热", 2: "自动", 3: "送风", 4: "除湿"}[mode])

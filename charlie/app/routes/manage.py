@@ -136,6 +136,13 @@ async def metrics(request: Request):
     return json_response(request, lambda: _metrics.summary(exclude_endpoint="/api/metrics"),
                         etag_token=_metrics.token(exclude_endpoint="/api/metrics"))
 
+@router.get("/api/audit")
+async def audit_stats(request: Request):
+    """功能调用审计统计: 区分用户调用/测试调用/系统调用"""
+    from app.audit_log import get_call_stats
+    source = request.query_params.get("source")
+    return get_call_stats(source)
+
 @router.get("/api/tunnel")
 async def tunnel_status(request: Request):
     cached = file_not_modified_response(request, TUNNEL_FILE, "tunnel")

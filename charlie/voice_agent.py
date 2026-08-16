@@ -159,23 +159,53 @@ def _decision_feedback_handler(text: str, session_id: str = "default") -> str | 
 # ===== brain() 公共入口 =====
 def brain(text: str, session_id: str = "default") -> str:
     """大脑推理: 先走快路径（关键词命中直连），未命中走 LLM。"""
+    import time as _t
+    _start = _t.time()
     log.debug(f"[brain] 收到请求: {text[:50]}")
-    _cmd_reply = _handle_smart_command(text)
-    if _cmd_reply is not None:
-        _append_history(_get_history(session_id), text, _cmd_reply)
-        return _cmd_reply
-    reply = _decision_feedback_handler(text, session_id)
-    if reply is not None:
-        return reply
-    for path in FAST_PATHS:
-        reply = path.run(text, session_id)
+    try:
+        _cmd_reply = _handle_smart_command(text)
+        if _cmd_reply is not None:
+            _append_history(_get_history(session_id), text, _cmd_reply)
+            from app.audit_log import audit_log
+            audit_log("brain", input_data=text, output_data=_cmd_reply,
+                      action="smart_command", session_id=session_id,
+                      duration_ms=(_t.time()-_start)*1000)
+            return _cmd_reply
+        reply = _decision_feedback_handler(text, session_id)
         if reply is not None:
+            from app.audit_log import audit_log
+            audit_log("brain", input_data=text, output_data=reply,
+                      action="decision_feedback", session_id=session_id,
+                      duration_ms=(_t.time()-_start)*1000)
             return reply
-    cached = _cache_get(text)
-    if cached is not None:
-        log.info(f"[cache] 命中: {text[:20]}")
-        return cached
-    return _brain_llm(text, session_id)
+        for path in FAST_PATHS:
+            reply = path.run(text, session_id)
+            if reply is not None:
+                from app.audit_log import audit_log
+                audit_log("brain", input_data=text, output_data=reply,
+                          action=f"fast_path:{path.name}", session_id=session_id,
+                          duration_ms=(_t.time()-_start)*1000)
+                return reply
+        cached = _cache_get(text)
+        if cached is not None:
+            log.info(f"[cache] 命中: {text[:20]}")
+            from app.audit_log import audit_log
+            audit_log("brain", input_data=text, output_data=cached,
+                      action="cache_hit", session_id=session_id,
+                      duration_ms=(_t.time()-_start)*1000)
+            return cached
+        result = _brain_llm(text, session_id)
+        from app.audit_log import audit_log
+        audit_log("brain", input_data=text, output_data=result,
+                  action="llm", session_id=session_id,
+                  duration_ms=(_t.time()-_start)*1000)
+        return result
+    except Exception as e:
+        from app.audit_log import audit_log
+        audit_log("brain", input_data=text, success=False, error=str(e),
+                  action="error", session_id=session_id,
+                  duration_ms=(_t.time()-_start)*1000)
+        raise
 
 
 def _load_magic_module(name: str, filename: str = None):
@@ -202,6 +232,8 @@ class FastPath:
     def run(self, text: str, session_id: str = "default") -> str | None:
         if not self.match(text):
             return None
+        import time as _t
+        _start = _t.time()
         log.info(f"[{self.name}] 关键词命中: {text[:20]}")
         try:
             _module = sys.modules[__name__]
@@ -212,7 +244,15 @@ class FastPath:
             return None
         except Exception as e:
             log.warning(f"[{self.name}] handler 异常: {e}")
+            from app.audit_log import audit_log
+            audit_log(f"fast_path:{self.name}", input_data=text, success=False,
+                      error=str(e), action=self.handler_name, session_id=session_id,
+                      duration_ms=(_t.time()-_start)*1000)
             return None
+        from app.audit_log import audit_log
+        audit_log(f"fast_path:{self.name}", input_data=text, output_data=reply,
+                  action=self.handler_name, session_id=session_id,
+                  duration_ms=(_t.time()-_start)*1000)
         if reply:
             _append_history(_get_history(session_id), text, reply)
             return reply
@@ -256,17 +296,40 @@ FAST_PATHS = [
 # ===== 完整语音闭环 =====
 def voice_loop(audio_in: bytes, fmt: str = "mp3") -> Tuple[str, str, bytes]:
     """语音进 → ASR → 大脑(含MCP) → TTS → 语音出"""
+    import time as _t
+    _start = _t.time()
+    from app.audit_log import audit_log
+    audit_log("voice_loop", input_data=f"audio={len(audio_in)}bytes fmt={fmt}",
+              action="start", session_id="voice")
     text = asr(audio_in, fmt)
+    audit_log("asr", input_data=f"{len(audio_in)}bytes", output_data=text,
+              action="recognize", session_id="voice",
+              duration_ms=(_t.time()-_start)*1000)
     if not text:
+        audit_log("voice_loop", input_data="empty_asr", output_data="empty",
+                  action="empty", session_id="voice",
+                  duration_ms=(_t.time()-_start)*1000)
         return EMPTY_ASR_TEXT, EMPTY_ASR_REPLY, b""
     if is_low_intent_asr(text):
+        audit_log("voice_loop", input_data=text, output_data=LOW_INTENT_ASR_REPLY,
+                  action="low_intent", session_id="voice",
+                  duration_ms=(_t.time()-_start)*1000)
         return text, LOW_INTENT_ASR_REPLY, b""
     reply = brain(text)
     try:
+        _tts_start = _t.time()
         audio_out = tts(reply)
+        audit_log("tts", input_data=reply[:100], output_data=f"{len(audio_out)}bytes",
+                  action="synthesize", session_id="voice",
+                  duration_ms=(_t.time()-_tts_start)*1000)
     except Exception as e:
         log.warning(f"voice_loop TTS降级为文字: {e}")
+        audit_log("tts", input_data=reply[:100], success=False, error=str(e),
+                  action="synthesize_failed", session_id="voice")
         audio_out = b""
+    audit_log("voice_loop", input_data=text, output_data=reply[:100],
+              action="complete", session_id="voice",
+              duration_ms=(_t.time()-_start)*1000)
     return text, reply, audio_out
 
 
