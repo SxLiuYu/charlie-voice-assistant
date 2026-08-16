@@ -176,7 +176,7 @@ def resolve() -> dict:
         return {
             'model': ARK_MODEL, 'model_type': 'oai',
             'api_base': ARK_BASE, 'api_key': ARK_KEY,
-            'generate_cfg': {'use_raw_api': True, 'extra_body': {'extra_body': {'enable_thinking': False}}, 'max_tokens': 512},
+            'generate_cfg': {'use_raw_api': True, 'extra_body': {'extra_body': {'enable_thinking': False}}, 'max_tokens': 1024},
         }
     if is_glm_configured():
         _m = current_glm_model()
@@ -186,7 +186,7 @@ def resolve() -> dict:
         return {
             'model': _m, 'model_type': 'oai',
             'api_base': GLM_BASE, 'api_key': GLM_KEY,
-            'generate_cfg': {'use_raw_api': True, 'max_tokens': 512,
+            'generate_cfg': {'use_raw_api': True, 'max_tokens': 1024,
                              'extra_body': {'thinking': {'type': 'disabled'}}},
         }
     # 无任何云端 LLM Key → 尝试 Ollama 本地（需用户自行安装，对硬件有要求）
@@ -195,7 +195,7 @@ def resolve() -> dict:
         return {
             'model': OLLAMA_MODEL, 'model_type': 'oai',
             'api_base': OLLAMA_OPENAI_BASE, 'api_key': 'ollama',
-            'generate_cfg': {'use_raw_api': True, 'extra_body': {'extra_body': {'enable_thinking': False}}, 'max_tokens': 512},
+            'generate_cfg': {'use_raw_api': True, 'extra_body': {'extra_body': {'enable_thinking': False}}, 'max_tokens': 1024},
         }
     # 无可用 LLM → 引导用户注册免费 GLM Key
     raise RuntimeError(

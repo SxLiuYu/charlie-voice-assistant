@@ -18,7 +18,7 @@ DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.dirn
 
 _history = []
 _sessions = {"default": _history}
-MAX_HISTORY = 20
+MAX_HISTORY = 30
 MAX_SESSIONS = 10
 _history_lock = threading.Lock()
 HISTORY_FILE = os.path.join(DATA_DIR, "conversation_history.json")
@@ -210,7 +210,7 @@ def _estimate_msg_tokens(msg: dict) -> int:
     # +4: 每条消息 role/name 开销(对齐 OpenAI tokenizer 估算, 避免预算偏低致历史裁剪不足)
     return _estimate_tokens(msg.get("content", "")) + 4
 
-def _trim_history_tokens(hist: list, max_tokens: int = 4000, session_id: str = "default") -> None:
+def _trim_history_tokens(hist: list, max_tokens: int = 6000, session_id: str = "default") -> None:
     if not hist:
         return
     total = sum(_estimate_msg_tokens(m) for m in hist)

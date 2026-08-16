@@ -205,7 +205,7 @@ def _classify_intent(text: str) -> str:
                   "stream": False,
                   "max_tokens": 10, "temperature": 0},
             headers={"Authorization": f"Bearer {_ep_key}"},
-            timeout=(3, 10))
+            timeout=(2, 5))
         raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
         mcp = _normalize_intent(raw)
         with _st.intent_cache_lock:
