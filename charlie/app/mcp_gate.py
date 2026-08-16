@@ -40,7 +40,7 @@ OPTIONAL_MCP_KEYS = [
     "magic-jarvis",      # 贾维斯能力（金融/环境/体育，免费无Key）
     "magic-habits",      # 习惯追踪（无key依赖）
     "baize-skills",      # TAVILY/ALIYUN
-    "ac-control",        # TUYA_*
+    # "ac-control",      # 已禁用：空调仅通过语音快路径控制，LLM不可自动调用
 ]
 
 # 每个可选 MCP 需要的 env key（任一缺失则跳过该 MCP）

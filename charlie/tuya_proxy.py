@@ -49,12 +49,8 @@ def ac_status():
 
 @router.post("/ac/control")
 def ac_control(action: str, temperature: int = 0, fan_speed: str = ""):
-    """控制空调(2B 红外云 API, 真正触发红外发码)
-    - action: on/off/cool/heat/auto/fan/dry
-    - temperature: 16-30
-    - fan_speed: auto/low/medium/high
-    """
-    api = _get_2b_api()
+    """[已禁用] 空调控制仅通过语音快路径触发，HTTP/MCP/场景均不可用"""
+    raise HTTPException(403, "空调控制已禁用，仅支持语音指令操作")
     act = action.lower()
     mode_map = {"cool": 0, "heat": 1, "auto": 2, "fan": 3, "dry": 4}
     if act == "off":

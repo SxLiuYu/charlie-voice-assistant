@@ -38,23 +38,9 @@ def _get_api():
 
 @mcp.tool()
 def ac_control(action: str, temperature: int = 0, fan_speed: str = "") -> str:
-    log.info(f"[ir] 空调控制: {action} {temperature}度 风速={fan_speed}")
-    """通过 Tuya 云 API 控制空调（开关、模式、温度、风速）。
-    参数:
-    - action: on=开机 off=关机 cool=制冷 heat=制热 fan=送风 dry=除湿 auto=自动
-    - temperature: 目标温度 (16-30), 0=不调温
-    - fan_speed: 风速 auto/low/medium/high, 留空=不调风速
-    """
-    api = _get_api()
-    if not IR_DEVICE_ID or not AC_DEVICE_ID:
-        return "❌ TUYA_IR_DEVICE_ID/TUYA_AC_DEVICE_ID 未配置"
-    act = action.lower()
-    if act == "off":
-        power, mode = 0, None
-    elif act in MODE_2B:
-        power, mode = 1, MODE_2B[act]
-    elif act == "on":
-        power, mode = 1, None
+    """[已禁用] 空调控制仅支持语音指令"""
+    log.warning(f"[ir] 空调控制已被禁用(仅语音可用): {action}")
+    return "空调控制已禁用，请用语音指令操作（如'打开空调制冷26度'）"
     else:
         return f"不支持的动作: {action}"
     eff_temp = max(16, min(30, temperature if temperature > 0 else 26))
