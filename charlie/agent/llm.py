@@ -101,7 +101,7 @@ def _normalize_intent(raw: str) -> str:
     elif "douyin" in raw: return "magic-douyin"
     elif "taobao" in raw: return "magic-taobao"
     elif "recipe" in raw or "cook" in raw or "菜" in raw or "食谱" in raw: return "magic-recipe"
-    elif "wardrobe" in raw or "clothes" in raw or "穿搭" in raw: return "magic-wardrobe"
+    elif "wardrobe" in raw or "clothes" in raw or "穿搭" in raw or "穿什么" in raw or "今天穿" in raw: return "magic-wardrobe"
     elif "magic" in raw: return "magic-music"
     elif "ac" in raw or "air" in raw or "control" in raw: return "ac-control"
     elif "file" in raw or "fs" in raw: return "filesystem"
@@ -123,7 +123,7 @@ def _classify_intent(text: str) -> str:
             log.info(f"[intent] 分类冷却中，{_st.intent_disabled_until - now:.0f}秒内默认none")
             return "none"
     _KEYWORD_MAP = [
-        ({"天气", "气温", "下雨", "温度", "几度", "穿什么", "今天天气", "明天天气", "今天冷", "今天热"}, "amap-maps"),
+        ({"天气", "气温", "下雨", "温度", "几度", "今天天气", "明天天气", "今天冷", "今天热"}, "amap-maps"),
         ({"地图", "导航", "附近", "我在哪", "路线", "怎么走", "到哪"}, "amap-maps"),
         ({"搜一下", "查一下", "查查", "谷歌", "购物", "买东西"}, "baize-skills"),
         ({"提醒", "定时", "闹钟", "备忘", "日程", "待办", "记一下", "提醒我"}, "magic-reminder"),
@@ -138,6 +138,7 @@ def _classify_intent(text: str) -> str:
         ({"空调", "电视", "制冷", "制热", "风扇", "开灯", "关灯", "关闭空调", "关闭电视"}, "ac-control"),
         ({"文件", "读文件", "写文件", "笔记"}, "filesystem"),
         ({"外卖", "点餐", "购物", "商品", "查一下", "充电桩", "特斯拉", "出门"}, "magic-life"),
+        ({"穿什么", "穿搭", "今天穿", "明天穿", "出门穿", "约会穿", "搭配", "衣橱", "衣服", "加衣服", "外套", "冷了穿", "热了穿", "穿几件"}, "magic-wardrobe"),
         ({"做菜", "菜谱", "食谱", "做什么菜", "食材", "吃什么", "做饭", "怎么做", "做法", "怎么煮", "怎么炒", "今天吃啥", "今晚吃啥", "中午吃啥", "推荐个菜", "推荐一道菜", "凉菜", "热菜", "汤", "主食", "下饭", "买菜", "番茄炒蛋", "可乐鸡翅"}, "magic-recipe"),
         ({"学习", "进化", "自进化", "优化", "自我优化", "自学习", "学习进度", "进化状态"}, "magic-evolution"),
         ({"淘宝", "京东", "比价", "商品", "价格对比", "买东西", "购物", "买"}, "magic-taobao"),
