@@ -76,11 +76,11 @@ def _aes_ctr_crypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
             raise
 
 
-def _build_audio_packet(aes_nonce: bytes, payload: bytes, timestamp: int, sequence: int) -> bytes:
+def _build_audio_packet(aes_key: bytes, aes_nonce: bytes, payload: bytes, timestamp: int, sequence: int) -> bytes:
     """构造加密 UDP 音频包
 
     格式: |type 1|flags 1|payload_len 2(big)|ssrc 4|timestamp 4(big)|sequence 4(big)|encrypted_payload|
-    nonce = base_nonce，bytes[2:4]=payload_len, bytes[8:12]=timestamp, bytes[12:16]=sequence
+    aes_key = AES-128 密钥, aes_nonce = base nonce，bytes[2:4]=payload_len, bytes[8:12]=timestamp, bytes[12:16]=sequence
     """
     payload_len = len(payload)
     # 构造 per-packet nonce
@@ -90,7 +90,7 @@ def _build_audio_packet(aes_nonce: bytes, payload: bytes, timestamp: int, sequen
     struct.pack_into("!I", nonce, 12, sequence)          # sequence big-endian
 
     # 加密 payload
-    encrypted = _aes_ctr_crypt(aes_nonce[:16], bytes(nonce), payload)
+    encrypted = _aes_ctr_crypt(aes_key, bytes(nonce), payload)
 
     # 构造完整包
     header = bytearray(UDP_AUDIO_HEADER_SIZE)
@@ -200,6 +200,9 @@ class MqttXiaozhiServer:
             log.info(f"[mqtt-server] [{device_id}] 收到 {mtype}: {payload[:100]}")
 
             if mtype == "hello":
+                # 过滤掉自己发出的 hello 回复（含 session_id），避免反馈循环
+                if "session_id" in data:
+                    return
                 self._handle_hello(data, device_id, msg.topic)
             elif mtype == "listen":
                 self._handle_listen(data, device_id)
@@ -287,7 +290,10 @@ class MqttXiaozhiServer:
         }
         if self._client:
             self._client.publish(down_topic, json.dumps(response, ensure_ascii=False), qos=1)
-        log.info(f"[mqtt-server] [{device_id}] hello 回复: UDP {lan_ip}:{self._udp_port}")
+            # 固件 v2.1.0 的 MqttProtocol 不订阅 down topic，只监听 publish_topic
+            # 同时向 up_topic 发送以确保设备收到
+            self._client.publish(up_topic, json.dumps(response, ensure_ascii=False), qos=1)
+        log.info(f"[mqtt-server] [{device_id}] hello 回复: UDP {lan_ip}:{self._udp_port} (down+up)")
 
     def _handle_listen(self, data: dict, device_id: str):
         """处理 listen → 开始接收语音"""
@@ -358,10 +364,11 @@ class MqttXiaozhiServer:
                 "voice": "zh-CN",
             }))
 
-            ts = int(time.time() * 1000)
-            def _send_audio(_aes_nonce=aes_nonce, _addr=addr, _ts=ts, _packets=opus_packets, _did=device_id):
+            # RTP-style relative timestamp (ms since epoch mod 2^32, wraps every ~49 days)
+            ts = int(time.time() * 1000) & 0xFFFFFFFF
+            def _send_audio(_aes_key=aes_key, _aes_nonce=aes_nonce, _addr=addr, _ts=ts, _packets=opus_packets, _did=device_id):
                 for i, pkt in enumerate(_packets):
-                    packet = _build_audio_packet(_aes_nonce, pkt, _ts + i * 60, i)
+                    packet = _build_audio_packet(_aes_key, _aes_nonce, pkt, _ts + i * 60, i)
                     try:
                         self._udp_sock.sendto(packet, _addr)
                     except Exception as e:
@@ -377,12 +384,34 @@ class MqttXiaozhiServer:
         return success_count > 0
 
     def push_notification(self, text: str):
-        """推送纯文字通知（不播音频，仅显示在所有 ESP32 屏幕上）"""
-        self._publish_to_all(json.dumps({
-            "type": "notification",
-            "text": text,
-        }))
-        log.info(f"[mqtt-server] 通知推送: {text[:30]}")
+        """推送纯文字通知（不播音频，仅显示在 ESP32 屏幕上）
+
+        优先推送给有活跃 session 的设备；若无 session，也向已注册 topic
+        的设备推送（设备连着 MQTT broker 但未发 hello 的待机态）。
+        还会向 OTA 配置的默认 device_id 推送（覆盖从未发过 hello 的设备）。
+        """
+        payload = json.dumps({"type": "notification", "text": text}, ensure_ascii=False)
+        # 1. 活跃 session 中的设备
+        with _sessions_lock:
+            session_devices = list(_sessions.keys())
+        # 2. 已注册 topic 的设备（hello 过但 session 过期）
+        with _device_topics_lock:
+            topic_devices = list(_device_topics.keys())
+        # 3. 默认设备 ID（OTA 返回的 device_id，覆盖从未 hello 的待机设备）
+        default_did = os.getenv("MQTT_DEVICE_ID", "esp32-default")
+
+        all_devices = set(session_devices) | set(topic_devices) | {default_did}
+        for did in all_devices:
+            self._publish_to_device_or_default(did, payload)
+        log.info(f"[mqtt-server] 通知推送: {text[:30]} ({len(all_devices)} 设备)")
+
+    def _publish_to_device_or_default(self, device_id: str, payload: str):
+        """推送到设备 down topic，若无注册 topic 则用默认格式构造"""
+        topic = self._get_publish_topic_for_device(device_id)
+        if not topic:
+            topic = f"charlie/esp32/{device_id}/down"
+        if self._client:
+            self._client.publish(topic, payload, qos=1)
 
     def _udp_recv_loop(self):
         """UDP 接收循环 — 接收 ESP32 发来的加密 Opus 音频，VAD 端点检测后走 ASR→LLM→TTS
@@ -403,8 +432,39 @@ class MqttXiaozhiServer:
                 # 查找 device_id
                 with _addr_to_device_lock:
                     device_id = _addr_to_device.get(addr)
+
                 if not device_id:
-                    continue
+                    # 未知 addr → 尝试匹配 addr=None 的会话（设备刚 hello 完首次发 UDP）
+                    with _sessions_lock:
+                        for did, sess in list(_sessions.items()):
+                            if sess.get("addr") is not None:
+                                continue
+                            # 尝试用此会话的 key 解密第一个包来验证
+                            try:
+                                if data[0] != 0x01:
+                                    continue
+                                plen = struct.unpack_from("!H", data, 2)[0]
+                                if len(data) != UDP_AUDIO_HEADER_SIZE + plen:
+                                    continue
+                                ts = struct.unpack_from("!I", data, 8)[0]
+                                seq = struct.unpack_from("!I", data, 12)[0]
+                                n = bytearray(sess["aes_nonce"])
+                                struct.pack_into("!H", n, 2, plen)
+                                struct.pack_into("!I", n, 8, ts)
+                                struct.pack_into("!I", n, 12, seq)
+                                decrypted = _aes_ctr_crypt(sess["aes_key"], bytes(n), data[UDP_AUDIO_HEADER_SIZE:])
+                                # Opus 帧以 TOC byte 开头 (0xFC 常见)，验证解密成功
+                                if decrypted and (decrypted[0] & 0xFC) == 0xFC:
+                                    sess["addr"] = addr
+                                    device_id = did
+                                    with _addr_to_device_lock:
+                                        _addr_to_device[addr] = did
+                                    log.info(f"[mqtt-server] 自动匹配设备: {addr} → {did}")
+                                    break
+                            except Exception:
+                                continue
+                    if not device_id:
+                        continue
 
                 with _sessions_lock:
                     session = _sessions.get(device_id)
@@ -619,10 +679,10 @@ class MqttXiaozhiServer:
             "voice": "zh-CN",
         }))
 
-        ts = int(time.time() * 1000)
+        ts = int(time.time() * 1000) & 0xFFFFFFFF
         def _send_audio():
             for i, pkt in enumerate(opus_packets):
-                packet = _build_audio_packet(aes_nonce, pkt, ts + i * 60, i)
+                packet = _build_audio_packet(aes_key, aes_nonce, pkt, ts + i * 60, i)
                 try:
                     self._udp_sock.sendto(packet, addr)
                 except Exception as e:

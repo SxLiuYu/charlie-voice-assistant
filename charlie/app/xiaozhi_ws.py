@@ -75,7 +75,7 @@ SILENCE_RMS_DEFAULT = 150   # fallback before a noise baseline exists
 # dropped silently so the device never talks on its own. Receiving a valid
 # command refreshes the window, keeping a normal back-and-forth alive.
 # 0 disables the gate.
-ARM_WINDOW = 30.0  # 对话连续窗口（主动推送由MQTT信令触发，不绑架此值）
+ARM_WINDOW = float(os.getenv("XIAOZHI_ARM_WINDOW", "30.0"))  # 对话连续窗口；0=禁用断开，保持长连接供主动推送
 # After a wake (listen/detect) the device's own speaker beep + the wake word
 # itself can momentarily re-trigger our endpointing. Ignore fresh hot frames
 # for this long so the acknowledgement tone and echo settle before the mic
@@ -360,6 +360,7 @@ def register_xiaozhi_routes(app: FastAPI):
                         await ws.send_text(json.dumps({"type": "tts", "state": "sentence_start", "text": item["text"]}))
                         for pkt in packets:
                             await ws.send_bytes(pkt)
+                            await asyncio.sleep(0.06)  # 60ms 帧间隔
                         await ws.send_text(json.dumps({"type": "tts", "state": "stop"}))
                         log.info(f"[xiaozhi] 补发推送: {item['text'][:30]}")
                     except Exception as e:
@@ -443,6 +444,13 @@ def register_xiaozhi_routes(app: FastAPI):
                                 pending_sentences.append(s)
                                 _put_blocking((s, mp3))
                         return
+                    _ws_t0 = time.monotonic()
+                    try:
+                        from app.audit_log import audit_log
+                        audit_log("ws:brain", input_data=text,
+                                  action="start", session_id=f"xiaozhi-{device_key}")
+                    except Exception:
+                        pass
                     for s, full in brain_stream_sentences(
                         text, session_id="xiaozhi-" + device_key,
                         interrupted_reply=interrupted_reply,
@@ -638,6 +646,14 @@ def register_xiaozhi_routes(app: FastAPI):
                      (t_decode - t0) * 1000,
                      (t_asr - t_decode) * 1000,
                      asr_text)
+            try:
+                from app.audit_log import audit_log
+                audit_log("ws:asr", input_data=f"{len(frames)}frames",
+                          output_data=asr_text, action="recognize",
+                          session_id=f"xiaozhi-{device_key}",
+                          duration_ms=(t_asr - t_decode) * 1000)
+            except Exception:
+                pass
             if not asr_text or is_garbled_asr(asr_text):
                 log.info("[xiaozhi] ASR filtered as garbled: %r", asr_text)
                 await send_json({"type": "stt", "text": ""})

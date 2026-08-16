@@ -122,6 +122,12 @@ def play_reminder_audio(text: str, reminder_id: int | None = None):
     afplay 放到独立线程避免阻塞决策/调度线程"""
     import platform as _platform
     try:
+        from app.audit_log import audit_log
+        audit_log("notification:reminder_audio", input_data=text,
+                  action="play", session_id="system", source="system")
+    except Exception:
+        pass
+    try:
         from voice_agent import tts_to_mp3
         log.info(f"[reminder] TTS生成: {text}")
         audio = tts_to_mp3(f"主人，提醒您：{text}")
@@ -187,6 +193,7 @@ async def async_push_tts_to_xiaozhi(ws, text: str, mp3_data: bytes):
         await ws.send_text(_json.dumps({"type": "tts", "state": "sentence_start", "text": text}, ensure_ascii=False))
         for pkt in packets:
             await ws.send_bytes(pkt)
+            await asyncio.sleep(0.06)  # 60ms 帧间隔，匹配设备解码速度
         await ws.send_text(_json.dumps({"type": "tts", "state": "stop"}, ensure_ascii=False))
         log.info(f"[xiaozhi-push] 推送成功: {text[:30]} ({len(packets)}帧)")
     except Exception as e:
