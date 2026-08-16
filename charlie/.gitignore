@@ -45,3 +45,4 @@ audio_000.wav
 .baidu_token_tmp*.json
 evolution_data.json
 models/
+.coverage

@@ -708,7 +708,7 @@ class TestVoiceLoop:
         """TTS 限流冷却时仍返回 ASR 文本和大脑回复，避免整轮对话失败。"""
         with patch.object(voice_agent, "asr", return_value="今天天气怎么样"), \
              patch.object(voice_agent, "brain", return_value="今天晴天。"), \
-             patch.object(agent.asr_tts, "tts", side_effect=voice_agent.TTSUnavailableError("TTSHTTP异常: 429")):
+             patch.object(voice_agent, "tts", side_effect=voice_agent.TTSUnavailableError("TTSHTTP异常: 429")):
             text, reply, audio = voice_agent.voice_loop(b"fake-audio", "wav")
 
         assert text == "今天天气怎么样"
@@ -858,7 +858,7 @@ class TestTTSFailureCooldown:
         voice_agent._tts_unavailable_until = 0.0
         agent.asr_tts._tts_unavailable_until = 0.0
         with patch.object(agent.asr_tts, "TTS_FAILURE_COOLDOWN", 0.02), \
-             patch.object(agent.retry, "_retry", side_effect=Exception("TTSHTTP异常: 429")) as mock_retry:
+             patch.object(agent.retry, "_retry", side_effect=voice_agent.TTSUnavailableError("TTSHTTP异常: 429")) as mock_retry:
             for _ in range(2):
                 with pytest.raises(voice_agent.TTSUnavailableError):
                     voice_agent.tts("第一句")
@@ -871,7 +871,7 @@ class TestTTSFailureCooldown:
         agent.asr_tts._tts_unavailable_until = 0.0  # 清 setup 留下熔断, 让首次走 _retry 而非直接熔断
         wav = b"wav-audio-bytes" + b"x" * 120
         with patch.object(agent.asr_tts, "TTS_FAILURE_COOLDOWN", 0.02), \
-             patch.object(agent.retry, "_retry", side_effect=[Exception("TTSHTTP异常: 429"), wav]) as mock_retry:
+             patch.object(agent.retry, "_retry", side_effect=[voice_agent.TTSUnavailableError("TTSHTTP异常: 429"), wav]) as mock_retry:
             with pytest.raises(voice_agent.TTSUnavailableError):
                 voice_agent.tts("失败")
             time.sleep(0.03)
@@ -1204,6 +1204,8 @@ class TestApiKeyFailover:
         """单密钥场景: ARK_KEY 从环境读取"""
         monkeypatch.setenv("ARK_KEY", "test-ark-key-1")
         import importlib
+        import agent.llm_state as _llm_st
+        importlib.reload(_llm_st)
         importlib.reload(voice_agent)
         assert voice_agent.ARK_KEY == "test-ark-key-1"
 

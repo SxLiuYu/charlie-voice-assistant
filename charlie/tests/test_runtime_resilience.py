@@ -791,7 +791,7 @@ def test_update_suggest_state_holds_exclusive_lock_for_read_modify_write(tmp_pat
     """主动建议状态更新必须在同一个排他锁内重读磁盘、合并更新并写入。"""
     import json
     from contextlib import contextmanager
-    import voice_server
+    import app.schedulers as _sched
 
     state_file = tmp_path / "suggestions_state.json"
     lock_file = tmp_path / "suggestions_state.json.lock"
@@ -799,12 +799,12 @@ def test_update_suggest_state_holds_exclusive_lock_for_read_modify_write(tmp_pat
         json.dumps({"last_rain_suggest": "old-day"}, ensure_ascii=False),
         encoding="utf-8",
     )
-    monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-    monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-    voice_server.SUGGESTIONS_STATE.clear()
+    monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+    monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+    _sched.SUGGESTIONS_STATE.clear()
 
     lock_modes = []
-    original_locked_state = voice_server._locked_suggest_state
+    original_locked_state = _sched._locked_suggest_state
 
     @contextmanager
     def tracking_locked_state(shared=False):
@@ -812,9 +812,9 @@ def test_update_suggest_state_holds_exclusive_lock_for_read_modify_write(tmp_pat
         with original_locked_state(shared=shared):
             yield
 
-    monkeypatch.setattr(voice_server, "_locked_suggest_state", tracking_locked_state)
+    monkeypatch.setattr(_sched, "_locked_suggest_state", tracking_locked_state)
 
-    voice_server._update_suggest_state({"last_time_suggest": "2026-08-01_morning"})
+    _sched._update_suggest_state({"last_time_suggest": "2026-08-01_morning"})
 
     assert lock_modes == [False]
     stored = json.loads(state_file.read_text(encoding="utf-8"))

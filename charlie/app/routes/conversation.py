@@ -201,6 +201,8 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
                 if txt in pending_tts:
                     pending_tts.remove(txt)
             elif rtype == "error":
+                if txt in pending_tts:
+                    pending_tts.remove(txt)
                 if not tts_failed:
                     tts_failed = True
                     yield sse_event(warning)
@@ -465,7 +467,7 @@ async def export_conversation(format: str = "txt", session_id: str = "default", 
     lines = []
     for m in hist:
         role = "我" if m.get("role") == "user" else "Charlie"
-        ts = m.get("ts", "")[:19].replace("T", " ") if m.get("ts") else ""
+        ts = str(m.get("ts", "") or "")[:19].replace("T", " ") if m.get("ts") else ""
         ts_prefix = f"[{ts}] " if ts else ""
         lines.append(f"[{role}] {ts_prefix}{m.get('content', '')}")
     return Response(content="\n\n".join(lines).encode("utf-8"), media_type="text/plain",
@@ -499,7 +501,7 @@ async def search_conversation(q: str = "", session_id: str = "default", limit: i
         prefix = "..." if start > 0 else ""
         suffix = "..." if end < len(content) else ""
         ctx = prefix + content[start:idx] + "[" + content[idx:idx+len(q)] + "]" + content[idx+len(q):end] + suffix
-        ts = m.get("ts", "")[:19].replace("T", " ") if m.get("ts") else ""
+        ts = str(m.get("ts", "") or "")[:19].replace("T", " ") if m.get("ts") else ""
         results.append({"role": role, "context": ctx, "full": content[:200], "score": score, "index": i, "timestamp": ts})
     results.sort(key=lambda r: r["score"], reverse=True)
     total = len(results)

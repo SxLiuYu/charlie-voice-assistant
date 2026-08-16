@@ -167,6 +167,9 @@ def tts(text: str) -> bytes:
         # 百度TTS主用(~120ms vs Finna~1085ms, 快9倍), 失败降级Finna
         audio = _retry(lambda: _tts_baidu(cleaned), name="TTS(百度)")
     except TTSUnavailableError:
+        with _tts_lock:
+            _tts_failures += 1
+            _tts_unavailable_until = now + TTS_FAILURE_COOLDOWN
         raise
     except Exception as e:
         log.warning(f"百度TTS失败, 降级Finna: {e}")

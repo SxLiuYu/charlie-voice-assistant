@@ -15,8 +15,9 @@ from app.state import _rate_buckets, _session_buckets, _RATE_GENERAL, _RATE_VOIC
 
 log = logging.getLogger("magic")
 
+TUNNEL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tunnel_url.txt")
+
 def tunnel_origins() -> list[str]:
-    TUNNEL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tunnel_url.txt")
     try:
         with open(TUNNEL_FILE, encoding="utf-8") as f:
             tunnel = f.read().strip()
@@ -25,7 +26,6 @@ def tunnel_origins() -> list[str]:
         return []
 
 def read_tunnel_url() -> str | None:
-    TUNNEL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tunnel_url.txt")
     try:
         with open(TUNNEL_FILE, encoding="utf-8") as f:
             url = f.read().strip()

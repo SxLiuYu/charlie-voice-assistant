@@ -350,6 +350,7 @@ def test_one_wake_allows_multiple_followups(xiaozhi_server):
          patch("app.xiaozhi_ws._synth_mp3", return_value=b"\x00" * 200), \
          patch("app.xiaozhi_ws.mp3_to_opus_packets",
                return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
+         patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
          patch("voice_agent.asr", side_effect=fake_asr), \
          patch("voice_agent.brain_stream_sentences", side_effect=fake_brain):
         with ws_connect(xiaozhi_server) as ws:
@@ -398,6 +399,7 @@ def test_short_utterance_reaches_asr(xiaozhi_server):
          patch("app.xiaozhi_ws._synth_mp3", return_value=b"\x00" * 200), \
          patch("app.xiaozhi_ws.mp3_to_opus_packets",
                return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
+         patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
          patch("voice_agent.asr", side_effect=fake_asr), \
          patch("voice_agent.brain_stream_sentences", side_effect=fake_brain):
         with ws_connect(xiaozhi_server) as ws:

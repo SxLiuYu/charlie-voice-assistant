@@ -13,7 +13,7 @@ voice_server.py 现在是组装入口: 日志 → FastAPI app → 中间件 → 
   app/routes/websocket.py   — WebSocket双向通信路由
   app/routes/manage.py      — 配置/PWA/ESP32/偏好/行为/协议/MCP路由
 """
-import os, sys, json, time, logging, asyncio, concurrent.futures
+import os, sys, json, time, datetime, threading, logging, asyncio, concurrent.futures
 import uuid
 
 if not getattr(sys, 'frozen', False):
@@ -258,6 +258,15 @@ register_xiaozhi_routes(app)
 # ===== Backward-compatible re-exports =====
 # Tests and external code import voice_server._xxx directly.
 # These re-exports keep them working after the split.
+from app.audio import to_wav
+from app.auth import _sanitize_text
+from app.notifications import MAX_NOTIFICATIONS
+from app.reminders import (
+    claim_due_reminders, _load_reminders, append_reminder,
+    complete_reminder, acquire_scheduler_lock,
+)
+from fastapi.responses import StreamingResponse
+from app.routes.reminders import sse_events
 from app.routes import manage as _manage_mod
 from app.routes import conversation as _conv_mod
 from app.routes import websocket as _ws_mod

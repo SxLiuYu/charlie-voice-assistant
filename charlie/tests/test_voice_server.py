@@ -15,6 +15,19 @@ from fastapi.testclient import TestClient
 from app import reminders as app_reminders
 from app.state import Metrics, _interrupt_telemetry, _poll_telemetry, _rate_buckets, _session_buckets, register_sse_client, unregister_sse_client, snapshot_sse_clients, sse_client_count
 import voice_server
+import app.schedulers as _sched
+import app.notifications as _notif
+import app.cors as _cors
+import app.http_helpers as _http
+import app.reminders as _rem
+import app.routes.reminders as _rem_route
+import app.routes.conversation as _conv_route
+import app.routes.websocket as _ws_route
+import agent.history as _history
+import agent.asr_tts as _asr_tts
+import agent.preferences as _prefs_mod
+import app.routes.manage as _manage_route
+import agent.llm_state as _llm_state
 
 
 def _silence_wav(seconds=5, sample_rate=16000):
@@ -119,7 +132,7 @@ class TestHealthAndStatus:
 
     @pytest.mark.parametrize("path", ["/", "/test"])
     def test_html_routes_reuse_cached_file_contents(self, client, monkeypatch, path):
-        monkeypatch.setattr(voice_server, "_text_file_cache", {}, raising=False)
+        monkeypatch.setattr(_http, "_text_file_cache", {}, raising=False)
         opened_paths = []
         real_open = open
 
@@ -127,7 +140,7 @@ class TestHealthAndStatus:
             opened_paths.append(os.fspath(file))
             return real_open(file, *args, **kwargs)
 
-        monkeypatch.setattr(voice_server, "_open_text_file", tracking_open)
+        monkeypatch.setattr(_http, "_open_text_file", tracking_open)
 
         first = client.get(path)
         second = client.get(path)
@@ -140,7 +153,7 @@ class TestHealthAndStatus:
 
     @pytest.mark.parametrize("path", ["/", "/test"])
     def test_html_routes_support_etag_304_without_reading_file(self, client, monkeypatch, path):
-        monkeypatch.setattr(voice_server, "_text_file_cache", {}, raising=False)
+        monkeypatch.setattr(_http, "_text_file_cache", {}, raising=False)
 
         first = client.get(path)
         etag = first.headers.get("etag")
@@ -156,7 +169,7 @@ class TestHealthAndStatus:
             opened_paths.append(os.fspath(file))
             return real_open(file, *args, **kwargs)
 
-        monkeypatch.setattr(voice_server, "_open_text_file", tracking_open)
+        monkeypatch.setattr(_http, "_open_text_file", tracking_open)
         second = client.get(path, headers={"If-None-Match": etag})
 
         assert second.status_code == 304
@@ -165,7 +178,7 @@ class TestHealthAndStatus:
         assert opened_paths == []
 
     def test_cached_text_file_rereads_when_file_token_changes(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(voice_server, "_text_file_cache", {}, raising=False)
+        monkeypatch.setattr(_http, "_text_file_cache", {}, raising=False)
         path = tmp_path / "page.html"
         path.write_text("first version", encoding="utf-8")
 
@@ -176,7 +189,7 @@ class TestHealthAndStatus:
             opened_paths.append(os.fspath(file))
             return real_open(file, *args, **kwargs)
 
-        monkeypatch.setattr(voice_server, "_open_text_file", tracking_open)
+        monkeypatch.setattr(_http, "_open_text_file", tracking_open)
 
         assert voice_server._read_cached_text(str(path)) == "first version"
         assert voice_server._read_cached_text(str(path)) == "first version"
@@ -399,7 +412,7 @@ class TestHealthAndStatus:
         assert second.headers["cache-control"] == "public, max-age=86400"
 
     def test_manifest_reuses_cached_json_and_supports_head_304(self, client, monkeypatch):
-        monkeypatch.setattr(voice_server, "_MANIFEST_BODY", None, raising=False)
+        monkeypatch.setattr(_http, "_MANIFEST_BODY", None, raising=False)
 
         first = client.get("/manifest.json")
         etag = first.headers.get("etag")
@@ -418,7 +431,7 @@ class TestHealthAndStatus:
             builds += 1
             return original_build()
 
-        monkeypatch.setattr(voice_server, "_build_manifest_payload", tracking_build)
+        monkeypatch.setattr(_http, "build_manifest_payload", tracking_build)
 
         head = client.head("/manifest.json")
         cached = client.get("/manifest.json", headers={"If-None-Match": etag})
@@ -563,9 +576,9 @@ class TestHealthAndStatus:
     def test_tunnel_cors_origin_reloads_when_tunnel_file_changes(self, tmp_path):
         tunnel_file = tmp_path / "tunnel_url.txt"
         tunnel_file.write_text("https://first.example.com", encoding="utf-8")
-        old_origins = list(voice_server._cors_origins)
+        old_origins = list(_cors._cors_origins)
         try:
-            with patch.object(voice_server, "TUNNEL_FILE", str(tunnel_file)):
+            with patch.object(_cors, "TUNNEL_FILE", str(tunnel_file)):
                 assert voice_server._reload_cors_origins() == ["https://first.example.com"]
                 assert "https://first.example.com" in voice_server._cors_origins
 
@@ -578,21 +591,22 @@ class TestHealthAndStatus:
                 assert voice_server._reload_cors_origins() == []
                 assert "https://second.example.com" not in voice_server._cors_origins
         finally:
-            voice_server._cors_origins[:] = old_origins
+            _cors._cors_origins[:] = old_origins
 
     def test_tunnel_endpoint_reloads_cors_origin(self, client, tmp_path):
         tunnel_file = tmp_path / "tunnel_url.txt"
         tunnel_file.write_text("https://new.example.com", encoding="utf-8")
-        old_origins = list(voice_server._cors_origins)
+        old_origins = list(_cors._cors_origins)
         try:
-            with patch.object(voice_server, "TUNNEL_FILE", str(tunnel_file)):
+            with patch.object(_cors, "TUNNEL_FILE", str(tunnel_file)), \
+                 patch.object(_manage_route, "TUNNEL_FILE", str(tunnel_file)):
                 response = client.get("/api/tunnel")
 
             assert response.status_code == 200
             assert response.json()["url"] == "https://new.example.com"
             assert "https://new.example.com" in voice_server._cors_origins
         finally:
-            voice_server._cors_origins[:] = old_origins
+            _cors._cors_origins[:] = old_origins
 
     def test_dynamic_cors_middleware_reloads_origin_flags(self):
         from starlette.applications import Starlette
@@ -625,7 +639,7 @@ class TestHealthAndStatus:
     def test_cors_defaults_to_localhost_and_lan_without_wildcard(self, client, monkeypatch):
         monkeypatch.delenv("ASSISTANT_KID_CORS_ORIGINS", raising=False)
         monkeypatch.setattr(
-            voice_server,
+            _cors,
             "lan_origins",
             lambda: [
                 "http://192.168.1.4:8000",
@@ -633,9 +647,9 @@ class TestHealthAndStatus:
             ],
         )
 
-        old_origins = list(voice_server._cors_origins)
+        old_origins = list(_cors._cors_origins)
         try:
-            with patch.object(voice_server, "_tunnel_origins", lambda: []):
+            with patch.object(_cors, "tunnel_origins", lambda: []):
                 voice_server._reload_cors_origins()
 
                 assert "*" not in voice_server._cors_origins
@@ -664,7 +678,7 @@ class TestHealthAndStatus:
             assert unknown_preflight.status_code == 400
             assert "Access-Control-Allow-Origin" not in unknown_preflight.headers
         finally:
-            voice_server._cors_origins[:] = old_origins
+            _cors._cors_origins[:] = old_origins
 
     def test_extra_cors_origins_are_explicitly_allowlisted(self, monkeypatch, tmp_path):
         from app import config
@@ -676,9 +690,9 @@ class TestHealthAndStatus:
         monkeypatch.setattr(config, "lan_origins", lambda: ["http://192.168.1.4:8000", "https://192.168.1.4:8443"])
 
         tunnel_file = tmp_path / "tunnel_url.txt"
-        old_origins = list(voice_server._cors_origins)
+        old_origins = list(_cors._cors_origins)
         try:
-            with patch.object(voice_server, "TUNNEL_FILE", str(tunnel_file)):
+            with patch.object(_manage_route, "TUNNEL_FILE", str(tunnel_file)):
                 voice_server._reload_cors_origins()
 
                 assert "https://phone.example:8443" in voice_server._cors_origins
@@ -686,24 +700,24 @@ class TestHealthAndStatus:
                 assert "*" not in voice_server._cors_origins
                 assert "not-a-url" not in voice_server._cors_origins
         finally:
-            voice_server._cors_origins[:] = old_origins
+            _cors._cors_origins[:] = old_origins
 
     def test_cors_refreshes_lan_origins_after_ttl_without_tunnel_endpoint(self, monkeypatch):
         from app import config
 
         now = [1000.0]
         monkeypatch.setattr(voice_server.time, "monotonic", lambda: now[0])
-        monkeypatch.setattr(voice_server, "_tunnel_origins", lambda: [])
-        monkeypatch.setattr(voice_server, "configured_cors_origins", lambda: [])
+        monkeypatch.setattr(_cors, "tunnel_origins", lambda: [])
+        monkeypatch.setattr(_cors, "configured_cors_origins", lambda: [])
         monkeypatch.setattr(config, "configured_cors_origins", lambda: [])
-        monkeypatch.setattr(voice_server, "lan_origins", lambda: ["http://192.168.1.4:8000"])
-        old_origins = list(voice_server._cors_origins)
+        monkeypatch.setattr(_cors, "lan_origins", lambda: ["http://192.168.1.4:8000"])
+        old_origins = list(_cors._cors_origins)
         old_loaded_at = voice_server._cors_origins_loaded_at
         try:
             voice_server._refresh_cors_origins(force=True)
             assert "http://192.168.1.4:8000" in voice_server._cors_origins
 
-            monkeypatch.setattr(voice_server, "lan_origins", lambda: ["http://10.0.0.5:8000"])
+            monkeypatch.setattr(_cors, "lan_origins", lambda: ["http://10.0.0.5:8000"])
             voice_server._refresh_cors_origins()
             assert "http://10.0.0.5:8000" not in voice_server._cors_origins
 
@@ -712,7 +726,7 @@ class TestHealthAndStatus:
             assert "http://10.0.0.5:8000" in voice_server._cors_origins
             assert "http://192.168.1.4:8000" not in voice_server._cors_origins
         finally:
-            voice_server._cors_origins[:] = old_origins
+            _cors._cors_origins[:] = old_origins
             voice_server._cors_origins_loaded_at = old_loaded_at
 
     def test_status_exposes_runtime_health(self, client, tmp_path, monkeypatch):
@@ -729,9 +743,9 @@ class TestHealthAndStatus:
         assert proactive_handle is not None
 
         now = time.time()
-        monkeypatch.setattr(voice_agent, "_tts_unavailable_until", now + 12)
-        monkeypatch.setattr(voice_agent, "_intent_failures", 2)
-        monkeypatch.setattr(voice_agent, "_intent_disabled_until", now + 25)
+        monkeypatch.setattr(_asr_tts, "_tts_unavailable_until", now + 12)
+        monkeypatch.setattr(_llm_state, "intent_failures", 2)
+        monkeypatch.setattr(_llm_state, "intent_disabled_until", now + 25)
 
         try:
             r = client.get("/api/status")
@@ -1110,7 +1124,7 @@ class TestHealthAndStatus:
         assert r.status_code == 200
         data = r.json()
         assert "version" in data
-        assert data["version"] == "3.1.0"
+        assert data["version"] == "3.2.0"
         assert "deepseek" in data.get("brain", "").lower()
 
 
@@ -1277,7 +1291,7 @@ class TestReminders:
             def call_soon_threadsafe(self, callback, payload):
                 raise RuntimeError("event loop is closed")
 
-        monkeypatch.setattr(voice_server, "_main_loop", ClosedLoop())
+        monkeypatch.setattr(_notif, "_main_loop", ClosedLoop())
         register_sse_client(client_queue)
         try:
             voice_server._push_notification_to_sse("data: test\n\n")
@@ -1319,12 +1333,12 @@ class TestReminders:
             def __exit__(self, exc_type, exc, tb):
                 self.release()
 
-        original_deque = voice_server._notifications
+        original_deque = _notif._notifications
         original_lock = voice_server._notifications_lock
         notifications = TrackingDeque()
         lock = InstrumentedLock()
-        voice_server._notifications = notifications
-        voice_server._notifications_lock = lock
+        _notif._notifications = notifications
+        _notif._notifications_lock = lock
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 drain_future = pool.submit(voice_server._drain_notifications)
@@ -1339,8 +1353,8 @@ class TestReminders:
             remaining = voice_server._drain_notifications()
             assert remaining == [{"text": "同时到达"}]
         finally:
-            voice_server._notifications = original_deque
-            voice_server._notifications_lock = original_lock
+            _notif._notifications = original_deque
+            _notif._notifications_lock = original_lock
 
     def test_notification_buffer_trims_oldest_entries_under_cap(self):
         for index in range(voice_server.MAX_NOTIFICATIONS + 3):
@@ -1362,7 +1376,7 @@ class TestReminders:
                 scheduled.append(payload)
                 callback(client_q, payload)
 
-        monkeypatch.setattr(voice_server, "_main_loop", FakeLoop())
+        monkeypatch.setattr(_notif, "_main_loop", FakeLoop())
         register_sse_client(first_queue)
         register_sse_client(second_queue)
         try:
@@ -1405,8 +1419,9 @@ class TestReminders:
                 return CompletedProcess(cmd, 0)
             raise AssertionError(f"unexpected command: {cmd}")
 
-        with patch.object(voice_agent, "tts", return_value=wav) as mock_raw_tts, \
+        with patch.object(_asr_tts, "tts", return_value=wav) as mock_raw_tts, \
              patch.object(voice_server, "_add_notification"), \
+             patch.object(threading.Thread, "start", lambda self: self.run()), \
              patch("subprocess.run", side_effect=fake_run):
             voice_server._play_reminder_audio("该喝水了")
             voice_server._play_reminder_audio("该喝水了")
@@ -1463,6 +1478,7 @@ class TestReminders:
 
         with patch.object(voice_agent, "tts_to_mp3", return_value=b"fake-mp3" + b"x" * 120), \
              patch.object(voice_server, "_add_notification"), \
+             patch.object(threading.Thread, "start", lambda self: self.run()), \
              patch.object(tempfile, "NamedTemporaryFile", side_effect=fake_named_temporary_file), \
              patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["afplay"], timeout=1)):
             voice_server._play_reminder_audio("临时文件测试")
@@ -1495,6 +1511,7 @@ class TestReminders:
         try:
             with patch.object(voice_agent, "tts_to_mp3", return_value=b"fake-mp3" + b"x" * 120), \
                  patch.object(voice_server, "_add_notification"), \
+                 patch.object(threading.Thread, "start", lambda self: self.run()), \
                  patch("subprocess.run") as mock_run:
                 voice_server._play_reminder_audio("成功完成提醒", reminder_id=4244)
 
@@ -1536,6 +1553,7 @@ class TestReminders:
         try:
             with patch.object(voice_agent, "tts_to_mp3", return_value=b"fake-mp3" + b"x" * 120), \
                  patch.object(voice_server, "_add_notification"), \
+                 patch.object(threading.Thread, "start", lambda self: self.run()), \
                  patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["afplay"], timeout=1)):
                 voice_server._play_reminder_audio("播放失败提醒", reminder_id=4245)
 
@@ -1683,9 +1701,9 @@ class TestReminders:
             if len(sleep_calls) >= 2:
                 raise SystemExit
 
-        monkeypatch.setattr(voice_server, "claim_due_reminders", fake_claim)
-        monkeypatch.setattr(voice_server, "_play_reminder_audio", fake_play)
-        monkeypatch.setattr(voice_server, "_scheduler_lock_handle", object())
+        monkeypatch.setattr(_sched, "claim_due_reminders", fake_claim)
+        monkeypatch.setattr(_sched, "play_reminder_audio", fake_play)
+        monkeypatch.setattr(_sched, "_scheduler_lock_handle", object())
         monkeypatch.setattr(voice_server.time, "sleep", fake_sleep)
 
         with pytest.raises(SystemExit):
@@ -1707,10 +1725,10 @@ class TestReminders:
         def fake_sleep(_seconds):
             raise SystemExit
 
-        monkeypatch.setattr(voice_server, "_scheduler_lock_handle", None)
-        monkeypatch.setattr(voice_server, "acquire_scheduler_lock", lambda: None)
-        monkeypatch.setattr(voice_server, "claim_due_reminders", fake_claim)
-        monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: None)
+        monkeypatch.setattr(_sched, "_scheduler_lock_handle", None)
+        monkeypatch.setattr(_sched, "acquire_scheduler_lock", lambda: None)
+        monkeypatch.setattr(_sched, "claim_due_reminders", fake_claim)
+        monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
         monkeypatch.setattr(voice_server.time, "sleep", fake_sleep)
 
         with pytest.raises(SystemExit):
@@ -1743,12 +1761,12 @@ class TestReminders:
             def now(cls, tz=None):
                 return fixed_now
 
-        monkeypatch.setattr(voice_server, "_proactive_lock_handle", None, raising=False)
-        monkeypatch.setattr(voice_server, "acquire_proactive_lock", lambda: None, raising=False)
-        monkeypatch.setattr(voice_server, "_get_weather", fake_weather)
-        monkeypatch.setattr(voice_server, "_add_notification", fake_add_notification)
-        monkeypatch.setattr(voice_server, "_play_reminder_audio", fake_play)
-        monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+        monkeypatch.setattr(_sched, "_proactive_lock_handle", None, raising=False)
+        monkeypatch.setattr(_sched, "acquire_proactive_lock", lambda: None, raising=False)
+        monkeypatch.setattr(_sched, "_get_weather", fake_weather)
+        monkeypatch.setattr(_sched, "add_notification", fake_add_notification)
+        monkeypatch.setattr(_sched, "play_reminder_audio", fake_play)
+        monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
         monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
         monkeypatch.setattr(voice_server.time, "sleep", fake_sleep)
 
@@ -1774,17 +1792,17 @@ class TestReminders:
             raise SystemExit
 
         monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
-        monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-        monkeypatch.setattr(voice_server, "_suggest_state_snapshot", lambda: {
+        monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+        monkeypatch.setattr(_sched, "_suggest_state_snapshot", lambda: {
             "last_weather_check": time.time() + 3600,
             "last_rain_suggest": "",
             "last_time_suggest": "",
             "last_health_alert": "",
         })
-        monkeypatch.setattr(voice_server, "_claim_suggest_state", lambda *args: False)
-        monkeypatch.setattr(voice_server, "_get_weather", lambda: [])
-        monkeypatch.setattr(voice_server, "_add_notification", lambda *args: None)
-        monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda *args, **kwargs: None)
+        monkeypatch.setattr(_sched, "_claim_suggest_state", lambda *args: False)
+        monkeypatch.setattr(_sched, "_get_weather", lambda: [])
+        monkeypatch.setattr(_sched, "add_notification", lambda *args: None)
+        monkeypatch.setattr(_sched, "play_reminder_audio", lambda *args, **kwargs: None)
         monkeypatch.setattr(voice_server, "time", voice_server.time)
         monkeypatch.setattr(voice_server.time, "sleep", fake_sleep)
 
@@ -1827,20 +1845,20 @@ class TestReminders:
         notifications = []
         played = []
 
-        monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-        monkeypatch.setattr(voice_server, "_suggest_state_snapshot", lambda: {
+        monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+        monkeypatch.setattr(_sched, "_suggest_state_snapshot", lambda: {
             "last_weather_check": 0,
             "last_rain_suggest": "",
             "last_time_suggest": "2026-08-02_morning",
             "last_health_alert": "",
         })
-        monkeypatch.setattr(voice_server, "_claim_suggest_state", lambda key, value: True)
-        monkeypatch.setattr(voice_server, "_get_weather", lambda: [
+        monkeypatch.setattr(_sched, "_claim_suggest_state", lambda key, value: True)
+        monkeypatch.setattr(_sched, "_get_weather", lambda: [
             {"dayweather": "雷阵雨", "nightweather": "雷阵雨"},
         ])
-        monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-        monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: played.append(text))
-        monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+        monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+        monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: played.append(text))
+        monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
         monkeypatch.setattr(voice_server.time, "time", lambda: 1_800_000_000)
         monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
             cpu_percent=lambda interval=None: 10,
@@ -1862,11 +1880,11 @@ class TestReminders:
 
         state_file = tmp_path / "suggestions_state.json"
         lock_file = tmp_path / "suggestions_state.json.lock"
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-        old_state = dict(voice_server.SUGGESTIONS_STATE)
-        voice_server.SUGGESTIONS_STATE.clear()
-        voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
 
         weather_calls = []
         notifications = []
@@ -1882,13 +1900,13 @@ class TestReminders:
                 return current["now"]
 
         try:
-            monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-            monkeypatch.setattr(voice_server, "_get_weather", lambda: weather_calls.append(True) or [
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_get_weather", lambda: weather_calls.append(True) or [
                 {"date": "2026-08-02", "dayweather": "雷阵雨", "nightweather": "雷阵雨"},
             ])
-            monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-            monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: played.append(text))
-            monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: played.append(text))
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
             monkeypatch.setattr(voice_server.time, "time", lambda: current["ts"])
             monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
             monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
@@ -1902,8 +1920,8 @@ class TestReminders:
                 voice_server._proactive_suggestions()
 
             # 模拟服务重启：模块级内存状态清空，但持久化状态仍保留在磁盘。
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
             current["now"] = datetime.datetime(2026, 8, 2, 0, 54, 50)
             current["ts"] += 2_333
 
@@ -1916,8 +1934,8 @@ class TestReminders:
             stored = json.loads(state_file.read_text(encoding="utf-8"))
             assert stored["last_rain_suggest"] == "2026-08-02"
         finally:
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(old_state)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
 
     def test_proactive_weather_uses_today_forecast_not_tomorrow(self, tmp_path, monkeypatch):
         """主动天气提醒只能使用今天预报，不能把明天的雨说成今天。"""
@@ -1926,11 +1944,11 @@ class TestReminders:
 
         state_file = tmp_path / "suggestions_state.json"
         lock_file = tmp_path / "suggestions_state.json.lock"
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-        old_state = dict(voice_server.SUGGESTIONS_STATE)
-        voice_server.SUGGESTIONS_STATE.clear()
-        voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
 
         weather_calls = []
         notifications = []
@@ -1942,13 +1960,13 @@ class TestReminders:
                 return fixed_now
 
         try:
-            monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-            monkeypatch.setattr(voice_server, "_get_weather", lambda: weather_calls.append(True) or [
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_get_weather", lambda: weather_calls.append(True) or [
                 {"date": "2026-08-03", "dayweather": "雷阵雨", "nightweather": "雷阵雨"},
             ])
-            monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-            monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: None)
-            monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
             monkeypatch.setattr(voice_server.time, "time", lambda: 1_785_600_957.0)
             monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
             monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
@@ -1964,8 +1982,8 @@ class TestReminders:
             assert weather_calls == [True]
             assert notifications == []
         finally:
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(old_state)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
 
     def test_morning_report_reuses_current_weather_fetch(self, tmp_path, monkeypatch):
         """天气提醒检查后的晨报不能在同一轮再请求一次天气 API。"""
@@ -1974,11 +1992,11 @@ class TestReminders:
 
         state_file = tmp_path / "suggestions_state.json"
         lock_file = tmp_path / "suggestions_state.json.lock"
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-        old_state = dict(voice_server.SUGGESTIONS_STATE)
-        voice_server.SUGGESTIONS_STATE.clear()
-        voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
 
         weather_calls = []
         notifications = []
@@ -1990,13 +2008,13 @@ class TestReminders:
                 return fixed_now
 
         try:
-            monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-            monkeypatch.setattr(voice_server, "_get_weather", lambda: weather_calls.append(True) or [
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_get_weather", lambda: weather_calls.append(True) or [
                 {"date": "2026-08-02", "dayweather": "晴", "nightweather": "多云", "daytemp": "30"},
             ])
-            monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-            monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: None)
-            monkeypatch.setattr(voice_server, "_load_reminders", lambda: [{"text": "写测试", "done": False, "due": "2026-08-02 10:00"}])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [{"text": "写测试", "done": False, "due": "2026-08-02 10:00"}])
             monkeypatch.setattr(voice_server.time, "time", lambda: 1_785_632_400.0)
             monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
             monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
@@ -2015,8 +2033,8 @@ class TestReminders:
                 "morning",
             )]
         finally:
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(old_state)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
 
     def test_morning_report_fetches_weather_once_when_hourly_check_is_skipped(self, tmp_path, monkeypatch):
         """一小时内已检查过天气时，晨报仍可懒加载一次当天天气。"""
@@ -2025,11 +2043,11 @@ class TestReminders:
 
         state_file = tmp_path / "suggestions_state.json"
         lock_file = tmp_path / "suggestions_state.json.lock"
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-        old_state = dict(voice_server.SUGGESTIONS_STATE)
-        voice_server.SUGGESTIONS_STATE.clear()
-        voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
 
         weather_calls = []
         notifications = []
@@ -2041,14 +2059,14 @@ class TestReminders:
                 return fixed_now
 
         try:
-            voice_server._update_suggest_state({"last_weather_check": 1_785_632_400.0})
-            monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-            monkeypatch.setattr(voice_server, "_get_weather", lambda: weather_calls.append(True) or [
+            _sched._update_suggest_state({"last_weather_check": 1_785_632_400.0})
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_get_weather", lambda: weather_calls.append(True) or [
                 {"date": "2026-08-02", "dayweather": "多云", "nightweather": "晴", "daytemp": "29"},
             ])
-            monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-            monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: None)
-            monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
             monkeypatch.setattr(voice_server.time, "time", lambda: 1_785_632_400.0)
             monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
             monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
@@ -2067,8 +2085,8 @@ class TestReminders:
                 "morning",
             )]
         finally:
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(old_state)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
 
     def test_morning_report_retries_weather_after_empty_hourly_fetch(self, tmp_path, monkeypatch):
         """本轮天气检查为空时，晨报应再尝试一次获取天气。"""
@@ -2077,11 +2095,11 @@ class TestReminders:
 
         state_file = tmp_path / "suggestions_state.json"
         lock_file = tmp_path / "suggestions_state.json.lock"
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-        old_state = dict(voice_server.SUGGESTIONS_STATE)
-        voice_server.SUGGESTIONS_STATE.clear()
-        voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
 
         weather_results = [[], [{"date": "2026-08-02", "dayweather": "小雨", "daytemp": "26"}]]
         notifications = []
@@ -2096,11 +2114,11 @@ class TestReminders:
             return weather_results.pop(0)
 
         try:
-            monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-            monkeypatch.setattr(voice_server, "_get_weather", fake_weather)
-            monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-            monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: None)
-            monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_get_weather", fake_weather)
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
             monkeypatch.setattr(voice_server.time, "time", lambda: 1_785_632_400.0)
             monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
             monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
@@ -2119,8 +2137,8 @@ class TestReminders:
                 "morning",
             )]
         finally:
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(old_state)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
 
     def test_preference_suggestions_keep_distinct_state_for_similar_keys(self, tmp_path, monkeypatch):
         """前 10 个字符相同的偏好不能共用去重状态。"""
@@ -2129,11 +2147,11 @@ class TestReminders:
 
         state_file = tmp_path / "suggestions_state.json"
         lock_file = tmp_path / "suggestions_state.json.lock"
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-        old_state = dict(voice_server.SUGGESTIONS_STATE)
-        voice_server.SUGGESTIONS_STATE.clear()
-        voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
 
         notifications = []
         preferences = {
@@ -2148,12 +2166,12 @@ class TestReminders:
                 return fixed_now
 
         try:
-            monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-            monkeypatch.setattr(voice_server, "_suggest_state_snapshot", lambda: {"last_weather_check": time.time() + 3600})
-            monkeypatch.setattr(voice_server, "_get_weather", lambda: [])
-            monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-            monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: None)
-            monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_suggest_state_snapshot", lambda: {"last_weather_check": time.time() + 3600})
+            monkeypatch.setattr(_sched, "_get_weather", lambda: [])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
             monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
             monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
                 cpu_percent=lambda interval=None: 10,
@@ -2178,8 +2196,8 @@ class TestReminders:
                 "主人，快到下班时间了(19:00下班)，需要我帮你查查路况或叫个车吗？",
             ]
         finally:
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(old_state)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
 
     def test_same_day_preference_suggestion_survives_restart(self, tmp_path, monkeypatch):
         """同一天服务重启后，已申领的偏好建议不能重复播报。"""
@@ -2189,17 +2207,17 @@ class TestReminders:
 
         state_file = tmp_path / "suggestions_state.json"
         lock_file = tmp_path / "suggestions_state.json.lock"
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_FILE", str(state_file))
-        monkeypatch.setattr(voice_server, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
-        old_state = dict(voice_server.SUGGESTIONS_STATE)
-        voice_server.SUGGESTIONS_STATE.clear()
-        voice_server.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
 
         pkey = "下班回家路线偏好设置A"
         pval = "18:30下班"
         pref_fingerprint = hashlib.sha256(f"{pkey}\0{pval}".encode("utf-8")).hexdigest()[:16]
         pref_key = f"last_pref_{pref_fingerprint}"
-        voice_server._update_suggest_state({pref_key: f"2026-08-02_pref_{pref_fingerprint}"})
+        _sched._update_suggest_state({pref_key: f"2026-08-02_pref_{pref_fingerprint}"})
 
         notifications = []
         fixed_now = datetime.datetime(2026, 8, 2, 18, 30, 0)
@@ -2210,12 +2228,12 @@ class TestReminders:
                 return fixed_now
 
         try:
-            voice_server._update_suggest_state({"last_pref_下班回家路线偏好设置": "2026-08-01_pref_下班回家路线偏好设置"})
-            monkeypatch.setattr(voice_server, "_proactive_lock_handle", object(), raising=False)
-            monkeypatch.setattr(voice_server, "_get_weather", lambda: [])
-            monkeypatch.setattr(voice_server, "_add_notification", lambda text, ntype: notifications.append((text, ntype)))
-            monkeypatch.setattr(voice_server, "_play_reminder_audio", lambda text, reminder_id=None: None)
-            monkeypatch.setattr(voice_server, "_load_reminders", lambda: [])
+            _sched._update_suggest_state({"last_pref_下班回家路线偏好设置": "2026-08-01_pref_下班回家路线偏好设置"})
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_get_weather", lambda: [])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
             monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
             monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
                 cpu_percent=lambda interval=None: 10,
@@ -2229,8 +2247,8 @@ class TestReminders:
 
             assert notifications == []
         finally:
-            voice_server.SUGGESTIONS_STATE.clear()
-            voice_server.SUGGESTIONS_STATE.update(old_state)
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
 
     def test_list_reminders(self, client):
         r = client.get("/api/reminders")
@@ -2287,8 +2305,8 @@ class TestReminders:
             calls.append((text, time_str, due))
             return {"id": 9999, "text": text, "time": time_str, "due": due, "done": False}
 
-        monkeypatch.setattr(voice_server, "append_reminder", fake_append_reminder)
-        monkeypatch.setattr(voice_server, "_load_reminders", lambda: (_ for _ in ()).throw(AssertionError("route must not load reminders")))
+        monkeypatch.setattr(_rem_route, "append_reminder", fake_append_reminder)
+        monkeypatch.setattr(_rem_route, "_load_reminders", lambda: (_ for _ in ()).throw(AssertionError("route must not load reminders")))
 
         r = client.post("/api/reminders", json={"text": "路由事务提醒", "time": ""})
 
@@ -2299,8 +2317,8 @@ class TestReminders:
     def test_delete_reminder_uses_complete_transaction(self, client, monkeypatch):
         """DELETE 提醒必须通过锁内完成事务处理，并把 not found 映射为 404。"""
         calls = []
-        monkeypatch.setattr(voice_server, "complete_reminder", lambda rid: calls.append(rid) or True)
-        monkeypatch.setattr(voice_server, "_load_reminders", lambda: (_ for _ in ()).throw(AssertionError("route must not load reminders")))
+        monkeypatch.setattr(_rem_route, "complete_reminder", lambda rid: calls.append(rid) or True)
+        monkeypatch.setattr(_rem_route, "_load_reminders", lambda: (_ for _ in ()).throw(AssertionError("route must not load reminders")))
 
         r = client.delete("/api/reminders/8888")
 
@@ -2308,7 +2326,7 @@ class TestReminders:
         assert calls == [8888]
 
     def test_delete_missing_reminder_returns_404_without_save(self, client, monkeypatch):
-        monkeypatch.setattr(voice_server, "complete_reminder", lambda rid: False)
+        monkeypatch.setattr(_rem_route, "complete_reminder", lambda rid: False)
 
         r = client.delete("/api/reminders/4040")
 
@@ -2493,8 +2511,8 @@ class TestConditionalGet:
         prefs_file = tmp_path / "preferences.json"
         lock_file = tmp_path / "preferences.json.lock"
         prefs_file.write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(voice_agent, "PREFS_FILE", str(prefs_file))
-        monkeypatch.setattr(voice_agent, "PREFS_LOCK_FILE", str(lock_file), raising=False)
+        monkeypatch.setattr(_prefs_mod, "PREFS_FILE", str(prefs_file))
+        monkeypatch.setattr(_prefs_mod, "PREFS_LOCK_FILE", str(lock_file), raising=False)
         voice_agent._preferences.clear()
         voice_agent._preferences_revision = 0
         if hasattr(voice_agent, "_preferences_save_seq"):
@@ -2611,7 +2629,7 @@ class TestSearch:
                 opened_paths.append(path)
             return open(path, *args, **kwargs)
 
-        with patch("voice_agent.open", side_effect=tracked_open):
+        with patch("agent.history.open", side_effect=tracked_open):
             r = client.get(f"/api/search?q=alpha&session_id={session_id}")
 
         assert r.status_code == 200
@@ -2647,7 +2665,7 @@ class TestSearch:
                 opened_paths.append(path)
             return open(path, *args, **kwargs)
 
-        with patch("voice_agent.open", side_effect=tracked_open):
+        with patch("agent.history.open", side_effect=tracked_open):
             first = client.get(f"/api/search?q=beta&session_id={session_id}")
             second = client.get(f"/api/search?q=beta&session_id={session_id}")
 
@@ -2691,13 +2709,13 @@ class TestSearch:
                 opened_paths.append(path)
             return open(path, *args, **kwargs)
 
-        with patch("voice_agent.open", side_effect=tracked_open):
+        with patch("agent.history.open", side_effect=tracked_open):
             first = client.get(f"/api/search?q=gamma&session_id={session_id}")
             assert first.status_code == 200
             assert first.json()["total"] == 2
 
         write_external_messages("delta")
-        with patch("voice_agent.open", side_effect=tracked_open):
+        with patch("agent.history.open", side_effect=tracked_open):
             changed = client.get(f"/api/search?q=delta&session_id={session_id}")
 
         assert changed.status_code == 200
@@ -2730,10 +2748,10 @@ class TestChat:
 
     def test_voice_stream_empty_asr_short_circuits_brain(self, client):
         """空 ASR 只返回没听清提示，不进入大脑或 TTS。"""
-        with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+        with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
              patch("voice_agent.asr", return_value=""), \
              patch("voice_agent.brain_stream_sentences") as mock_brain, \
-             patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_tts:
+             patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_tts:
             r = client.post(
                 "/api/voice/stream?session_id=test_empty_asr_http",
                 files={"file": ("audio.webm", b"fake-audio-bytes", "audio/webm")},
@@ -2752,7 +2770,7 @@ class TestChat:
         """本地能确定的长静音不调用远端 ASR。"""
         with patch("voice_agent.asr") as mock_asr, \
              patch("voice_agent.brain_stream_sentences") as mock_brain, \
-             patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_tts:
+             patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_tts:
             r = client.post(
                 "/api/voice/stream?session_id=test_silence_http",
                 files={"file": ("audio.wav", _silence_wav(), "audio/wav")},
@@ -2769,10 +2787,10 @@ class TestChat:
     @pytest.mark.parametrize("asr_text", ["嗯。", "啊啊啊", "Hmm."])
     def test_voice_stream_low_intent_asr_short_circuits_brain(self, client, asr_text):
         """明确语气词 ASR 只给本地确认，不进入大脑、不写历史、不触发 TTS。"""
-        with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+        with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
              patch("voice_agent.asr", return_value=asr_text), \
              patch("voice_agent.brain_stream_sentences") as mock_brain, \
-             patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
+             patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
              patch("voice_agent._append_history") as mock_append_history:
             r = client.post(
                 "/api/voice/stream?session_id=test_low_intent_asr_http",
@@ -2793,10 +2811,10 @@ class TestChat:
     @pytest.mark.parametrize("asr_text", ["几点了", "讲个冷笑话", "对。", "好啊。"])
     def test_voice_stream_short_real_question_still_streams_brain(self, client, asr_text):
         """短问题不能被语气词规则误伤。"""
-        with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+        with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
              patch("voice_agent.asr", return_value=asr_text), \
              patch("voice_agent.brain_stream_sentences", return_value=iter([("好的。", "好的。")])) as mock_brain, \
-             patch("voice_server._flush_tts_buffer", return_value="fake-audio"):
+             patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio"):
             r = client.post(
                 "/api/voice/stream?session_id=test_short_question_http",
                 files={"file": ("audio.webm", b"fake-audio-bytes", "audio/webm")},
@@ -2819,7 +2837,7 @@ class TestChat:
             yield "你好，我在。", "你好，我在。"
 
         with patch("voice_agent.brain_stream_sentences", side_effect=brain_stream), \
-             patch("voice_server._flush_tts_buffer", return_value="ZmFrZS1hdWRpbw=="):
+             patch("app.routes.conversation._flush_tts_buffer", return_value="ZmFrZS1hdWRpbw=="):
             stream = voice_server._stream_brain_tts(
                 "你好", asr_text="你好", session_id="test_sse_ack"
             )
@@ -2845,7 +2863,7 @@ class TestChat:
 
     def test_voice_stream_oversized_audio_matches_voice_error_shape(self, client):
         """流式语音超限响应不泄漏 HTTP 状态字段，错误文案与非流式接口一致。"""
-        with patch("voice_server.MAX_AUDIO_SIZE", 1024 * 1024), \
+        with patch("app.routes.conversation.MAX_AUDIO_SIZE", 1024 * 1024), \
              patch("voice_server.to_wav") as mock_to_wav:
             r = client.post(
                 "/api/voice/stream",
@@ -2892,7 +2910,7 @@ class TestStreamingResilience:
             return original_stream(stream, **kwargs)
 
         monkeypatch.setattr(voice_server.asyncio, "wait_for", immediate_timeout)
-        monkeypatch.setattr(voice_server, "StreamingResponse", capture_stream)
+        monkeypatch.setattr(_rem_route, "StreamingResponse", capture_stream)
 
         response = await voice_server.sse_events()
         assert response.status_code == 200
@@ -2970,7 +2988,7 @@ class TestStreamingResilience:
                      ("第二段，也已经适合播报。", "第二段，也已经适合播报。")]
         with patch("voice_agent.brain_stream_sentences", return_value=iter(sentences)), \
              patch("voice_agent._clean_for_tts", side_effect=lambda text: text) as mock_clean, \
-             patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_flush:
+             patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_flush:
             events = await self._collect_sse_events(
                 voice_server._stream_brain_tts("你好", session_id="tts_clean_sse")
             )
@@ -3021,7 +3039,7 @@ class TestStreamingResilience:
         try:
             with patch("voice_agent.brain_stream_sentences", return_value=iter(sentences)), \
                  patch("voice_agent._clean_for_tts", side_effect=lambda text: text) as mock_clean, \
-                 patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_flush:
+                 patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_flush:
                 async for event in voice_server._ws_stream_brain(ws_id, "你好", session_id="tts_clean_ws"):
                     events.append(event)
                     if event.get("type") == "done":
@@ -3095,7 +3113,7 @@ class TestStreamingResilience:
 
         try:
             with patch("voice_agent.brain_stream_sentences", return_value=iter([("你好，我在。", "你好，我在。")])), \
-                 patch("voice_server._flush_tts_buffer", return_value="ZmFrZS1hdWRpbw=="):
+                 patch("app.routes.conversation._flush_tts_buffer", return_value="ZmFrZS1hdWRpbw=="):
                 await asyncio.create_task(run_stream())
         finally:
             voice_server._ws_clients.pop(speaker_id, None)
@@ -3155,7 +3173,7 @@ class TestTTS:
                 return CompletedProcess(cmd, 0, stdout=mp3)
             return CompletedProcess(cmd, 0)
 
-        with patch("voice_agent.tts", return_value=wav) as mock_tts, \
+        with patch("agent.asr_tts.tts", return_value=wav) as mock_tts, \
              patch("subprocess.run", side_effect=fake_run):
             first = client.post("/api/tts", json={"text": "你好世界"})
             second = client.post("/api/tts", json={"text": "你好世界"})
@@ -3189,7 +3207,7 @@ class TestVoiceAPI:
     def test_voice_tts_unavailable_returns_text_without_audio(self, client):
         import voice_agent
 
-        with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+        with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
              patch("voice_agent.asr", return_value="提醒我喝水"), \
              patch("voice_agent.brain", return_value="好的，已提醒。"), \
              patch("voice_agent.tts", side_effect=voice_agent.TTSUnavailableError("TTSHTTP异常: 429")):
@@ -3483,7 +3501,7 @@ class TestWebSocket:
 
         task = asyncio.ensure_future(never_ends())
         ws_id = 990001
-        voice_server._main_loop = asyncio.get_running_loop()
+        _notif.set_main_loop(asyncio.get_running_loop())
         voice_server._ws_clients[ws_id] = {
             "ws": ws,
             "interrupt": False,
@@ -3554,10 +3572,10 @@ class TestWebSocket:
     def test_ws_empty_asr_short_circuits_brain(self, client):
         """WebSocket 空 ASR 只返回没听清提示，不进入大脑或 TTS。"""
         try:
-            with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+            with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
                  patch("voice_agent.asr", return_value=""), \
                  patch("voice_agent.brain_stream_sentences") as mock_brain, \
-                 patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
+                 patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()  # connect
                 ws.send_json({
@@ -3588,7 +3606,7 @@ class TestWebSocket:
         try:
             with patch("voice_agent.asr") as mock_asr, \
                  patch("voice_agent.brain_stream_sentences") as mock_brain, \
-                 patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
+                 patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()  # connect
                 ws.send_json({
@@ -3617,10 +3635,10 @@ class TestWebSocket:
     def test_ws_low_intent_asr_short_circuits_stream_task(self, client, asr_text):
         """WebSocket 语气词 ASR 只给本地确认，不启动流式大脑任务。"""
         try:
-            with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+            with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
                  patch("voice_agent.asr", return_value=asr_text), \
-                 patch("voice_server._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
-                 patch("voice_server._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
+                 patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
+                 patch("app.routes.conversation._flush_tts_buffer", return_value="fake-audio") as mock_tts, \
                  patch("voice_agent._append_history") as mock_append_history, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()  # connect
@@ -3656,9 +3674,9 @@ class TestWebSocket:
             await ws.send_json({"type": "text", "text": "__stream_started__"})
 
         try:
-            with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+            with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
                  patch("voice_agent.asr", return_value=asr_text), \
-                 patch("voice_server._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)) as mock_stream, \
+                 patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)) as mock_stream, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()  # connect
                 ws.send_json({
@@ -3687,9 +3705,9 @@ class TestWebSocket:
             await ws.send_json({"type": "text", "text": "__stream_started__"})
 
         try:
-            with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+            with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
                  patch("voice_agent.asr", return_value="你好"), \
-                 patch("voice_server._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)), \
+                 patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)), \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()  # connect
                 ws.send_json({
@@ -3715,10 +3733,10 @@ class TestWebSocket:
             await ws.send_json({"type": "text", "text": "__stream_started__"})
 
         try:
-            with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+            with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
                  patch("voice_agent.asr", return_value="你好"), \
-                 patch("voice_server._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)), \
-                 patch("voice_server._ws_broadcast_to_session", new=AsyncMock()) as mock_broadcast, \
+                 patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)), \
+                 patch("app.routes.websocket._ws_broadcast_to_session", new=AsyncMock()) as mock_broadcast, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()  # connect
                 ws.send_json({
@@ -3751,9 +3769,9 @@ class TestWebSocket:
             await ws.send_json({"type": "text", "text": "__stream_started__"})
 
         try:
-            with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+            with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
                  patch("voice_agent.asr", return_value="你好"), \
-                 patch("voice_server._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)), \
+                 patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock(side_effect=fake_stream)), \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()  # connect
                 ws.send_json({
@@ -3830,7 +3848,7 @@ class TestWebSocket:
         interrupted_reply = "我正准备说明明天的天气和出门建议。"
 
         try:
-            with patch("voice_server._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
+            with patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()
                 ws.send_json({"type": "interrupt", "interrupted_reply": interrupted_reply})
@@ -3854,9 +3872,9 @@ class TestWebSocket:
         interrupted_reply = "我正准备播报今天的日程。"
 
         try:
-            with patch("voice_server.to_wav", return_value=b"fake-wav"), \
+            with patch("app.routes.websocket.to_wav", return_value=b"fake-wav"), \
                  patch("voice_agent.asr", return_value="那下一项是什么？"), \
-                 patch("voice_server._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
+                 patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()
                 ws.send_json({"type": "interrupt", "interrupted_reply": interrupted_reply})
@@ -3879,7 +3897,7 @@ class TestWebSocket:
 
     def test_ws_message_without_prior_interrupt_reply_has_no_follow_up(self, client):
         try:
-            with patch("voice_server._ws_stream_and_send", new=AsyncMock()), \
+            with patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()), \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()
                 ws.send_json({"type": "text", "message": "直接开始新话题"})
@@ -3892,7 +3910,7 @@ class TestWebSocket:
     def test_ws_text_is_sanitized_before_brain(self, client):
         """WebSocket 文字消息必须经过 _sanitize_text 清洗后才能进入大脑"""
         try:
-            with patch("voice_server._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
+            with patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()) as mock_stream, \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()
                 ws.send_json({"type": "text", "message": "<script>alert(1)</script>帮我查下天气"})
@@ -3922,7 +3940,7 @@ class TestWebSocket:
 
     def test_ws_second_interrupt_without_reply_clears_pending_context(self, client):
         try:
-            with patch("voice_server._ws_stream_and_send", new=AsyncMock()), \
+            with patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()), \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()
                 ws.send_json({"type": "interrupt", "interrupted_reply": "第一段被打断回复"})
@@ -3942,7 +3960,7 @@ class TestWebSocket:
         long_intent = "后续意图" * 80
 
         try:
-            with patch("voice_server._ws_stream_and_send", new=AsyncMock()), \
+            with patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()), \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()
                 ws.send_json({"type": "interrupt", "interrupted_reply": "被打断的回复"})
@@ -3959,7 +3977,7 @@ class TestWebSocket:
         before = client.get("/api/status").json()["interrupts"]["total"]
 
         try:
-            with patch("voice_server._ws_stream_and_send", new=AsyncMock()), \
+            with patch("app.routes.websocket._ws_stream_and_send", new=AsyncMock()), \
                  client.websocket_connect("/ws") as ws:
                 ws.receive_json()
                 ws.send_json({"type": "interrupt", "interrupted_reply": "需要恢复上下文的回复"})
