@@ -26,7 +26,7 @@ _BUILTIN_PROTOCOLS = {
         "triggers": ["晚安", "睡觉", "好梦", "睡了", "我累了", "goodnight"],
         "auto_trigger": {"state": "home_sleeping"},
         "steps": [
-            {"action": "ac_control", "params": {"action": "off"}},
+            {"action": "ac_sleep", "params": {}},
             {"action": "tv_control", "params": {"action": "power_off"}},
             {"action": "reminder", "params": {"text": "起床", "time": "tomorrow 08:00"}},
             {"action": "tts", "params": {"template": "晚安，明天{weather}。"}},
@@ -136,6 +136,30 @@ def _get_weather() -> str:
     return ""
 
 
+def _get_weather_forecast() -> dict:
+    """获取今天天气预报详情（含夜间温度数值），供睡眠空调判断。
+
+    返回 {"dayweather","nightweather","daytemp","nighttemp"}，失败返回 {}。
+    """
+    AMAP = os.getenv("AMAP_KEY", "")
+    AMAP_CITY = os.getenv("AMAP_CITY", "110000")
+    try:
+        r = requests.get("https://restapi.amap.com/v3/weather/weatherInfo",
+            params={"city": AMAP_CITY, "key": AMAP, "extensions": "all"}, timeout=10).json()
+        casts = (r.get("forecasts") or [{}])[0].get("casts", [])
+        if casts:
+            today = casts[0]
+            return {
+                "dayweather": today.get("dayweather", ""),
+                "nightweather": today.get("nightweather", ""),
+                "daytemp": today.get("daytemp", ""),
+                "nighttemp": today.get("nighttemp", ""),
+            }
+    except (OSError, KeyError, ValueError) as e:
+        log.debug(f"[scenes] 天气预报获取失败: {e}")
+    return {}
+
+
 def _get_today_todos() -> list:
     """获取今日待办"""
     try:
@@ -171,6 +195,37 @@ def _ac_control(action: str) -> str:
     except Exception as e:
         log.warning(f"[ac] scenes控制失败(action={action!r}): {e}")
         return "空调控制失败"
+
+
+# 睡眠时保留空调的夜间最低温度阈值（℃）：夜间温度 >= 该值则保留空调助眠（热天），
+# 低于该值才关空调（凉爽）。可通过环境变量 SLEEP_AC_KEEP_TEMP 覆盖。
+SLEEP_AC_KEEP_TEMP = int(os.getenv("SLEEP_AC_KEEP_TEMP", "24"))
+
+
+def _ac_sleep() -> str:
+    """睡眠场景的空调处理：根据夜间天气决定关空调或保留。
+
+    - 夜间最低温 >= SLEEP_AC_KEEP_TEMP(默认24℃) → 保留空调助眠（热天不能关空调睡）
+    - 夜间最低温 < 阈值 → 关闭空调（凉爽可关）
+    - 天气获取失败 → 保守保留空调（避免热天误关）
+
+    返回用于播报与协议结果拼接的自然语言描述。
+    """
+    forecast = _get_weather_forecast()
+    nighttemp_str = str(forecast.get("nighttemp", "")).strip()
+    try:
+        nighttemp = int(nighttemp_str)
+    except (ValueError, TypeError):
+        log.info(f"[ac] 睡眠空调: 天气数据不可用，保守保留空调助眠")
+        return "天气未知，空调保持开启。"
+    if nighttemp >= SLEEP_AC_KEEP_TEMP:
+        log.info(f"[ac] 睡眠空调: 夜间{nighttemp}℃≥{SLEEP_AC_KEEP_TEMP}℃，保留空调助眠")
+        return f"夜间{nighttemp}度较热，空调保持开启助眠。"
+    log.info(f"[ac] 睡眠空调: 夜间{nighttemp}℃<{SLEEP_AC_KEEP_TEMP}℃，关闭空调")
+    result = _ac_control("off")
+    if "失败" in result:
+        return f"夜间{nighttemp}度凉爽，空调关闭失败。"
+    return f"夜间{nighttemp}度凉爽，已关闭空调。"
 
 
 def _tv_control(action: str) -> str:
@@ -334,7 +389,8 @@ def _llm_step(params: dict) -> str:
 
 # ===== 步骤执行器 =====
 _STEP_EXECUTORS = {
-    "ac_control": lambda params: _ac_control(params.get("action", "off")),
+    "ac_control": lambda params: f"[空调控制已禁用] action={params.get('action', 'off')}",  # 安全模式：不调用 Tuya API
+    "ac_sleep": lambda params: _ac_sleep(),
     "tv_control": lambda params: _tv_control(params.get("action", "power_off")),
     "volume": lambda params: _set_volume(int(params.get("level", 50))),
     "reminder": lambda params: _set_reminder(params.get("text", ""), params.get("time", "")),

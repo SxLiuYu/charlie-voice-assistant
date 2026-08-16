@@ -156,7 +156,7 @@ async def lifespan(app):
         start_scheduler()
         start_proactive()
         start_evolution()
-        start_decision_engine()
+        # start_decision_engine()  # 暂停自主决策引擎：防止自动触发 goodnight/leaving_home 场景控制空调
         start_wake_listener()
         start_ws_cleanup()
         _warmup_brain()
