@@ -42,12 +42,18 @@ _local = threading.local()
 
 def _detect_source() -> str:
     """检测当前调用来源: test / user / system"""
-    # 1. pytest 环境
+    # 1. pytest 环境 — 多种检测方式
+    # 1a. PYTEST_CURRENT_TEST 环境变量 (pytest-xdist 或 pytest 默认设置)
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return "test"
+    # 1b. pytest 在 sys.modules 中
     if "pytest" in sys.modules:
-        test_name = os.environ.get("PYTEST_CURRENT_TEST", "")
-        if test_name:
-            return "test"
-        # pytest 已导入但没有当前测试 → 可能是 conftest 加载阶段
+        return "test"
+    # 1c. 命令行包含 pytest
+    if any("pytest" in arg for arg in sys.argv):
+        return "test"
+    # 1d. _pytest 模块 (pytest 内部模块)
+    if "_pytest" in sys.modules:
         return "test"
     # 2. 显式标记 (audit_call 传入 source 参数)
     ctx_source = getattr(_local, "source", None)
@@ -63,6 +69,22 @@ def _get_log_file(source: str) -> str:
     elif source == "system":
         return _SYSTEM_LOG_FILE
     return _USER_LOG_FILE
+
+
+# 生产日志目录 (不受 conftest 的 ASSISTANT_KID_LOG_DIR 覆盖影响)
+_PROD_LOG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+os.makedirs(_PROD_LOG_DIR, exist_ok=True)
+_PROD_TEST_LOG_FILE = os.path.join(_PROD_LOG_DIR, "calls_test.log")
+
+
+def _get_prod_log_file(source: str) -> str:
+    """获取生产日志目录中的对应文件 (测试也写一份到生产目录，避免被 conftest 清理)"""
+    if source == "test":
+        return _PROD_TEST_LOG_FILE
+    elif source == "system":
+        return os.path.join(_PROD_LOG_DIR, "calls_system.log")
+    return os.path.join(_PROD_LOG_DIR, "calls_user.log")
 
 
 def _truncate(s, maxlen=200):
@@ -116,10 +138,17 @@ def audit_log(feature: str, input_data=None, output_data=None, success=True,
         "pid": os.getpid(),
     }
     log_file = _get_log_file(src)
+    prod_log_file = _get_prod_log_file(src)
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
     try:
         with _lock:
+            # 写到 LOG_DIR (测试时是 tempdir, 生产时是 logs/)
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(line)
+            # 测试日志额外写一份到生产 logs/ 目录 (不被 conftest 清理)
+            if src == "test" and prod_log_file != log_file:
+                with open(prod_log_file, "a", encoding="utf-8") as f:
+                    f.write(line)
     except Exception as e:
         log.debug(f"[audit] 写日志失败: {e}")
 
@@ -187,11 +216,11 @@ def get_call_stats(source: str = None) -> dict:
     """读取调用统计"""
     files = []
     if source is None or source == "user":
-        files.append(("user", _USER_LOG_FILE))
+        files.append(("user", _get_prod_log_file("user")))
     if source is None or source == "test":
-        files.append(("test", _TEST_LOG_FILE))
+        files.append(("test", _PROD_TEST_LOG_FILE))
     if source is None or source == "system":
-        files.append(("system", _SYSTEM_LOG_FILE))
+        files.append(("system", _get_prod_log_file("system")))
 
     stats = {}
     for src, fpath in files:
