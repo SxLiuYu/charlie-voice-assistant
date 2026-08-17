@@ -188,6 +188,8 @@ app.include_router(conversation_router)
 app.include_router(reminders_router)
 app.include_router(websocket_router)
 app.include_router(manage_router)
+from app.routes import wardrobe_photo as _wardrobe_photo_mod
+app.include_router(_wardrobe_photo_mod.router)
 
 # ===== 全局异常处理 =====
 @app.exception_handler(Exception)
