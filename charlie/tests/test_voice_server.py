@@ -1870,8 +1870,11 @@ class TestReminders:
         with pytest.raises(SystemExit):
             voice_server._proactive_suggestions()
 
-        assert notifications == [("主人，今天天气预报有雷阵雨，出门记得带伞哦。", "weather")]
-        assert played == ["主人，今天天气预报有雷阵雨，出门记得带伞哦。"]
+        assert notifications == [
+            ("主人，今天天气预报有雷阵雨，出门记得带伞哦。", "weather"),
+            ("早上好主人！新的一天加油！今天没有待办事项，轻松一天！", "morning"),
+        ]
+        assert played == ["主人，今天天气预报有雷阵雨，出门记得带伞哦。", "早上好主人！新的一天加油！今天没有待办事项，轻松一天！"]
 
     def test_proactive_weather_claim_survives_restart_within_same_day(self, tmp_path, monkeypatch):
         """同日重启后，已播报的降雨提醒不能因内存状态丢失而重复播报。"""
@@ -2247,6 +2250,140 @@ class TestReminders:
 
             assert notifications == []
         finally:
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
+
+    def test_sleep_suggest_keeps_ac_on_hot_night(self, tmp_path, monkeypatch):
+        """热天夜间入睡不关空调，播报与实际操作一致，不再说谎。"""
+        import sys
+        import types
+
+        state_file = tmp_path / "suggestions_state.json"
+        lock_file = tmp_path / "suggestions_state.json.lock"
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+
+        notifications = []
+        played = []
+        ac_off_calls = []
+        tv_calls = []
+
+        fake_sc = types.SimpleNamespace(
+            _ac_sleep=lambda: ac_off_calls.append("sleep") or "夜间28度较热，空调保持开启助眠。",
+            _tv_control=lambda action: tv_calls.append(action) or "电视已power_off",
+        )
+        _sched._magic_scenes_mod = fake_sc
+
+        fixed_now = datetime.datetime(2026, 8, 2, 23, 30, 0)
+
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        try:
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_suggest_state_snapshot", lambda: {
+                "last_weather_check": time.time() + 3600,
+                "last_sleep_scene": "",
+                "last_time_suggest": "",
+                "last_health_alert": "",
+            })
+            monkeypatch.setattr(_sched, "_claim_suggest_state", lambda key, value: True)
+            monkeypatch.setattr(_sched, "_get_weather", lambda: [])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: played.append(text))
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
+            monkeypatch.setattr(voice_server.time, "time", lambda: 1_785_646_200.0)
+            monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
+            monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
+                cpu_percent=lambda interval=None: 10,
+                virtual_memory=lambda: types.SimpleNamespace(percent=20),
+            ))
+            monkeypatch.setattr("voice_agent.list_preferences", lambda: {})
+            monkeypatch.setattr("voice_agent.get_user_state", lambda: {"state": "home_sleeping"}, raising=False)
+            monkeypatch.setattr("voice_agent.update_user_state", lambda **kw: None, raising=False)
+            monkeypatch.setattr(voice_server.time, "sleep", lambda _seconds: (_ for _ in ()).throw(SystemExit))
+
+            with pytest.raises(SystemExit):
+                voice_server._proactive_suggestions()
+
+            assert ac_off_calls == ["sleep"]  # 调用了睡眠空调判断(返回保留)
+            assert tv_calls == ["power_off"]
+            assert len(notifications) == 1
+            assert "保持开启" in notifications[0][0]
+            assert "电视已关闭" in notifications[0][0]
+            assert "已关闭空调和电视" not in notifications[0][0]  # 不再说谎
+        finally:
+            _sched._magic_scenes_mod = None
+            _sched.SUGGESTIONS_STATE.clear()
+            _sched.SUGGESTIONS_STATE.update(old_state)
+
+    def test_sleep_suggest_turns_off_ac_on_cool_night(self, tmp_path, monkeypatch):
+        """凉爽夜间入睡关空调，播报含'已关闭空调'。"""
+        import sys
+        import types
+
+        state_file = tmp_path / "suggestions_state.json"
+        lock_file = tmp_path / "suggestions_state.json.lock"
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_FILE", str(state_file))
+        monkeypatch.setattr(_sched, "SUGGEST_STATE_LOCK_FILE", str(lock_file), raising=False)
+        old_state = dict(_sched.SUGGESTIONS_STATE)
+        _sched.SUGGESTIONS_STATE.clear()
+        _sched.SUGGESTIONS_STATE.update(voice_server._SUGGESTIONS_DEFAULT_STATE)
+
+        notifications = []
+        tv_calls = []
+
+        fake_sc = types.SimpleNamespace(
+            _ac_sleep=lambda: "夜间18度凉爽，已关闭空调。",
+            _tv_control=lambda action: tv_calls.append(action) or "电视已power_off",
+        )
+        _sched._magic_scenes_mod = fake_sc
+
+        fixed_now = datetime.datetime(2026, 10, 2, 23, 30, 0)
+
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        try:
+            monkeypatch.setattr(_sched, "_proactive_lock_handle", object(), raising=False)
+            monkeypatch.setattr(_sched, "_suggest_state_snapshot", lambda: {
+                "last_weather_check": time.time() + 3600,
+                "last_sleep_scene": "",
+                "last_time_suggest": "",
+                "last_health_alert": "",
+            })
+            monkeypatch.setattr(_sched, "_claim_suggest_state", lambda key, value: True)
+            monkeypatch.setattr(_sched, "_get_weather", lambda: [])
+            monkeypatch.setattr(_sched, "add_notification", lambda text, ntype: notifications.append((text, ntype)))
+            monkeypatch.setattr(_sched, "play_reminder_audio", lambda text, reminder_id=None: None)
+            monkeypatch.setattr(_sched, "_load_reminders", lambda: [])
+            monkeypatch.setattr(voice_server.time, "time", lambda: 1_789_158_200.0)
+            monkeypatch.setattr(voice_server.datetime, "datetime", FixedDateTime)
+            monkeypatch.setitem(sys.modules, "psutil", types.SimpleNamespace(
+                cpu_percent=lambda interval=None: 10,
+                virtual_memory=lambda: types.SimpleNamespace(percent=20),
+            ))
+            monkeypatch.setattr("voice_agent.list_preferences", lambda: {})
+            monkeypatch.setattr("voice_agent.get_user_state", lambda: {"state": "home_sleeping"}, raising=False)
+            monkeypatch.setattr("voice_agent.update_user_state", lambda **kw: None, raising=False)
+            monkeypatch.setattr(voice_server.time, "sleep", lambda _seconds: (_ for _ in ()).throw(SystemExit))
+
+            with pytest.raises(SystemExit):
+                voice_server._proactive_suggestions()
+
+            assert tv_calls == ["power_off"]
+            assert len(notifications) == 1
+            assert "已关闭空调" in notifications[0][0]
+            assert "电视已关闭" in notifications[0][0]
+        finally:
+            _sched._magic_scenes_mod = None
             _sched.SUGGESTIONS_STATE.clear()
             _sched.SUGGESTIONS_STATE.update(old_state)
 
