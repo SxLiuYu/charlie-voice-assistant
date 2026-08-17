@@ -31,9 +31,9 @@ hidden_imports = [
     'app.reminders', 'app.config', 'app.env_catalog', 'app.preflight',
     'app.cert', 'app.mcp_gate', 'utils',
     # 拆分后的新模块 (voice_server.py 重构)
-    'app.http_helpers', 'app.notifications', 'app.cors', 'app.schedulers',
+    'app.http_helpers', 'app.notifications', 'app.cors', 'app.schedulers', 'app.audit_log',
     'app.routes', 'app.routes.system', 'app.routes.conversation',
-    'app.routes.reminders', 'app.routes.websocket', 'app.routes.manage',
+    'app.routes.reminders', 'app.routes.websocket', 'app.routes.manage', 'app.routes.wardrobe_photo',
     # qwen_agent 隐式依赖
     'qwen_agent', 'qwen_agent.agents', 'qwen_agent.tools',
     'qwen_agent.tools.mcp_manager',
@@ -168,9 +168,17 @@ def _find_opus():
         loc = ctypes.util.find_library('opus')
         if loc and os.path.isfile(loc):
             return loc
-        for p in [os.path.join(os.getcwd(), '_internal', 'opus.dll'),
-                  os.path.join(os.getcwd(), 'opus.dll'),
-                  os.path.join(os.getcwd(), '_internal', 'libopus-0.dll')]:
+        search_paths = [
+            os.path.join(os.getcwd(), '_internal', 'opus.dll'),
+            os.path.join(os.getcwd(), 'opus.dll'),
+            os.path.join(os.getcwd(), '_internal', 'libopus-0.dll'),
+            # Check opus-extract (bundled in repo for Windows builds)
+            os.path.join(os.getcwd(), '..', 'opus-extract', 'mingw64', 'bin', 'libopus-0.dll'),
+            # Check .venv site-packages
+            os.path.join(os.getcwd(), '.venv', 'Lib', 'site-packages', 'opus.dll'),
+            os.path.join(os.getcwd(), '.venv', 'Lib', 'site-packages', 'libopus-0.dll'),
+        ]
+        for p in search_paths:
             if os.path.isfile(p):
                 return p
     # macOS common paths
