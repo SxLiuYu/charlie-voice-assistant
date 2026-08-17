@@ -193,14 +193,18 @@ async def get_preferences(request: Request):
 
 @router.post("/api/preferences")
 async def set_preference_api(req: PreferenceRequest):
+    from app.audit_log import audit_log
     from voice_agent import set_preference
     msg = set_preference(req.key, req.value)
+    audit_log("api:preferences", input_data=f"{req.key}={req.value}", output_data=msg, action="set")
     return {"ok": True, "message": msg, "key": req.key, "value": req.value}
 
 @router.delete("/api/preferences/{key}")
 async def del_preference_api(key: str):
+    from app.audit_log import audit_log
     from voice_agent import del_preference
     msg = del_preference(key)
+    audit_log("api:preferences", input_data=key, output_data=msg, action="delete")
     return {"ok": True, "message": msg}
 
 @router.get("/api/sessions")
@@ -455,9 +459,11 @@ async def get_setup():
 
 @router.post("/api/setup")
 async def post_setup(request: Request):
+    from app.audit_log import audit_log
     try:
         data = await request.json()
     except Exception:
+        audit_log("api:setup", input_data="invalid_json", success=False, error="bad_request", action="save")
         return JSONResponse({"ok": False, "error": "请求数据格式错误"}, status_code=400)
     safe_data = {k: str(v).strip() for k, v in data.items() if k in _SETUP_WHITELIST and str(v).strip()}
     demo_accept = str(data.get("demo_accept", "false")).lower() in ("1", "true", "yes", "on")
@@ -466,17 +472,21 @@ async def post_setup(request: Request):
         _reload_runtime_env()
         existing = _parse_env_file(_ENV_FILE)
         llm_ready = bool(existing.get("ARK_KEY")) or bool(existing.get("GLM_KEY"))
+        audit_log("api:setup", input_data=f"keys={list(safe_data.keys())}", output_data=f"llm_ready={llm_ready}", action="save")
         return {"ok": True, "message": "配置已保存并即时生效", "llm_ready": llm_ready}
     except Exception as e:
+        audit_log("api:setup", input_data=f"keys={list(safe_data.keys())}", success=False, error=str(e), action="save")
         return JSONResponse({"ok": False, "error": f"保存失败: {e}"}, status_code=500)
 
 @router.post("/api/setup/verify")
 async def verify_setup(request: Request):
+    from app.audit_log import audit_log
     try:
         body = await request.json()
     except Exception:
         body = {}
     results = {}
+    audit_log("api:setup:verify", input_data=f"verify_keys={list(body.keys())}", action="verify")
     def _check_glm():
         from app import llm_config as _lc
         ok, msg = _lc.verify_glm_key(body.get("GLM_KEY", ""), body.get("GLM_MODEL", ""))
@@ -529,15 +539,20 @@ async def esp32_detect_port():
 
 @router.post("/api/esp32/flash")
 async def esp32_flash(request: Request):
+    from app.audit_log import audit_log
     try:
         data = await request.json()
     except Exception:
+        audit_log("api:esp32_flash", success=False, error="bad_request", action="flash")
         return JSONResponse({"ok": False, "error": "请求数据格式错误"}, status_code=400)
     port = data.get("port", "")
     if not port:
+        audit_log("api:esp32_flash", success=False, error="missing_port", action="flash")
         return JSONResponse({"ok": False, "error": "缺少串口字段: port"}, status_code=422)
     if not _esp32_flash.start(_esp32_flash_worker, port):
+        audit_log("api:esp32_flash", input_data=port, success=False, error="already_running", action="flash")
         return {"started": False, "message": "已有烧录在进行中"}
+    audit_log("api:esp32_flash", input_data=port, output_data="started", action="flash")
     return {"started": True, "message": "烧录已启动"}
 
 def _find_esp32_firmware():
@@ -598,11 +613,15 @@ def _download_model_worker():
 
 @router.post("/api/setup/download-model")
 async def download_model():
+    from app.audit_log import audit_log
     import voice_server
     if _model_download.is_active():
+        audit_log("api:download_model", success=False, error="already_running", action="download")
         return {"started": False, "message": "已有下载在进行中"}
     if voice_server._check_model_exists():
+        audit_log("api:download_model", output_data="already_exists", action="download")
         return {"started": False, "message": "模型已存在", "model_exists": True}
+    audit_log("api:download_model", output_data="started", action="download")
     _model_download.start(_download_model_worker)
     return {"started": True, "message": "下载已启动（237MB，后台进行）"}
 
@@ -627,13 +646,16 @@ async def protocols_status():
 
 @router.post("/api/protocols/learn")
 async def protocols_learn(body: dict):
+    from app.audit_log import audit_log
     try:
         from app import load_magic_module
         _sc = load_magic_module("magic_scenes", "magic-scenes.py")
         if _sc:
             result = _sc.learn_protocol(body.get("name", ""), body.get("trigger_words", ""), body.get("steps_description", ""))
+            audit_log("api:protocols:learn", input_data=body.get("name", ""), output_data=result, action="learn")
             return {"ok": True, "message": result}
     except Exception as e:
+        audit_log("api:protocols:learn", input_data=body.get("name", ""), success=False, error=str(e), action="learn")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @router.get("/api/evolution")
@@ -652,9 +674,11 @@ async def evolution_status():
 
 @router.post("/api/evolution/learn")
 async def evolution_learn():
+    from app.audit_log import audit_log
     try:
         from voice_agent import _get_brain
         brain = _get_brain("magic-evolution")
+        audit_log("api:evolution:learn", input_data="manual_trigger", action="learn")
         for rsp in brain.run([{"role": "user", "content": "learn_from_history()"}]):
             pass
         return {"ok": True, "message": "学习完成"}
@@ -664,8 +688,10 @@ async def evolution_learn():
 # ===== Wake / user / logs =====
 @router.post("/api/wake/toggle")
 async def wake_toggle_api(enabled: bool = None):
+    from app.audit_log import audit_log
     import local_wake
     current = local_wake.toggle_wake(enabled)
+    audit_log("api:wake_toggle", input_data=f"enabled={enabled}", output_data=f"enabled={current}", action="toggle")
     return {"enabled": current}
 
 @router.get("/api/wake/status")
@@ -675,8 +701,10 @@ async def wake_status_api():
 
 @router.post("/api/user/switch")
 async def switch_user_api(user_id: str = "default"):
+    from app.audit_log import audit_log
     from voice_agent import set_current_user, get_current_user
     set_current_user(user_id)
+    audit_log("api:user_switch", input_data=user_id, output_data=get_current_user(), action="switch")
     return {"user_id": get_current_user(), "message": f"已切换到用户: {user_id}"}
 
 @router.get("/api/user/current")
@@ -715,11 +743,14 @@ async def list_tts_voices():
 
 @router.post("/api/tts/voice")
 async def set_tts_voice(voice_id: str = "Cherry"):
+    from app.audit_log import audit_log
     import voice_agent
     if voice_id not in AVAILABLE_TTS_VOICES:
+        audit_log("api:tts_voice", input_data=voice_id, success=False, error="unknown_voice", action="set")
         return JSONResponse({"error": f"未知音色: {voice_id}"}, status_code=400)
     voice_agent.TTS_VOICE = voice_id
     voice_agent._tts_cache.clear()
+    audit_log("api:tts_voice", input_data=voice_id, output_data=voice_id, action="set")
     return {"ok": True, "voice": voice_id, "name": AVAILABLE_TTS_VOICES[voice_id]}
 
 # ===== MCP =====
@@ -742,7 +773,9 @@ async def list_mcp_servers():
 
 @router.post("/api/mcp/toggle")
 async def toggle_mcp_server(server_id: str = "", enabled: bool = True):
+    from app.audit_log import audit_log
     if not server_id:
+        audit_log("api:mcp_toggle", success=False, error="missing_server_id", action="toggle")
         return JSONResponse({"error": "缺少 server_id 参数"}, status_code=400)
     current = os.getenv("MCP_SERVERS", "amap-maps,baize-skills,filesystem,magic-music,magic-reminder,magic-notes,magic-system,magic-info,magic-life,magic-scenes,magic-evolution,magic-summary,magic-wardrobe,magic-browser,magic-apps,magic-feishu,magic-douyin,magic-taobao")
     enabled_list = [s.strip() for s in current.split(",") if s.strip()]
@@ -753,24 +786,30 @@ async def toggle_mcp_server(server_id: str = "", enabled: bool = True):
     os.environ["MCP_SERVERS"] = ",".join(enabled_list)
     from voice_agent import restart_brain
     restart_brain()
+    audit_log("api:mcp_toggle", input_data=server_id, output_data=f"enabled={enabled}", action="toggle")
     return {"ok": True, "server_id": server_id, "enabled": enabled, "enabled_list": enabled_list}
 
 # ===== Internal xiaozhi push =====
 @router.post("/api/internal/xiaozhi-push")
 async def _internal_xiaozhi_push(payload: dict, request: Request):
+    from app.audit_log import audit_log
     internal_token = os.getenv("INTERNAL_API_TOKEN", "")
     if internal_token:
         auth = request.headers.get("X-Internal-Token", "")
         if auth != internal_token:
+            audit_log("api:xiaozhi_push", success=False, error="unauthorized", action="push")
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     else:
         client_ip = request.client.host if request.client else ""
         if client_ip not in ("127.0.0.1", "::1", "localhost"):
+            audit_log("api:xiaozhi_push", success=False, error="forbidden", action="push")
             return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
     text = payload.get("text", "")
     mp3_b64 = payload.get("mp3", "")
     if not text or not mp3_b64:
+        audit_log("api:xiaozhi_push", success=False, error="missing_params", action="push")
         return {"ok": False, "error": "missing text or mp3"}
+    audit_log("api:xiaozhi_push", input_data=text[:50], action="push")
     import base64 as _b64
     from app.state import snapshot_xiaozhi_clients
     mp3_data = _b64.b64decode(mp3_b64)

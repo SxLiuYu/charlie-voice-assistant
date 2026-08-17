@@ -81,7 +81,7 @@ def add_notification(text: str, ntype: str = "reminder"):
     if ntype in FEISHU_HIGH_VALUE:
         push_feishu_async(text)   # 飞书消息推送(异步, 不阻塞)
         _push_ntfy_async(text)     # ntfy 备用通道(异步, 不阻塞)
-    elif ntype not in ("wake", "health"):
+    elif ntype not in ("wake", "health", "reminder"):
         # 未知类型默认推（保持向后兼容）
         push_feishu_async(text)
         _push_ntfy_async(text)

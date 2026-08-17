@@ -173,6 +173,49 @@ class TestMagicScenes:
         result = self.sc.execute_protocol("goodnight")
         assert "晚安" in result
 
+    def test_ac_sleep_hot_night_keeps_ac(self):
+        """热天夜间(>=24℃)不关空调，保留助眠。"""
+        def hot_forecast():
+            return {"dayweather": "晴", "nightweather": "晴", "daytemp": "34", "nighttemp": "28"}
+        calls = []
+        orig = self.sc._ac_control
+        self.sc._get_weather_forecast = hot_forecast
+        self.sc._ac_control = lambda action: calls.append(action) or "空调已off"
+        try:
+            msg = self.sc._ac_sleep()
+        finally:
+            self.sc._ac_control = orig
+        assert calls == []  # 没有关空调
+        assert "保持开启" in msg
+        assert "28" in msg
+
+    def test_ac_sleep_cool_night_turns_off(self):
+        """凉爽夜间(<24℃)关闭空调。"""
+        def cool_forecast():
+            return {"dayweather": "多云", "nightweather": "多云", "daytemp": "22", "nighttemp": "18"}
+        calls = []
+        self.sc._get_weather_forecast = cool_forecast
+        self.sc._ac_control = lambda action: calls.append(action) or "空调已off"
+        try:
+            msg = self.sc._ac_sleep()
+        finally:
+            self.sc._ac_control = lambda action: "空调已off"
+        assert calls == ["off"]
+        assert "已关闭空调" in msg
+        assert "18" in msg
+
+    def test_ac_sleep_no_weather_keeps_ac(self):
+        """天气数据不可用时保守保留空调，不误关。"""
+        self.sc._get_weather_forecast = lambda: {}
+        calls = []
+        self.sc._ac_control = lambda action: calls.append(action) or "空调已off"
+        try:
+            msg = self.sc._ac_sleep()
+        finally:
+            self.sc._ac_control = lambda action: "空调已off"
+        assert calls == []
+        assert "保持开启" in msg
+
     def test_wait_step(self):
         result = self.sc._wait_step({"seconds": 1})
         assert "等待" in result
