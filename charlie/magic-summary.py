@@ -7,9 +7,21 @@
 - 用户说 "今天发生了什么事" → 生成今日摘要
 - 用户说 "总结一下昨天" → 生成昨日回顾
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-summary",
+    "tier": "core",
+    "required_env": [],
+    "label": "每日摘要生成"
+}
+
 from mcp.server.fastmcp import FastMCP
 import os, json, datetime, time, re
 import logging
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 log = logging.getLogger("magic")
 
 mcp = FastMCP("magic-summary")
@@ -119,19 +131,19 @@ def _generate_summary(conversations: list, decisions: list, memories: list, titl
         for m in memories[:5]:
             context += f"  {m}\n"
 
-    # 用 ARK LLM 生成摘要
+    # 用 LLM 生成摘要
+    from app.llm_config import active_chat_endpoint
+
     try:
         import requests
-        ark_key = os.getenv("ARK_KEY", "")
-        ark_base = os.getenv("ARK_BASE", "https://ark.cn-beijing.volces.com/api/plan/v3")
-        ark_model = os.getenv("ARK_MODEL", "ark-code-latest")
-        if not ark_key:
+        base, api_key, model = active_chat_endpoint()
+        if not api_key:
             return _simple_summary(conversations, decisions, memories, title)
 
-        r = requests.post(f"{ark_base}/chat/completions",
-            headers={"Authorization": f"Bearer {ark_key}", "Content-Type": "application/json"},
+        r = requests.post(f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": ark_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": "你是 Charlie，用2-3句中文简洁总结一天的活动。重点：关键对话、重要事件、值得注意的模式。"},
                     {"role": "user", "content": context},

@@ -1,4 +1,12 @@
 """magic-reminder: 提醒/定时器/日历 (3个工具)"""
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-reminder",
+    "tier": "core",
+    "required_env": [],
+    "label": "提醒/定时器/日历"
+}
+
 from mcp.server.fastmcp import FastMCP
 import logging
 log = logging.getLogger("magic")
@@ -7,7 +15,6 @@ mcp = FastMCP("magic-reminder")
 
 @mcp.tool()
 def add_reminder(text: str, time: str = "", repeat: str = "") -> str:
-    log.info(f"[reminder] add_reminder(text={text}, time={time_str})")
     """添加提醒。text=提醒内容, time=时间(如'下午3点'/'30分钟后'/'每天8点'), repeat=重复类型(daily/weekly/weekdays, 留空=一次性)
 
     repeat 值:
@@ -16,6 +23,7 @@ def add_reminder(text: str, time: str = "", repeat: str = "") -> str:
     - weekly: 每周重复
     - weekdays: 工作日(周一到周五)重复
     """
+    log.info(f"[reminder] add_reminder(text={text}, time={time})")
     from utils import parse_time_str
     from app.reminders import append_reminder
 

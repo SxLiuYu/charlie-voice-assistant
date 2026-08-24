@@ -24,6 +24,8 @@ from app.reminders import _load_reminders, proactive_lock_status, scheduler_lock
 from app.state import (_metrics, _poll_telemetry, _ws_clients, _rate_buckets,
     _session_buckets, _ws_client_count, _RATE_GENERAL, _RATE_VOICE, _RATE_PER_SESSION,
     _interrupt_telemetry, sse_client_count)
+from app.llm_config import active_chat_endpoint
+from app.mcp_gate import resolve_mcp_profile
 
 system_router = APIRouter(tags=["system"])
 
@@ -170,11 +172,15 @@ def _pref_count() -> int:
 
 @system_router.get("/api/version")
 async def version():
+    _ep = active_chat_endpoint()
+    _mcp_count = len(resolve_mcp_profile())
+    _brain_model = _ep[2] if _ep[2] else "未配置"
+    _tts_model = getattr(voice_agent, "TTS_MODEL", "qwen3-tts-flash")
     return {
         "name": "Charlie",
         "version": "3.2.0",
-        "brain": "deepseek-v4-flash + Qwen-Agent + 4 MCP (可配置)",
-        "voice": "qwen3-asr/tts-flash (finna)",
+        "brain": f"{_brain_model} + {_mcp_count} MCP (可配置)",
+        "voice": f"{_tts_model} (finna)",
         "features": ["流式语音对话", "流式文字对话", "大脑逐句产出", "TTS批量推送",
                      "语音对话", "对话记忆", "对话搜索", "主动提醒", "天气告警", "每日晨报", "系统监控",
                      "SSE实时推送", "WebSocket双向通信", "TTS打断", "限流防护", "CORS加固", "PWA移动端",
@@ -262,6 +268,10 @@ async def dashboard():
     polling_totals = polling.get("totals", {})
     interrupts = _interrupt_telemetry.summary()
     interrupt_follow_up = interrupts.get("last_follow_up")
+    _ep = active_chat_endpoint()
+    _mcp_count = len(resolve_mcp_profile())
+    _brain_model = _ep[2] if _ep[2] else "未配置"
+    _tts_model = getattr(voice_agent, "TTS_MODEL", "qwen3-tts-flash")
     if interrupt_follow_up:
         interrupted_reply = html.escape(str(interrupt_follow_up.get("interrupted_reply", ""))[:80])
         follow_up_text = html.escape(str(interrupt_follow_up.get("text", ""))[:80])
@@ -330,10 +340,10 @@ a{{color:#6cf;text-decoration:none}}a:hover{{text-decoration:underline}}
 <div class="bar"><div class="{'green' if disk.percent<80 else 'yellow' if disk.percent<90 else 'red'}" style="width:{disk.percent}%"></div></div>
 </div>
 <div class="card"><h3>🧠 大脑</h3>
-<div class="metric"><span>模型</span><span class="val">deepseek-v4-flash + 4 MCP (可配置)</span></div>
+<div class="metric"><span>模型</span><span class="val">{_brain_model} + {_mcp_count} MCP (可配置)</span></div>
 <div class="metric"><span>预热状态</span><span class="tag {'ok' if brain_warm else 'warn'}">{'✅ 已就绪' if brain_warm else '⏳ 预热中'}</span></div>
 <div class="metric"><span>对话历史</span><span class="val">{len(_history)} 条</span></div>
-<div class="metric"><span>语音引擎</span><span class="val">qwen3-asr/tts-flash</span></div>
+<div class="metric"><span>语音引擎</span><span class="val">{_tts_model}</span></div>
 <div class="metric"><span>用户偏好</span><span class="val">{_pref_count()} 项</span></div>
 </div>
 <div class="card"><h3>🩺 运行健康</h3>

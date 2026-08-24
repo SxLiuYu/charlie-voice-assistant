@@ -51,6 +51,18 @@ h1 .icon{width:36px;height:36px;background:linear-gradient(135deg,#667eea,#764ba
 <p class="subtitle">按分组填写 API 密钥。未配置的项会自动降级或禁用。首次配置 3 分钟。</p>
 
 <div id="banner" class="banner" style="display:none"></div>
+<div class="group" style="margin-bottom:18px">
+  <div class="group-title" style="cursor:default">
+    <span>LLM 优先级</span>
+    <span style="font-size:11px;color:#888">拖拽排序，越靠前越优先</span>
+  </div>
+  <div class="group-body">
+    <div id="llm-priority-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px"></div>
+    <div class="btn-row" style="margin-top:0">
+      <button class="apply-btn" style="padding:6px 12px;border-radius:6px;font-size:12px" onclick="saveLLMPriority()">保存优先级</button>
+    </div>
+  </div>
+</div>
 <div id="groups"></div>
 
 <div id="demoBox" class="demo-check" style="display:none">
@@ -65,9 +77,81 @@ h1 .icon{width:36px;height:36px;background:linear-gradient(135deg,#667eea,#764ba
 <script>
 let groups=[], values={}, demoActive=false, llmAvailable=false;
 
+function enableDragSort(listId) {
+  const list = document.getElementById(listId);
+  let dragEl = null;
+  list.querySelectorAll('.llm-item').forEach(item => {
+    item.addEventListener('dragstart', e => { dragEl = item; e.dataTransfer.effectAllowed = 'move'; item.style.opacity = '0.4'; });
+    item.addEventListener('dragend', () => { item.style.opacity = '1'; dragEl = null; });
+    item.addEventListener('dragover', e => {
+      e.preventDefault();
+      const after = getDragAfter(list, e.clientY);
+      if (after == null) list.appendChild(dragEl);
+      else list.insertBefore(dragEl, after);
+    });
+  });
+}
+
+function getDragAfter(container, y) {
+  const els = [...container.querySelectorAll('.llm-item:not([style*="opacity: 0.4"])')];
+  return els.reduce((closest, el) => {
+    const box = el.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset, element: el };
+    return closest;
+  }, { offset: -Infinity }).element;
+}
+
+async function loadLLMPriority(){
+  try{
+    const r = await fetch('/api/setup/llm-priority').then(res=>res.json()).catch(()=>({providers:[],priority:[]}));
+    const list = document.getElementById('llm-priority-list');
+    if(!list) return;
+    const priority = Array.isArray(r.priority) ? r.priority : [];
+    const providers = Array.isArray(r.providers) ? r.providers : [];
+    const byName = Object.fromEntries(providers.map(p=>[p.name, p]));
+    const ordered = priority.map(n=>byName[n]).filter(Boolean);
+    const rest = providers.filter(p=>!priority.includes(p.name));
+    const items = [...ordered, ...rest];
+    list.innerHTML = items.map((p, idx) => {
+      const dotColor = p.configured ? '#22c55e' : '#ef4444';
+      const label = p.configured ? '已配置' : '未配置';
+      return `<div class="llm-item" draggable="true" data-name="${p.name}" style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#20202e;border:1px solid #2a2a3e;border-radius:7px;cursor:grab;user-select:none">
+        <div style="width:18px;text-align:center;font-size:12px;color:#888">${idx+1}</div>
+        <div class="status-dot" style="background:${dotColor};flex-shrink:0"></div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;color:#e0e0e0">${p.label||p.name}</div>
+          <div style="font-size:11px;color:#666;font-family:monospace">${p.model||''}</div>
+        </div>
+        <span class="badge ${p.configured?'set':'optional'}">${label}</span>
+      </div>`;
+    }).join('');
+    enableDragSort('llm-priority-list');
+  }catch(e){console.error('loadLLMPriority failed', e)}
+}
+
+async function saveLLMPriority(){
+  const list = document.getElementById('llm-priority-list');
+  if(!list) return;
+  const items = list.querySelectorAll('.llm-item');
+  const priority = Array.from(items).map(el => el.getAttribute('data-name')).filter(Boolean);
+  try{
+    const r = await fetch('/api/setup/llm-priority', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority})});
+    const d = await r.json();
+    const b = document.getElementById('banner');
+    if(d && d.ok){
+      b.className='banner ok'; b.textContent='✅ LLM 优先级已保存'; b.style.display='block';
+    }else{
+      b.className='banner err'; b.textContent='❌ '+(d?.error||'保存失败'); b.style.display='block';
+    }
+  }catch(e){
+    const b = document.getElementById('banner');
+    b.className='banner err'; b.textContent='❌ 网络错误'; b.style.display='block';
+  }
+}
+
 async function load(){
   try{
-    // 并行拉分组结构和当前值
     const [sr, vr] = await Promise.all([fetch('/api/setup/mcp-status'), fetch('/api/setup')]);
     if(sr.ok) groups = (await sr.json()).groups || [];
     if(vr.ok){
@@ -80,6 +164,7 @@ async function load(){
   renderBanner();
   renderGroups();
   renderDemoBox();
+  loadLLMPriority();
 }
 
 function renderBanner(){
@@ -90,7 +175,7 @@ function renderBanner(){
     b.style.display = 'block';
   }else if(llmAvailable){
     b.className = 'banner ok';
-    b.textContent = '✅ ARK_KEY 已配置，大脑使用完整模式';
+    b.textContent = '✅ LLM 已配置，大脑使用完整模式';
     b.style.display = 'block';
   }
 }

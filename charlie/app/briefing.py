@@ -21,20 +21,8 @@ def _get_weather_text() -> str:
 
 def _get_today_agenda() -> str:
     """获取今日日程（从飞书日历）"""
-    try:
-        from magic_feishu import get_calendar_events
-        now = datetime.now()
-        events = get_calendar_events(now, now.replace(hour=23, minute=59))
-        if not events:
-            return ""
-        if len(events) == 1:
-            ev = events[0]
-            t = ev.get("start", {}).get("dateTime", "")[11:16] if ev.get("start") else ""
-            return f"今天{ev.get('summary', '有个会议')}"
-        return f"今天有{len(events)}个日程"
-    except Exception as e:
-        log.debug(f"[briefing] 日程获取失败: {e}")
-        return ""
+    # magic_feishu.py 无 get_calendar_events 函数，此处集成已断开，暂时返回空
+    return ""
 
 
 def _get_due_reminders() -> str:
@@ -43,8 +31,8 @@ def _get_due_reminders() -> str:
         from app.reminders import list_reminders
         today = datetime.now().strftime("%Y-%m-%d")
         all_reminders = list_reminders(include_completed=False)
-        due = [r for r in all_reminders if not r.get("completed")
-               and (r.get("due_date", "") <= today or r.get("repeat"))]
+        due = [r for r in all_reminders if not r.get("done")
+               and (r.get("due", "") <= today or r.get("repeat"))]
         if not due:
             return ""
         return f"今天有{len(due)}项待办"
@@ -68,7 +56,7 @@ def _get_news_brief(limit: int = 2) -> str:
         # news模块还没创建时降级到热搜
         try:
             from personalized_push import get_hot_topics
-            topics = get_hot_topics(limit=limit)
+            topics = get_hot_topics()[:limit]
             if topics:
                 return f"热搜：{'，'.join(topics[:limit])}"
         except Exception:
@@ -81,11 +69,8 @@ def _get_news_brief(limit: int = 2) -> str:
 
 def _get_holiday() -> str:
     """获取今日节日/特殊日期"""
-    try:
-        from magic_info import get_holiday_name
-        return get_holiday_name()
-    except Exception:
-        return ""
+    # magic_info 模块无 get_holiday_name 函数，此处集成已断开，暂时返回空
+    return ""
 
 
 def morning_briefing() -> str:
@@ -151,7 +136,7 @@ def evening_wrapup() -> str:
         from app.reminders import list_reminders
         today = datetime.now().strftime("%Y-%m-%d")
         all_r = list_reminders(include_completed=True)
-        completed = [r for r in all_r if r.get("completed")
+        completed = [r for r in all_r if r.get("done")
                      and r.get("completed_at", "").startswith(today)]
         if completed:
             parts.append(f"今天完成了{len(completed)}项待办")
@@ -163,8 +148,8 @@ def evening_wrapup() -> str:
         from app.reminders import list_reminders
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         all_r = list_reminders(include_completed=False)
-        due_tomorrow = [r for r in all_r if not r.get("completed")
-                        and (r.get("due_date", "") == tomorrow or r.get("repeat"))]
+        due_tomorrow = [r for r in all_r if not r.get("done")
+                        and (r.get("due", "") == tomorrow or r.get("repeat"))]
         if due_tomorrow:
             parts.append(f"明天有{len(due_tomorrow)}项待办")
     except Exception:

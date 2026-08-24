@@ -2,6 +2,14 @@
 
 通过抖音网页版API搜索和获取视频信息，无需官方API密钥。
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-douyin",
+    "tier": "optional",
+    "required_env": [],
+    "label": "抖音MCP"
+}
+
 import os, json, requests, re
 from mcp.server.fastmcp import FastMCP
 import logging

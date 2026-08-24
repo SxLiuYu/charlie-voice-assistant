@@ -1,4 +1,12 @@
 """magic-system: 系统控制 (3个工具: 音量/语速/状态)"""
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-system",
+    "tier": "core",
+    "required_env": [],
+    "label": "系统控制(音量/语速/状态)"
+}
+
 from mcp.server.fastmcp import FastMCP
 import logging
 log = logging.getLogger("magic")

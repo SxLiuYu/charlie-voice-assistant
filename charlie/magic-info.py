@@ -1,4 +1,12 @@
 """magic-info: 信息查询 (6个工具: 时间/天气/新闻/位置/翻译/计算)"""
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-info",
+    "tier": "core",
+    "required_env": [],
+    "label": "时间/天气/新闻/翻译/计算"
+}
+
 from mcp.server.fastmcp import FastMCP
 from mcp_common import aliyun_chat, _safe_math_eval, ESP32_IP
 from datetime import datetime

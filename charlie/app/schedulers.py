@@ -14,9 +14,28 @@ from app.reminders import (
     SUGGESTIONS_STATE_FILE, PROACTIVE_LOCK_FILE, acquire_proactive_lock,
     DECISION_LOCK_FILE, acquire_decision_lock,
 )
+from app import load_magic_module
 from app.notifications import add_notification, play_reminder_audio
 
 log = logging.getLogger("magic")
+
+# ── ESP32 在线快速检测（避免往离线设备推音频）─────────────────────────────
+_esp32_seen_at = 0.0  # 最近一次收到 ESP32 消息的时间戳
+_AUTO_TRIGGER_COOLDOWN = 3600  # 同一 auto_trigger 至少隔 1 小时才能再次执行
+_auto_trigger_last_exec: dict[str, float] = {}  # key → 上次执行时间戳
+_DECISION_COOLDOWN = 3600  # 同一 confirm 类型决策至少隔 1 小时才能再次询问
+_decision_last_ask: dict[str, float] = {}  # key → 上次询问时间戳
+
+
+def _is_esp32_online() -> bool:
+    """ESP32 在线判断：最近 5 分钟内有过通信。"""
+    return (time.time() - _esp32_seen_at) < 300
+
+
+def _touch_esp32():
+    """供 WS 连接等处调用，标记 ESP32 最近活跃。"""
+    global _esp32_seen_at
+    _esp32_seen_at = time.time()
 
 try:
     import fcntl
@@ -233,7 +252,12 @@ def _reminder_scheduler():
                 except Exception:
                     pass
                 add_notification(f"⏰ 提醒：{text}", "reminder")
-                play_reminder_audio(text, reminder_id=rid)
+                def _deliver():
+                    try:
+                        play_reminder_audio(text, reminder_id=rid)
+                    except Exception:
+                        log.exception("[reminder] 播报异常")
+                threading.Thread(target=_deliver, daemon=True).start()
         except Exception as e:
             log.error(f"[reminder] 调度器异常: {e}")
         time.sleep(30)
@@ -284,6 +308,51 @@ def _proactive_suggestions():
             if state_changed:
                 log.info(f"[suggest] 用户状态变化: {_last_triggered_state} -> {state}")
                 _last_triggered_state = state
+                # 接线 auto_trigger：状态变化时检查匹配的场景
+                try:
+                    _scene_mod = load_magic_module("magic_scenes", "magic-scenes.py")
+                    if _scene_mod and hasattr(_scene_mod, "check_auto_triggers"):
+                        auto_keys = _scene_mod.check_auto_triggers(state)
+                        for pkey in auto_keys:
+                            # 同一场景 1 小时内不重复执行（防止夜间状态持续满足时狂发消息）
+                            last_exec = _auto_trigger_last_exec.get(pkey, 0)
+                            if time.time() - last_exec < _AUTO_TRIGGER_COOLDOWN:
+                                log.debug(f"[suggest] auto_trigger 冷却中({pkey})，跳过")
+                                continue
+                            _auto_trigger_last_exec[pkey] = time.time()
+                            _proto = _scene_mod._load_protocols().get(pkey, {})
+                            _proto_name = _proto.get("name", pkey)
+                            if _proto.get("auto_trigger", {}).get("require_confirm"):
+                                # 单向渠道（飞书推送/本地语音）：用户无法回复"是/否"。
+                                # require_confirm 改为直接执行，不等待确认（无可用回复通道）。
+                                # 若需确认才执行，应通过 ESP32 等双向渠道进行。
+                                if _is_esp32_online():
+                                    # ESP32 在线：语音播报执行结果
+                                    msg = f"检测到你{state}，晚安模式已启动。"
+                                    play_reminder_audio(msg)
+                                else:
+                                    # ESP32 离线：跳过大面积通知，只记录日志
+                                    log.info(f"[suggest] auto_trigger 跳过({pkey}): ESP32离线，不打扰用户")
+                                try:
+                                    result = _scene_mod.execute_protocol(pkey)
+                                    if result:
+                                        add_notification(result[:200], "auto_trigger")
+                                        if _is_esp32_online():
+                                            play_reminder_audio(result[:200])
+                                    log.info(f"[suggest] auto_trigger 直执: {pkey} (state={state}, esp32_online={_is_esp32_online()})")
+                                except Exception as e:
+                                    log.warning(f"[suggest] auto_trigger 执行失败({pkey}): {e}")
+                            else:
+                                try:
+                                    result = _scene_mod.execute_protocol(pkey)
+                                    if result:
+                                        add_notification(result[:200], "auto_trigger")
+                                        play_reminder_audio(result[:200])
+                                    log.info(f"[suggest] auto_trigger 执行: {pkey} (state={state})")
+                                except Exception as e:
+                                    log.warning(f"[suggest] auto_trigger 执行失败({pkey}): {e}")
+                except Exception as e:
+                    log.debug(f"[suggest] auto_trigger 检查跳过: {e}")
             casts = None
             weather_loaded = False
             now_ts = time.time()
@@ -320,7 +389,19 @@ def _proactive_suggestions():
                 w = today_forecast.get("dayweather", "") if today_forecast else ""
                 temp = today_forecast.get("daytemp", "") if today_forecast else ""
                 weather_info = f"今天{w}，{temp}度" if w and temp else ""
-                msg = f"出门注意，{weather_info}。" if weather_info else "出门注意安全。"
+                try:
+                    _jarvis = load_magic_module("magic_jarvis", "magic-jarvis.py")
+                    if _jarvis:
+                        _away_greet = _jarvis.proactive_greeting()
+                        if _away_greet:
+                            msg = f"{_away_greet}{weather_info}。" if weather_info else _away_greet
+                        else:
+                            msg = f"出门注意，{weather_info}。" if weather_info else "出门注意安全。"
+                    else:
+                        msg = f"出门注意，{weather_info}。" if weather_info else "出门注意安全。"
+                except Exception as e:
+                    log.debug(f"[suggest] proactive_greeting(away)跳过: {e}")
+                    msg = f"出门注意，{weather_info}。" if weather_info else "出门注意安全。"
                 add_notification(msg, "away")
                 play_reminder_audio(msg)
             elif state == "home_awake" and state_changed and _last_triggered_state == "away":
@@ -330,7 +411,16 @@ def _proactive_suggestions():
                     today_forecast = _forecast_for_date(casts, today)
                     w = today_forecast.get("dayweather", "") if today_forecast else ""
                     temp = today_forecast.get("daytemp", "") if today_forecast else ""
-                    parts = ["欢迎回家！"]
+                    try:
+                        _jarvis = load_magic_module("magic_jarvis", "magic-jarvis.py")
+                        if _jarvis:
+                            _home_greet = _jarvis.proactive_greeting()
+                        else:
+                            _home_greet = ""
+                    except Exception as e:
+                        log.debug(f"[suggest] proactive_greeting(home)跳过: {e}")
+                        _home_greet = ""
+                    parts = [_home_greet] if _home_greet else ["欢迎回家！"]
                     if w and temp:
                         parts.append(f"今天{w}，{temp}度。")
                     pending = [r for r in _load_reminders() if not r.get("done") and r.get("due", "").startswith(today)]
@@ -345,16 +435,48 @@ def _proactive_suggestions():
                 today_forecast = _forecast_for_date(casts, today)
                 w = today_forecast.get("dayweather", "") if today_forecast else ""
                 temp = today_forecast.get("daytemp", "") if today_forecast else ""
-                parts = [f"早上好主人！{'今天' + w + '，最高' + temp + '度，' if w and temp else ''}新的一天加油！"]
-                pending = [r for r in _load_reminders() if not r.get("done") and r.get("due", "").startswith(today)]
-                if pending:
-                    todo = "、".join(r["text"] for r in pending)
-                    parts.append(f"今天还有{len(pending)}项待办：{todo}。")
-                else:
-                    parts.append("今天没有待办事项，轻松一天！")
-                msg = "".join(parts)
+                _is_jarvis = False
+                try:
+                    from agent.roles import get_current_role
+                    _is_jarvis = get_current_role() == "jarvis"
+                except Exception:
+                    pass
+                try:
+                    _jarvis = load_magic_module("magic_jarvis", "magic-jarvis.py")
+                    # 所有角色都用 morning_briefing（JARVIS 能力是 Charlie 的默认能力）
+                    if _jarvis:
+                        msg = _jarvis.morning_briefing()
+                    else:
+                        _jarvis_proc = _jarvis if _jarvis else None
+                        _morning_greet = ""
+                        if _jarvis_proc:
+                            try:
+                                _morning_greet = _jarvis_proc.proactive_greeting()
+                            except Exception:
+                                _morning_greet = ""
+                        weather_str = f"今天{w}，最高{temp}度，" if w and temp else ""
+                        parts = [_morning_greet or f"早上好主人！{weather_str}新的一天加油！"]
+                        pending = [r for r in _load_reminders() if not r.get("done") and r.get("due", "").startswith(today)]
+                        if pending:
+                            todo = "、".join(r["text"] for r in pending)
+                            parts.append(f"今天还有{len(pending)}项待办：{todo}。")
+                        else:
+                            parts.append("今天没有待办事项，轻松一天！")
+                        msg = "".join(parts)
+                except Exception as e:
+                    log.debug(f"[suggest] morning briefing跳过: {e}")
+                    msg = "早上好主人！"
                 add_notification(msg, "morning")
                 play_reminder_audio(msg)
+                try:
+                    if _jarvis:
+                        _suggest = _jarvis.suggest_action("早晨问候后")
+                        if _suggest:
+                            _suggest_msg = f"💡 {_suggest}"
+                            add_notification(_suggest_msg, "suggestion")
+                            play_reminder_audio(_suggest_msg)
+                except Exception as e:
+                    log.debug(f"[suggest] suggest_action(morning)跳过: {e}")
             import psutil as _ps
             cpu = _ps.cpu_percent(interval=None)
             mem = _ps.virtual_memory().percent
@@ -447,13 +569,29 @@ def start_decision_engine():
                 _dec = load_magic_module("magic_decisions", "magic-decisions.py")
                 if _dec:
                     decisions = _dec.evaluate(user_state)
+                    pending = _dec.get_pending_confirmation()
                     for rule in decisions:
+                        rid = rule["id"]
                         if rule.get("confirm"):
+                            # 单向渠道：用户无法回复"是/否"，直接跳过询问
+                            if not _is_esp32_online():
+                                log.debug(f"[decision] 跳过确认询问({rid}): ESP32离线")
+                                continue
+                            # 冷却期内不重复询问
+                            last_ask = _decision_last_ask.get(rid, 0)
+                            if time.time() - last_ask < _DECISION_COOLDOWN:
+                                log.debug(f"[decision] 冷却中({rid})，跳过")
+                                continue
+                            # 已有待确认的询问不重复发（用户还没回复）
+                            if pending and pending.get("rule_id") == rid:
+                                log.debug(f"[decision] 已有待确认({rid})，跳过")
+                                continue
                             msg = rule["action"].get("text", "")
                             if msg:
+                                _decision_last_ask[rid] = time.time()
                                 add_notification(msg, "decision")
                                 play_reminder_audio(msg)
-                                _dec.set_pending_confirmation(rule["id"], msg)
+                                _dec.set_pending_confirmation(rid, msg)
                         else:
                             try:
                                 _dec.mark_triggered(rule["id"])

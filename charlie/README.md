@@ -48,7 +48,7 @@ docker compose up -d
 
 | Key | 用途 | 获取地址 |
 |---|---|---|
-| GLM_API_KEY | 大脑 LLM（智谱 GLM-4.7-Flash，永久免费） | https://open.bigmodel.cn |
+| GLM_KEY | 大脑 LLM（智谱 GLM-4.7-Flash，永久免费） | https://open.bigmodel.cn |
 | BAIDU_APP_ID/API_KEY/SECRET_KEY | ASR + TTS（有免费额度） | https://console.bce.baidu.com/ai/#/ai/speech/overview/index |
 | AMAP_KEY | 天气（可选） | https://console.amap.com |
 
@@ -66,7 +66,6 @@ Charlie 支持 ESP32 LC-S3 1.54 寸 TFT WiFi 开发板（xiaozhi 协议）：
 4. 选家里 WiFi、填入 OTA 地址（页面提供复制），保存后设备自动连 Charlie
 
 > 烧录的是干净固件，WiFi/服务器地址由设备自带的 AP 热点配网门户写入，不重新编译固件。
-> 详见 `docs/ESP32.md`
 
 ## HTTPS 手机访问
 
@@ -78,11 +77,10 @@ python https_server.py
 
 ## 配置项
 
-所有 60 个环境变量在 `.env.example` 里，按分组注释。配置注册表在 `app/env_catalog.py`（单一来源）。
+所有 90 个环境变量在 `.env.example` 里，按分组注释。配置注册表在 `app/env_catalog.py`（单一来源）。
 
 关键配置：
-- `MCP_PROFILE=core`（默认 8 个核心 MCP）/ `all`（19 个）/ `custom`（读 MCP_SERVERS）
-- `OLLAMA_HOST=http://localhost:11434`（Demo 模式 LLM，可选）
+- `MCP_PROFILE=core`（默认 12 个核心 MCP）/ `all`（19 个）/ `custom`（读 MCP_SERVERS）
 - `ASSISTANT_KID_HTTP_PORT=8000`（HTTP 端口）
 
 ## 项目结构
@@ -102,7 +100,7 @@ charlie/
 │   └── ...
 ├── web/                 # 前端 (voice/setup/welcome/esp32_setup)
 ├── scripts/             # gen-cert.sh, download-models.sh, check-leaks.sh
-├── docs/                # 文档 (SPEC, DEPLOYMENT, ESP32, DEMO_MODE)
+├── docs/                # 文档 (SPEC, DEPLOYMENT, DEMO_MODE)
 └── tests/               # pytest 测试套件
 ```
 

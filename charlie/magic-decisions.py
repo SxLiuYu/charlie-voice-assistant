@@ -7,11 +7,23 @@ v2 改进:
 - 决策反馈闭环: 用户对 confirm=True 决策的接受/拒绝被记录并影响未来优先级
 - 待确认状态: 决策引擎推送确认请求后, brain() 检测用户回应并记录反馈
 """
-import os, json, datetime, time, threading, logging
+import os, json, datetime, time, threading, logging, re
 
 log = logging.getLogger("magic")
 
 DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+
+
+def _get_sleep_hours():
+    from agent.preferences import get_preference
+    sleep_time = get_preference("sleep_time")  # "22:00"
+    wake_time = get_preference("wake_time")    # "07:00"
+    try:
+        sleep_hour = int(sleep_time.split(":")[0]) if sleep_time else 22
+        wake_hour = int(wake_time.split(":")[0]) if wake_time else 7
+        return (sleep_hour, wake_hour)
+    except (ValueError, IndexError):
+        return (22, 7)
 DECISIONS_FILE = os.path.join(DATA_DIR, "decision_history.json")
 FEEDBACK_FILE = os.path.join(DATA_DIR, "decision_feedback.json")
 PENDING_FILE = os.path.join(DATA_DIR, "pending_confirmation.json")
@@ -21,8 +33,8 @@ _decision_lock = threading.Lock()
 _COOLDOWN_HOURS = 12
 # 反馈阈值: 负面反馈率超过此值, 该规则将被跳过
 _NEGATIVE_FEEDBACK_THRESHOLD = 0.6
-# 确认等待窗口: 秒
-_CONFIRMATION_WINDOW = 60
+# 确认等待窗口: 秒（5 分钟，给用户看飞书消息并回复的时间）
+_CONFIRMATION_WINDOW = 300
 
 # ===== 决策规则 =====
 _DECISION_RULES = [
@@ -31,11 +43,11 @@ _DECISION_RULES = [
         "priority": 90,
         "condition": {
             "states": ["home_resting", "home_sleeping"],
-            "hours": (22, 6),
+            "hours": _get_sleep_hours,  # callable，evaluate 时动态求值
             "check_desc": "深夜+休息状态",
         },
-        "action": {"type": "protocol", "name": "goodnight"},
-        "confirm": False,
+        "action": {"type": "protocol", "name": "goodnight", "text": "已经很晚了，要帮你执行晚安场景吗？"},
+        "confirm": True,
     },
     {
         "id": "morning_wakeup",
@@ -57,8 +69,8 @@ _DECISION_RULES = [
             "hours": (6, 23),
             "check_desc": "检测到出门",
         },
-        "action": {"type": "protocol", "name": "leaving_home"},
-        "confirm": False,
+        "action": {"type": "protocol", "name": "leaving_home", "text": "要出门了吗，需要我做什么准备吗？"},
+        "confirm": True,
     },
     {
         "id": "lunch_reminder",
@@ -69,7 +81,7 @@ _DECISION_RULES = [
             "check_desc": "午饭时间+在家/工作",
         },
         "action": {"type": "tts", "text": "到午饭时间了，注意吃饭。"},
-        "confirm": True,
+        "confirm": False,
     },
     {
         "id": "deadline_reminder",
@@ -88,7 +100,7 @@ _DECISION_RULES = [
         "priority": 50,
         "condition": {
             "states": ["home_awake", "home_resting"],
-            "hours": (21, 23),
+            "hours": (21, 22),
             "check_desc": "晚间+在家",
         },
         "action": {"type": "tts", "text": "已经晚上9点了，该准备休息了。"},
@@ -116,14 +128,14 @@ _DECISION_RULES = [
             "extra_check": "sedentary_check",
         },
         "action": {"type": "tts", "text": "已经连续工作一个半小时了，站起来活动一下吧。"},
-        "confirm": True,
+        "confirm": False,
     },
     {
         "id": "evening_wrapup",
         "priority": 45,
         "condition": {
             "states": ["home_awake", "home_resting"],
-            "hours": (21, 23),
+            "hours": (22, 23),
             "check_desc": "晚间复盘",
             "extra_check": "evening_wrapup_check",
         },
@@ -253,13 +265,20 @@ def _should_skip_rule(rule_id: str) -> bool:
 
 # ===== 待确认状态 (文件持久化, 跨进程共享) =====
 
-def _load_pending() -> dict | None:
-    """加载待确认状态"""
+def _load_pending(user_id: str | None = None) -> dict | None:
+    """加载待确认状态
+
+    user_id: 如果提供, 只返回匹配该 user_id 的 pending (跨用户隔离)
+    格式: feishu_{sender_id} 中的 sender_id 部分
+    """
     try:
         if os.path.exists(PENDING_FILE):
             with open(PENDING_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict) and data.get("rule_id"):
+                # user_id 过滤：仅当 user_id 明确传入时才做匹配检查
+                if user_id is not None and data.get("user_id") != user_id:
+                    return None
                 # 检查是否过期
                 elapsed = time.time() - data.get("timestamp", 0)
                 if elapsed < _CONFIRMATION_WINDOW:
@@ -271,12 +290,16 @@ def _load_pending() -> dict | None:
     return None
 
 
-def _save_pending(rule_id: str, text: str):
-    """保存待确认状态"""
+def _save_pending(rule_id: str, text: str, user_id: str = ""):
+    """保存待确认状态
+
+    user_id: 触发此确认的用户标识 (飞书场景为 open_id, 格式 feishu_{sender_id} 中的 sender_id)
+    """
     data = {
         "rule_id": rule_id,
         "text": text,
         "timestamp": time.time(),
+        "user_id": user_id,
     }
     try:
         with open(PENDING_FILE, 'w', encoding='utf-8') as f:
@@ -285,15 +308,21 @@ def _save_pending(rule_id: str, text: str):
         log.debug(f"[decision] op failed: {e}")
 
 
-def set_pending_confirmation(rule_id: str, text: str):
-    """设置待确认决策: 用户需要回应此决策"""
-    _save_pending(rule_id, text)
-    log.info(f"[decision] 待确认: {rule_id} -> {text[:50]}")
+def set_pending_confirmation(rule_id: str, text: str, user_id: str = ""):
+    """设置待确认决策: 用户需要回应此决策
+
+    user_id: 触发此确认的用户标识
+    """
+    _save_pending(rule_id, text, user_id=user_id)
+    log.info(f"[decision] 待确认: {rule_id} -> {text[:50]} (user_id={user_id})")
 
 
-def get_pending_confirmation() -> dict | None:
-    """获取当前待确认的决策, 返回 {rule_id, text, timestamp} 或 None"""
-    return _load_pending()
+def get_pending_confirmation(user_id: str | None = None) -> dict | None:
+    """获取当前待确认的决策, 返回 {rule_id, text, timestamp, user_id} 或 None
+
+    user_id: 如果提供, 只返回匹配该 user_id 的 pending
+    """
+    return _load_pending(user_id=user_id)
 
 
 def clear_pending_confirmation():
@@ -534,7 +563,7 @@ def _arrive_home_check() -> str | None:
                 from app.reminders import list_reminders
                 today = time.strftime("%Y-%m-%d")
                 due = [r for r in list_reminders(include_completed=False)
-                       if not r.get("completed") and r.get("due_date", "") <= today]
+                       if not r.get("done") and r.get("due", "") <= today]
                 if due:
                     parts.append(f"还有{len(due)}项待办")
             except (OSError, KeyError, TypeError) as e:
@@ -564,7 +593,7 @@ def _contextual_greeting_check() -> str | None:
             from app.reminders import list_reminders
             today = time.strftime("%Y-%m-%d")
             due = [r for r in list_reminders(include_completed=False)
-                   if not r.get("completed") and r.get("due_date", "") <= today]
+                   if not r.get("done") and r.get("due", "") <= today]
             if due:
                 parts.append(f"你还有{len(due)}项待办没完成")
         except (OSError, KeyError, TypeError) as e:
@@ -612,8 +641,12 @@ def evaluate(user_state: dict, protocol_executor=None) -> list:
         # 1. 状态匹配
         if state not in cond["states"]:
             continue
-        # 2. 时间范围
-        start_h, end_h = cond["hours"]
+        # 2. 时间范围（支持 callable 动态求值，如 sleep_time 偏好）
+        _hours = cond["hours"]
+        if callable(_hours):
+            start_h, end_h = _hours()
+        else:
+            start_h, end_h = _hours
         if start_h <= end_h:
             if not (start_h <= hour < end_h):
                 continue
@@ -715,18 +748,33 @@ def evaluate(user_state: dict, protocol_executor=None) -> list:
     return decisions
 
 
-def execute_decision(rule: dict, protocol_executor) -> str:
-    """执行决策, 返回结果文字"""
+def execute_decision(rule: dict, protocol_executor, confirmed: bool = False) -> str:
+    """执行决策, 返回结果文字
+
+    confirmed=True 时跳过 protocol 的 safe 检查（用户已通过飞书/语音明确确认）。
+    """
     action = rule["action"]
     action_type = action["type"]
     history = _load_decision_history()
     _mark_triggered(rule["id"], history)
 
+    # 安全分类：protocol 类型默认需确认（除非标记 safe: True 或 confirmed=True）
+    if action_type == "protocol" and not rule.get("safe") and not confirmed:
+        proto_name = action.get("name", "未知场景")
+        log.info(f"[decision] Protocol {proto_name} 需要人工确认，跳过自动执行")
+        return f"「{proto_name}」需要确认，请通过飞书通知决定是否执行。"
+
     if action_type == "protocol":
         try:
             result = protocol_executor(action["name"])
             cond = rule.get("condition", {})
-            log.info(f"[decision] 执行Protocol: {action['name']} (触发规则={rule['id']}, state={cond.get('states')}, hours={cond.get('hours')}) -> {result[:80]}")
+            hours = cond.get("hours")
+            if callable(hours):
+                try:
+                    hours = list(hours())
+                except Exception:
+                    hours = "<callable>"
+            log.info(f"[decision] 执行Protocol: {action['name']} (触发规则={rule['id']}, state={cond.get('states')}, hours={hours}) -> {result[:80]}")
             return result
         except Exception as e:
             log.warning(f"[decision] Protocol执行失败: {e}")
@@ -791,16 +839,118 @@ def get_feedback_summary() -> dict:
 
 def get_rules() -> list:
     """返回所有决策规则(供前端展示)"""
-    return [
-        {
+    result = []
+    for r in _DECISION_RULES:
+        cond = dict(r["condition"])
+        hours = cond.get("hours")
+        if callable(hours):
+            try:
+                cond["hours"] = list(hours())
+            except Exception:
+                cond["hours"] = []
+            cond["hours_dynamic"] = True
+        result.append({
             "id": r["id"],
             "priority": r["priority"],
-            "condition": r["condition"],
+            "condition": cond,
             "action": r["action"],
             "confirm": r["confirm"],
-        }
-        for r in _DECISION_RULES
-    ]
+        })
+    return result
+
+
+# ===== 确认/拒绝反馈检测 =====
+
+# 完整短语匹配（head 模式，已由调用方提取不含标点的纯文本前缀）
+# 短句（<=10字）才走匹配；长句（>10字）直接交给 brain 处理
+_POSITIVE_PATTERNS = re.compile(
+    r'^(好的?|是的?|可以|执行|确认|同意|没问题|行吧?|要|好|行|嗯|嗯嗯)$'
+)
+_NEGATIVE_PATTERNS = re.compile(
+    r'^(不用了?|取消|不要了?|算了|不了|拒绝|别了?|停|不用|不|别)$'
+)
+
+
+def check_feedback(text: str, user_id: str | None = None, session_id: str = "default") -> str | None:
+    """检测用户对 pending 确认决策的反馈。
+
+    参数:
+      text: 用户回复文本
+      user_id: 用户标识（飞书场景为 sender_id，格式 "ou_xxx"）。只匹配同名
+               user_id 的 pending，不同用户的 pending 互不干扰。
+               session_id 参数保留兼容，如果 user_id 为 None 则用 session_id 推导。
+      session_id: 兼容旧调用，user_id 未传时忽略此参数。
+
+    返回值:
+      - str: 已匹配到确认/拒绝，返回回复文本
+      - None: 无待确认决策或文本不匹配，交给正常 brain 流程
+    """
+    pending = get_pending_confirmation(user_id=user_id)
+    if not pending:
+        return None
+
+    rid = pending.get("rule_id", "")
+    rule = next((r for r in _DECISION_RULES if r["id"] == rid), None)
+    if not rule:
+        clear_pending_confirmation()
+        return None
+
+    text_stripped = text.strip()
+
+    # 短句（≤7字）才走正则匹配；长句（>7字）直接交给 brain，避免误判
+    # 确认词最长"没问题"3字+标点1字=4字，7字阈值过滤"好的，今天天气怎么样"这类长句
+    if len(text_stripped) > 7:
+        return None
+
+    text_lower = text_stripped.lower()
+
+    # "好的，xxx" 格式：如果"好的"后紧跟逗号+内容，需区分"确认意图"还是"寒暄"
+    # "好的，执行吧" → 有动作词，算确认（走后续 regex 判断）
+    # "好的，今天天气怎么样" → 无动作词，视为非确认，交 brain
+    # "好的，确认" → "确认"在正面词列表，算确认
+    _action_after_hao = re.match(r'^好的[,，](.+)$', text_lower)
+    if _action_after_hao:
+        tail = _action_after_hao.group(1)
+        # 如果尾部不包含任何确认/动作词，视为非确认
+        _action_keywords = {"执行", "确认", "同意", "可以", "好", "行", "没问题", "是", "嗯"}
+        if not any(kw in tail for kw in _action_keywords):
+            return None
+
+    # 提取句首词（含句首标点），忽略尾部补充文字
+    # "好的，执行吧" → "好的"；"不用了谢谢" → "不用了"
+    head = ""
+    for ch in text_lower:
+        if '\u4e00' <= ch <= '\u9fff' or ch.isalnum():
+            head += ch
+        else:
+            break  # 遇到标点停止
+
+    # 先判负面（"不用"包含"用"但应为拒绝；注意"不用"也在正面列表所以先判负面）
+    if _NEGATIVE_PATTERNS.match(head):
+        record_feedback(rid, False)
+        clear_pending_confirmation()
+        log.info(f"[decision] 用户拒绝: {rid} (text={text[:30]})")
+        return f"好的，已取消「{rule['action'].get('name', rid)}」。"
+
+    if _POSITIVE_PATTERNS.match(head):
+        # 用户确认 → 执行协议
+        record_feedback(rid, True)
+        clear_pending_confirmation()
+        log.info(f"[decision] 用户确认: {rid} (text={text[:30]})")
+        try:
+            from app import load_magic_module
+            _scene = load_magic_module("magic_scenes", "magic-scenes.py")
+            if not _scene:
+                return f"「{rule['action'].get('name', rid)}」场景模块不可用。"
+            result = execute_decision(rule, _scene.execute_protocol, confirmed=True)
+            log.info(f"[decision] 执行结果: {result[:80] if result else '(空)'}")
+            return result or f"「{rule['action'].get('name', rid)}」已执行。"
+        except Exception as e:
+            log.warning(f"[decision] 确认后执行失败: {e}")
+            return f"执行失败: {e}"
+
+    # 不匹配确认/拒绝 → 返回 None 交给正常对话
+    return None
 
 
 if __name__ == "__main__":

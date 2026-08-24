@@ -2,6 +2,14 @@
 白泽搜索 MCP 服务器
 只保留搜索/互联网/购物相关工具
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "baize-skills",
+    "tier": "optional",
+    "required_env": [],
+    "label": "互联网搜索"
+}
+
 import os, requests
 from mcp.server.fastmcp import FastMCP
 import logging

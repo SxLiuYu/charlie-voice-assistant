@@ -35,6 +35,8 @@ _history_file_signature = None
 _history_file_cache = None
 _history_file_lock = threading.Lock()
 _history_save_seq = 0
+_history_append_count = 0  # 每 N 次 _append_history 后自动落盘，防止崩溃丢失
+HISTORY_SAVE_EVERY = 5     # 每 5 轮对话（10 条消息）落盘一次
 _context_summaries = {}
 
 def _history_file_sig() -> Optional[tuple]:
@@ -119,6 +121,19 @@ def _searchable_history(session_id: str = "default") -> list:
             return disk_msgs
     return []
 
+def get_recent_user_message(session_id: str = "default") -> str:
+    """返回指定会话中最后一条用户消息, 无则返回空字符串"""
+    try:
+        hist = _get_history(session_id)
+        with _history_lock:
+            for msg in reversed(hist):
+                if msg.get("role") == "user":
+                    return str(msg.get("content", ""))
+    except Exception:
+        pass
+    return ""
+
+
 def _session_summaries() -> list:
     with _history_lock:
         summaries = []
@@ -170,11 +185,21 @@ def _save_history() -> None:
         log.error(f"[history] 保存失败: {e}")
 
 def _append_history(hist: list, user_text: str, assistant_reply: str) -> None:
+    global _history_append_count
     now = time.time()
-    hist.append({"role": "user", "content": user_text, "ts": now})
-    hist.append({"role": "assistant", "content": assistant_reply, "ts": now})
-    while len(hist) > MAX_HISTORY * 2:
-        hist.pop(0)
+    with _history_lock:
+        hist.append({"role": "user", "content": user_text, "ts": now})
+        hist.append({"role": "assistant", "content": assistant_reply, "ts": now})
+        while len(hist) > MAX_HISTORY * 2:
+            hist.pop(0)
+    # 每 N 轮对话自动落盘，防止崩溃丢失（锁外调用避免与 snapshot 竞态）
+    _history_append_count += 1
+    if _history_append_count >= HISTORY_SAVE_EVERY:
+        _history_append_count = 0
+        try:
+            _save_history()
+        except Exception:
+            pass
 
 def _load_history() -> None:
     try:
@@ -214,12 +239,21 @@ def _trim_history_tokens(hist: list, max_tokens: int = 6000, session_id: str = "
     if not hist:
         return
     total = sum(_estimate_msg_tokens(m) for m in hist)
+    removed_texts = []
     while total > max_tokens and len(hist) > 4:  # 保最后2轮(4条)维持上下文连续性
         removed = hist.pop(0)
         total -= _estimate_msg_tokens(removed)
+        removed_texts.append(removed.get("content", "")[:60])
         if hist:
             removed = hist.pop(0)
             total -= _estimate_msg_tokens(removed)
+            removed_texts.append(removed.get("content", "")[:60])
+    # 将被裁剪的对话写入摘要，供跨会话上下文引用
+    if removed_texts:
+        _ctx_summary = "；".join(removed_texts[:6])
+        if len(_ctx_summary) > 200:
+            _ctx_summary = _ctx_summary[:200] + "..."
+        _context_summaries[session_id] = _ctx_summary
 
 def reset_history(session_id: str = "default") -> None:
     with _history_lock:

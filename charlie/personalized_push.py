@@ -11,6 +11,9 @@
 - ARK LLM (兴趣×热点→推荐)
 """
 import os, json, time, logging, requests
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 log = logging.getLogger("magic")
 _base = os.path.dirname(os.path.abspath(__file__))
@@ -19,10 +22,6 @@ try:
 except ImportError: pass
 
 DATA_DIR = os.getenv("ASSISTANT_KID_DATA_DIR", _base)
-# Agnes 2.5 Flash (免费模型, 替代 ARK)
-AGNES_KEY = os.getenv("AGNES_KEY", "")
-AGNES_BASE = os.getenv("AGNES_BASE", "https://apihub.agnes-ai.com/v1")
-AGNES_MODEL = os.getenv("AGNES_MODEL", "agnes-2.5-flash")
 FEISHU_PUSH_OPEN_ID = os.getenv("FEISHU_PUSH_OPEN_ID", "")
 
 # 去重: 记录已推送过的热点词, 7天后过期
@@ -129,9 +128,15 @@ def get_hot_topics() -> list:
 
 
 def recommend_with_llm(interests: str, hots: list) -> list:
-    """Agnes LLM: 用户兴趣 × 热点 → 筛选3条热点词(只筛选, 不解释)"""
+    """LLM: 用户兴趣 × 热点 → 筛选3条热点词(只筛选, 不解释)"""
+    from app.llm_config import active_chat_endpoint
+
     if not hots:
         return []
+    base, api_key, model = active_chat_endpoint()
+    if not api_key:
+        return hots[:3]
+
     hot_text = "\n".join(f"{i+1}. {h}" for i, h in enumerate(hots[:15]))
     prompt = (
         f"用户兴趣画像:\n{interests}\n\n"
@@ -140,10 +145,10 @@ def recommend_with_llm(interests: str, hots: list) -> list:
         f"只返回热点词, 每行一个, 不要序号不要解释不要理由。"
     )
     try:
-        r = requests.post(f"{AGNES_BASE}/chat/completions",
-            headers={"Authorization": f"Bearer {AGNES_KEY}", "Content-Type": "application/json"},
+        r = requests.post(f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": AGNES_MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 300, "temperature": 0.5,
             }, timeout=30)

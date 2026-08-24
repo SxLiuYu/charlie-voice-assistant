@@ -1,0 +1,105 @@
+{
+  "name": "charlie-full-test",
+  "id": "charlie-full-test",
+  "description": "Charlie语音助手全流程全功能测试团队",
+  "captainSessionId": "session-9ef29cad-61bf-4696-8df0-a40f7074570d",
+  "createdAt": 1787018359871,
+  "members": [
+    {
+      "id": "53a382ff-db90-4e9d-9544-4aea1fe22114",
+      "name": "researcher",
+      "role": "研究员",
+      "joinedAt": 1787018359873,
+      "status": "idle"
+    },
+    {
+      "id": "b4f348f9-d277-4391-8799-fef99fab829a",
+      "name": "engineer",
+      "role": "工程师",
+      "joinedAt": 1787018359891,
+      "status": "idle"
+    },
+    {
+      "id": "c1dfc57c-e32f-4f83-a343-33464522fd39",
+      "name": "tester",
+      "role": "测试员",
+      "joinedAt": 1787018359903,
+      "status": "idle"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "subject": "系统状态与配置检查",
+      "description": "检查Charlie服务状态、LLM配置、环境变量、内存CPU使用",
+      "status": "claimed",
+      "assignee": "researcher",
+      "dependencies": [],
+      "createdAt": 1787018359943,
+      "updatedAt": 1787018435304
+    },
+    {
+      "id": "t2",
+      "subject": "LLM对话功能测试",
+      "description": "测试AGNES中国节点和新加坡节点的对话能力、响应时间、质量",
+      "status": "pending",
+      "assignee": "engineer",
+      "dependencies": [
+        "t1"
+      ],
+      "createdAt": 1787018359954,
+      "updatedAt": 1787018359954
+    },
+    {
+      "id": "t3",
+      "subject": "语音ASR/TTS测试",
+      "description": "测试百度ASR识别、Finna TTS合成、唤醒词检测",
+      "status": "pending",
+      "assignee": "engineer",
+      "dependencies": [
+        "t1"
+      ],
+      "createdAt": 1787018359961,
+      "updatedAt": 1787018359961
+    },
+    {
+      "id": "t4",
+      "subject": "MCP技能功能测试",
+      "description": "测试天气、音乐、提醒、笔记、浏览器等MCP技能",
+      "status": "pending",
+      "assignee": "tester",
+      "dependencies": [
+        "t2",
+        "t3"
+      ],
+      "createdAt": 1787018359965,
+      "updatedAt": 1787018359965
+    },
+    {
+      "id": "t5",
+      "subject": "IoT设备控制测试",
+      "description": "测试Tuya空调控制、红外遥控、ESP32通信",
+      "status": "pending",
+      "assignee": "tester",
+      "dependencies": [
+        "t2"
+      ],
+      "createdAt": 1787018359968,
+      "updatedAt": 1787018359968
+    },
+    {
+      "id": "t6",
+      "subject": "性能与压力测试",
+      "description": "测试并发请求、内存泄漏、长时间运行稳定性",
+      "status": "pending",
+      "assignee": "tester",
+      "dependencies": [
+        "t4",
+        "t5"
+      ],
+      "createdAt": 1787018359970,
+      "updatedAt": 1787018359970
+    }
+  ],
+  "taskSeq": 6
+}

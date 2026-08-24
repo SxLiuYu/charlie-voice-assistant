@@ -5,7 +5,9 @@ LOW_INTENT_ASR_REPLY = "嗯嗯，我在。"
 
 # 唤醒词剥离: ASR 结果通常包含设备端唤醒词本身("你好小智，今天天气怎么样"),
 # 这些词不该进 brain/意图分类。用正则剥离前置唤醒词 + 跟随标点。
-_WAKE_C = r"(?:小智|小志|小助|小助手|查里|查理|查莉|查利|cha[rc]?li?e?|charl(?:ie|ey|es|li)?)"
+#
+# 静态 fallback 正则（roles 导入失败时仍可用），包含 jarvis 唤醒词。
+_WAKE_C = r"(?:小智|小志|小助|小助手|查里|查理|查莉|查利|cha[rc]?li?e?|charl(?:ie|ey|es|li)?|jarvis|贾维斯|贾维丝)"
 _WAKE_STRIP_RE = re.compile(
     r"^\s*(?:(?:嗨|哈喽|哈啰|喂|你好|您好|ok|hi|hello)\s*[,，]?\s*)?"
     + _WAKE_C
@@ -14,11 +16,59 @@ _WAKE_STRIP_RE = re.compile(
 )
 
 
+def _build_wake_strip_re() -> re.Pattern:
+    """动态构建唤醒词剥离正则：聚合所有角色的唤醒词（含角色名本身）。
+
+    结果会缓存在模块级变量 `_WAKE_STRIP_RE_DYNAMIC`，避免每次调用重读
+    preferences。如果 roles 模块不可用，返回静态 fallback 正则。
+    """
+    global _WAKE_STRIP_RE_DYNAMIC
+    try:
+        from agent.roles import get_all_roles
+        roles = get_all_roles()
+        # 收集所有角色的唤醒词 + 角色 ID（用于 "切换到 xxx" 等前缀）
+        all_wake_words: list[str] = []
+        for role_id, role_conf in roles.items():
+            words = role_conf.get("wake_words", [])
+            all_wake_words.extend(words)
+            # 角色 ID 本身也可能作为唤醒词出现（如 "jarvis"、"charlie"）
+            if role_id not in all_wake_words:
+                all_wake_words.append(role_id)
+        if not all_wake_words:
+            return _WAKE_STRIP_RE
+        # 转义正则元字符，拼接为 (?:w1|w2|w3) 分组
+        escaped = [re.escape(w) for w in all_wake_words if w]
+        if not escaped:
+            return _WAKE_STRIP_RE
+        wake_c = r"(?:" + "|".join(escaped) + r")"
+        dynamic_re = re.compile(
+            r"^\s*(?:(?:嗨|哈喽|哈啰|喂|你好|您好|ok|hi|hello)\s*[,，]?\s*)?"
+            + wake_c
+            + r"\s*[，,。.!！？~；;、\s]*",
+            re.IGNORECASE,
+        )
+        _WAKE_STRIP_RE_DYNAMIC = dynamic_re
+        return dynamic_re
+    except Exception:
+        return _WAKE_STRIP_RE
+
+
+_WAKE_STRIP_RE_DYNAMIC: re.Pattern | None = None
+
+
+def _get_wake_strip_re() -> re.Pattern:
+    """返回当前生效的唤醒词剥离正则（优先动态，首次调用时构建并缓存）。"""
+    global _WAKE_STRIP_RE_DYNAMIC
+    if _WAKE_STRIP_RE_DYNAMIC is None:
+        _WAKE_STRIP_RE_DYNAMIC = _build_wake_strip_re()
+    return _WAKE_STRIP_RE_DYNAMIC
+
+
 def strip_wake_word(text: str) -> str:
-    """去掉 ARS 结果开头携带的唤醒词/称谓 (仅当出现匹配且后跟标点/空格)。"""
+    """去掉 ASR 结果开头携带的唤醒词/称谓 (仅当出现匹配且后跟标点/空格)。"""
     if not text:
         return ""
-    return _WAKE_STRIP_RE.sub("", text, count=1).strip()
+    return _get_wake_strip_re().sub("", text, count=1).strip()
 
 _LOW_INTENT_STRIP_RE = re.compile(
     r"[\s，。！？、,.!?~～…\-—_:：；;\"'“”‘’（）()【】\[\]{}<>《》〈〉]+"

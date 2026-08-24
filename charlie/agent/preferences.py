@@ -156,6 +156,12 @@ def _commit_preferences(mutate: Callable[[dict], Any]) -> Any:
                 log.warning(f"[prefs] 保存失败: {e}")
                 return result
             _preferences_file_signature = _preferences_file_signature_now()
+    # 失效 system_msg 缓存，确保下次看到最新偏好
+    try:
+        from agent.system_msg import invalidate_system_msg_cache
+        invalidate_system_msg_cache()
+    except Exception:
+        pass
     return result
 
 def set_preference(key: str, value: str) -> str:

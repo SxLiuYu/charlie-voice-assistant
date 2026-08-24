@@ -2,6 +2,14 @@
 
 Charlie 的自进化能力：从对话中学习，越用越懂你。
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-evolution",
+    "tier": "core",
+    "required_env": [],
+    "label": "自进化系统"
+}
+
 from mcp.server.fastmcp import FastMCP
 import os, json, datetime, re, hashlib, time, threading
 from collections import Counter, defaultdict

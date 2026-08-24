@@ -1,5 +1,5 @@
 """衣橱照片识别：上传衣服照片 → 分析颜色/类型 → 录入衣橱"""
-import os, io, json, base64, tempfile, logging, colorsys, re, datetime
+import os, io, json, base64, tempfile, logging, colorsys, re, datetime, asyncio
 from collections import Counter
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from PIL import Image
@@ -63,13 +63,13 @@ def get_dominant_colors(image: Image.Image, n: int = 3) -> list:
     
     return [c for c, _ in color_counts.most_common(n)]
 
-def classify_clothing(colors: list, image_size: tuple) -> dict:
+async def classify_clothing(colors: list, image_size: tuple) -> dict:
     """基于颜色和尺寸特征推断衣物类型"""
     w, h = image_size
     aspect = w / h if h > 0 else 1
     primary_color = colors[0] if colors else "未知"
     color_str = "、".join(colors[:3])
-    
+
     prompt = f"""分析这张衣服照片的特征，推断衣物属性。返回JSON格式。
 
 照片特征:
@@ -82,32 +82,38 @@ def classify_clothing(colors: list, image_size: tuple) -> dict:
 
 只返回JSON。"""
 
-    try:
+    def _sync_post():
         from dotenv import load_dotenv
         load_dotenv()
         ark_key = os.getenv("ARK_KEY", "")
         ark_base = os.getenv("ARK_BASE", "")
         ark_model = os.getenv("ARK_MODEL", "u2")
-        
-        r = requests.post(f"{ark_base}/chat/completions",
+
+        r = requests.post(
+            f"{ark_base}/chat/completions",
             headers={"Authorization": f"Bearer {ark_key}", "Content-Type": "application/json"},
             json={"model": ark_model, "messages": [{"role": "user", "content": prompt}],
-                  "max_tokens": 800, "temperature": 0.3}, timeout=20)
-        
+                  "max_tokens": 800, "temperature": 0.3},
+            timeout=20,
+        )
+        return r
+
+    try:
+        r = await asyncio.to_thread(_sync_post)
+
         msg = r.json().get("choices", [{}])[0].get("message", {})
         reply = msg.get("content", "").strip()
         if not reply:
-            # U2 是推理模型，可能放在 reasoning_content
             reply = msg.get("reasoning_content", "").strip()
         if not reply:
             return None
-        
+
         m = re.search(r'\{[^}]+\}', reply, re.DOTALL)
         if m:
             result = json.loads(m.group(0))
         else:
             result = json.loads(reply)
-        
+
         return result
     except Exception as e:
         log.warning(f"[wardrobe] 衣物分类失败: {e}")

@@ -1,0 +1,1 @@
+{"id":"b8ab3606-cb02-4470-8cee-bf725483ae92","from":"engineer","to":"captain","content":"收到待命指令。已确认团队状态：\n- t1（系统状态与配置检查）正在执行中（assignee: researcher）\n- t2（LLM对话功能测试）和我分配，依赖 t1 完成\n- t3（语音ASR/TTS测试）和我分配，依赖 t1 完成\n\n保持待命状态，等待 t1 完成后立即执行 t2 和 t3。","ts":1787018469276}

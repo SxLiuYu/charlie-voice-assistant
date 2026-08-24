@@ -16,7 +16,7 @@ from app.state import (
     register_sse_client, unregister_sse_client, sse_client_count,
 )
 from app.notifications import drain_notifications
-from app.auth import _sanitize_text
+from app.auth import _sanitize_text, AUTH_TOKEN
 from app.config import http_port, https_port
 from app.reminders import (
     REMINDERS_FILE, _load_reminders, append_reminder, complete_reminder,
@@ -153,6 +153,8 @@ async def xiaozhi_ota(request: Request):
     elif host in ("localhost", "127.0.0.1", "::1", ""):
         host = _get_lan_ip() or "127.0.0.1"
     ws_url = f"ws://{host}:{http_port()}/ws/xiaozhi"
+    if AUTH_TOKEN:
+        ws_url = f"{ws_url}?token={AUTH_TOKEN}"
     ota_response = {
         "websocket": {"url": ws_url, "version": 1},
         "server_time": {"timestamp": int(datetime.datetime.now().timestamp()), "timezone_offset": 480},

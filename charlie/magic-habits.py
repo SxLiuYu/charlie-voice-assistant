@@ -3,6 +3,14 @@
 数据存储: data/habits.json
 结构: {habit_name: {"logs": ["2026-08-12", ...], "created": "2026-08-12"}}
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-habits",
+    "tier": "optional",
+    "required_env": [],
+    "label": "习惯追踪"
+}
+
 import os
 import json
 import logging
@@ -155,3 +163,6 @@ try:
 
 except ImportError:
     log.debug("[habits] mcp 未安装，工具不注册")
+else:
+    if __name__ == "__main__":
+        mcp.run()

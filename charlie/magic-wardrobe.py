@@ -10,9 +10,21 @@
 
 依赖: ~/.charlie/wardrobe/ (颜色搭配规则 + 衣橱数据)
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-wardrobe",
+    "tier": "optional",
+    "required_env": ['AMAP_KEY'],
+    "label": "AI穿搭推荐"
+}
+
 from mcp.server.fastmcp import FastMCP
 import os, json, requests, datetime, re
 import logging
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 log = logging.getLogger("magic")
 
 mcp = FastMCP("magic-wardrobe")
@@ -153,10 +165,10 @@ def get_weather(city: str) -> dict:
 
 def generate_outfit_with_llm(weather: dict, occasion: str = "日常", wardrobe_items: list = None) -> str:
     """用 ARK LLM 生成穿搭建议"""
+    from app.llm_config import active_chat_endpoint
+
     log.info(f"[wardrobe] LLM生成穿搭: occasion={occasion}, weather={weather.get('weather')} {weather.get('temp')}度")
-    ark_key = os.getenv("ARK_KEY", "")
-    ark_base = os.getenv("ARK_BASE", "https://ark.cn-beijing.volces.com/api/plan/v3")
-    ark_model = os.getenv("ARK_MODEL", "ark-code-latest")
+    base, api_key, model = active_chat_endpoint()
 
     city = weather.get("city", "你所在的城市")
     temp = weather.get("temp", 20)
@@ -192,11 +204,14 @@ def generate_outfit_with_llm(weather: dict, occasion: str = "日常", wardrobe_i
 方案三: ...
 小贴士: ..."""
 
+    if not api_key:
+        return simple_outfit_advice(city, temp, w)
+
     try:
-        r = requests.post(f"{ark_base}/chat/completions",
-            headers={"Authorization": f"Bearer {ark_key}", "Content-Type": "application/json"},
+        r = requests.post(f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": ark_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": "你是穿搭顾问, 用中文给出搭配建议。"},
                     {"role": "user", "content": prompt},

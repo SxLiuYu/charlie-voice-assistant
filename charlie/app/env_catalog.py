@@ -102,27 +102,73 @@ GROUP_LABELS = {
 
 ENTRIES: list[EnvEntry] = [
     # --- core（核心：缺这些只会降级，但建议都配） ---
-    EnvEntry("ARK_KEY", required=True, group="core", secret=True, demo_supported=True,
-             get_guide="https://console.volcengine.com/ark",
-             description="火山引擎 ARK 大脑 LLM（可选）。未配置时用智谱 GLM 免费大脑"),
-    EnvEntry("ARK_BASE", default="https://ark.cn-beijing.volces.com/api/plan/v3",
+    # ---- LLM 节点（通过 LLM_PRIORITY 优先级链启用，顺序: stepfun,agnes,sagnes,glm,ark） ----
+    EnvEntry("LLM_PRIORITY", default="stepfun,agnes,sagnes,glm,ark",
+             group="core", tunable=False,
+             description="LLM 优先级链（逗号分隔，如: stepfun,agnes,sagnes,glm,ark）"),
+    EnvEntry("AGNES_KEY", group="core", secret=True, demo_supported=True,
+             description="Agnes 中国节点 Key（默认首选 LLM，有免费额度）"),
+    EnvEntry("AGNES_BASE", default="https://apihub.agnes-ai.com/v1",
              group="core", tunable=True,
-             description="ARK API 基址（火山引擎北京区）"),
-    EnvEntry("ARK_MODEL", default="ark-code-latest", group="core", tunable=True,
-             description="大脑模型名"),
-    # 智谱 GLM 免费大脑 — glm-4-flash 永久免费，OpenAI 兼容，无需 ARK
+             description="Agnes 中国节点 API 基址"),
+    EnvEntry("AGNES_MODEL", default="agnes-2.0-flash",
+             group="core", tunable=True,
+             description="Agnes 中国节点模型名"),
+    EnvEntry("SAGNES_KEY", group="core", secret=True, demo_supported=True,
+             description="Agnes 新加坡节点 Key"),
+    EnvEntry("SAGNES_BASE", default="https://api-sg.agnes-ai.com/v1",
+             group="core", tunable=True,
+             description="Agnes 新加坡节点 API 基址"),
+    EnvEntry("SAGNES_MODEL", default="agnes-2.0-flash",
+             group="core", tunable=True,
+             description="Agnes 新加坡节点模型名"),
+    # 智谱 GLM 免费大脑 — glm-4.7-flash 永久免费，OpenAI 兼容，作为 LLM 备选节点
     EnvEntry("GLM_KEY", group="core", secret=True, demo_supported=True,
              get_guide="https://open.bigmodel.cn/apikey/platform",
-             description="智谱 GLM 免费 Key。glm-4.7-flash 模型永久免费、不限量。不想配 ARK_KEY 时填这个即可"),
+             description="智谱 GLM Key（永久免费 LLM 备选，通过 LLM_PRIORITY 启用）"),
     EnvEntry("GLM_BASE", default="https://open.bigmodel.cn/api/paas/v4",
              group="core", tunable=True,
-             description="智谱 API 基址（OpenAI 兼容）"),
+             description="智谱 API 基址（OpenAI 兼容，通过 LLM_PRIORITY 启用）"),
     EnvEntry("GLM_MODEL", default="glm-4.7-flash",
              group="core", tunable=True,
-             description="智谱模型名（glm-4.7-flash 永久免费）"),
+             description="智谱模型名（glm-4.7-flash 永久免费，通过 LLM_PRIORITY 启用）"),
     EnvEntry("GLM_MODELS", default="glm-4.7-flash,glm-4-flash,glm-4.5-flash",
              group="core", tunable=True,
-             description="GLM 429 限流 fallback 链（逗号分隔，按顺序轮换）"),
+             description="GLM 429 限流 fallback 链（逗号分隔，按顺序轮换，通过 LLM_PRIORITY 启用）"),
+    # 火山引擎 ARK — 作为 LLM 备选节点
+    EnvEntry("ARK_KEY", group="core", secret=True, demo_supported=True,
+             get_guide="https://console.volcengine.com/ark",
+             description="火山引擎 ARK Key（LLM 备选，通过 LLM_PRIORITY 启用）"),
+    EnvEntry("ARK_BASE", default="https://ark.cn-beijing.volces.com/api/plan/v3",
+             group="core", tunable=True,
+             description="ARK API 基址（通过 LLM_PRIORITY 启用）"),
+    EnvEntry("ARK_MODEL", default="ark-code-latest", group="core", tunable=True,
+             description="ARK 模型名（通过 LLM_PRIORITY 启用）"),
+    # StepFun 节点（LLM + ASR 降级备选）
+    EnvEntry("STEPFUN_KEY", group="core", secret=True, demo_supported=True,
+             get_guide="https://platform.stepfun.com",
+             description="StepFun API Key（LLM/ASR 降级备选。注意: LLM 的 reasoning 无法禁用，延迟比 Agnes 高。通过 LLM_PRIORITY 启用）"),
+    EnvEntry("STEPFUN_LLM_BASE", default="https://api.stepfun.com/step_plan/v1",
+             group="core", tunable=True,
+             description="StepFun LLM API 基址（通过 LLM_PRIORITY 启用）"),
+    EnvEntry("STEPFUN_LLM_MODEL", default="step-3.5-flash-2603",
+             group="core", tunable=True,
+             description="StepFun LLM 模型名（通过 LLM_PRIORITY 启用）"),
+    EnvEntry("STEPFUN_ASR_BASE", default="https://api.stepfun.com/v1",
+             group="core", tunable=True,
+             description="StepFun ASR API 基址（OpenAI 兼容 /audio/transcriptions）"),
+    EnvEntry("STEPFUN_ASR_MODEL", default="stepaudio-2.5-asr",
+             group="core", tunable=True,
+             description="StepFun ASR 模型名"),
+    EnvEntry("STEPFUN_TTS_BASE", default="https://api.stepfun.com/v1",
+             group="core", tunable=True,
+             description="StepFun TTS API 基址（OpenAI 兼容 /audio/speech）"),
+    EnvEntry("STEPFUN_TTS_MODEL", default="step-tts-2",
+             group="core", tunable=True,
+             description="StepFun TTS 模型名"),
+    EnvEntry("STEPFUN_TTS_VOICE", default="cixingnansheng",
+             group="core", tunable=True,
+             description="StepFun TTS 系统预设音色名（如 cixingnansheng）"),
     EnvEntry("BAIDU_APP_ID", required=True, group="core", secret=True,
              get_guide="https://console.bce.baidu.com/ai/#/ai/speech/overview/index",
              description="百度智能云 App ID（ASR + TTS）"),
@@ -137,12 +183,12 @@ ENTRIES: list[EnvEntry] = [
     # --- llm_fallback（Ollama 本地可选，需硬件支持） ---
     EnvEntry("OLLAMA_ENABLED", default="0", group="llm_fallback",
              tunable=True,
-             description="是否启用 Ollama 本地模式（1=启用，需安装 Ollama 且硬件足够）"),
+             description="是否启用 Ollama 本地模式（1=启用，需安装 Ollama 且硬件足够；已移除，保留兼容）"),
     EnvEntry("OLLAMA_HOST", default="http://localhost:11434", group="llm_fallback",
-             description="Ollama 服务地址（仅在 OLLAMA_ENABLED=1 时使用）"),
+             description="Ollama 服务地址（仅在 OLLAMA_ENABLED=1 时使用；已移除，保留兼容）"),
     EnvEntry("OLLAMA_MODEL", default="qwen3.5:2b", group="llm_fallback",
              tunable=True,
-             description="Ollama 本地模型名，需 ollama pull <model>（仅在 OLLAMA_ENABLED=1 时使用）"),
+             description="Ollama 本地模型名，需 ollama pull <model>（仅在 OLLAMA_ENABLED=1 时使用；已移除，保留兼容）"),
 
     # --- asr_local（本地 SenseVoice ASR） ---
     EnvEntry("SENSE_VOICE_MODEL", default="models/sense-voice",
@@ -164,6 +210,9 @@ ENTRIES: list[EnvEntry] = [
              description="0=禁用飞书主动推送"),
     EnvEntry("FEISHU_WEBHOOK", group="feishu", secret=True,
              description="飞书机器人 Webhook（watchdog 异常告警用）"),
+    EnvEntry("FEISHU_VERIFICATION_TOKEN", group="feishu", secret=True,
+             get_guide="https://open.feishu.cn/app → 事件订阅",
+             description="飞书事件订阅 Verification Token（配置后启用双向对话）"),
 
     # --- tuya（红外空调） ---
     EnvEntry("TUYA_CLIENT_ID", group="tuya", secret=True,
@@ -210,16 +259,19 @@ ENTRIES: list[EnvEntry] = [
              description="阿里云 DashScope（购物分析/翻译）"),
 
     # --- push（个性化热点推送） ---
-    EnvEntry("AGNES_KEY", group="push", secret=True,
-             description="AGNES LLM Key（个性化推荐筛选）"),
-    EnvEntry("AGNES_BASE", group="push",
-             description="AGNES API 基址"),
-    EnvEntry("AGNES_MODEL", group="push",
-             description="AGNES 模型名"),
+
     EnvEntry("PERSONALIZED_PUSH_INTERVAL", default="3600", group="push", tunable=True,
              description="热点推送间隔秒数（默认 1 小时）"),
     EnvEntry("DEFAULT_CITY", default="北京", group="push",
              description="默认城市（天气/穿搭推荐）"),
+
+    # --- notifications（ntfy 备用通知通道） ---
+    EnvEntry("NTFY_URL", group="push",
+             description="ntfy 服务地址（如 https://ntfy.sh，留空则不推送）"),
+    EnvEntry("NTFY_TOPIC", group="push",
+             description="ntfy topic（填了才启用，如 charlie-alerts）"),
+    EnvEntry("NTFY_AUTH", group="push", secret=True,
+             description="ntfy 认证（格式 user:pass，可选）"),
 
     # --- system（运行时配置） ---
     EnvEntry("AUTH_TOKEN", group="system", secret=True,
@@ -242,9 +294,11 @@ ENTRIES: list[EnvEntry] = [
              description="多用户 ID（按用户隔离对话历史/偏好）"),
     EnvEntry("SKIP_BACKGROUND", default="0", group="system", tunable=True,
              description="1=跳过后台调度器（HTTPS 进程用）"),
-    EnvEntry("MCP_PROFILE", default="core", group="system",
-             description="MCP 启用模式：core（默认 8 个）/ all（19 个）/ custom（读 MCP_SERVERS）"),
-    EnvEntry("MCP_SERVERS", group="system", tunable=True,
+    EnvEntry("DECISION_ENGINE_ENABLED", default="1", group="system", tunable=True,
+             description="1=启用自主决策引擎（早安简报/午饭/久坐/晚安等自动判断）"),
+    EnvEntry("MCP_PROFILE", default="core", group="system", tunable=False,
+             description="MCP 启用模式：core（默认 12 个）/ all（19 个）/ custom（读 MCP_SERVERS）"),
+    EnvEntry("MCP_SERVERS", group="system", tunable=False,
              description="自定义 MCP 列表（逗号分隔，仅 MCP_PROFILE=custom 时生效）"),
 
     # --- tuning（高级调参，不进 setup 白名单） ---
@@ -261,7 +315,7 @@ ENTRIES: list[EnvEntry] = [
              description="Finna TTS 模型名"),
     EnvEntry("TTS_SPEED", group="tuning", tunable=True,
              description="TTS 语速"),
-    EnvEntry("TTS_CACHE_MAX_CHARS", default="20", group="tuning", tunable=True,
+    EnvEntry("TTS_CACHE_MAX_CHARS", default="200", group="tuning", tunable=True,
              description="短文本 TTS 缓存上限字符数"),
     EnvEntry("TTS_FAILURE_THRESHOLD", default="3", group="tuning", tunable=True,
              description="TTS 连续失败熔断阈值"),
@@ -269,6 +323,10 @@ ENTRIES: list[EnvEntry] = [
              description="TTS 熔断冷却秒数"),
     EnvEntry("LOCAL_TTS_ENABLED", default="0", group="tuning", tunable=True,
              description="1=启用本地 TTS 降级"),
+    EnvEntry("ASR_PRIORITY", default="sensevoice,baidu,stepfun,vosk", group="tuning", tunable=False,
+             description="ASR 优先级链（逗号分隔，如: sensevoice,baidu,stepfun,vosk）"),
+    EnvEntry("TTS_PRIORITY", default="baidu,stepfun,finna", group="tuning", tunable=False,
+             description="TTS 优先级链（逗号分隔，如: baidu,stepfun,finna）"),
     EnvEntry("ASR_HOTWORDS", group="tuning", tunable=True,
              description="ASR 热词表（逗号分隔）"),
     EnvEntry("XIAOZHI_VAD_SILENCE_FRAMES", default="8", group="tuning", tunable=True,
@@ -330,19 +388,27 @@ def missing_required() -> list[EnvEntry]:
 
 
 def llm_available() -> bool:
-    """是否有任何一种 LLM 可用：ARK 已配或智谱 GLM 免费 Key 已配
+    """是否有任何一种 LLM 可用：AGNES / SAGNES / STEPFUN / GLM / ARK 已配
 
-    开箱即用版推荐 GLM 免费 Key + 百度免费 ASR/TTS，无需本地 GPU。
+    开箱即用版推荐 AGNES 免费 Key + 百度免费 ASR/TTS，无需本地 GPU。
     """
-    return is_configured("ARK_KEY") or is_configured("GLM_KEY")
+    return (is_configured("AGNES_KEY")
+            or is_configured("SAGNES_KEY")
+            or is_configured("STEPFUN_KEY")
+            or is_configured("GLM_KEY")
+            or is_configured("ARK_KEY"))
 
 
 def demo_mode_active() -> bool:
-    """当前是否处于未配置状态（未配 ARK_KEY 且未配 GLM_KEY）
+    """当前是否处于未配置状态（未配任何 LLM Key）
 
-    此状态下启动会引导用户注册免费 GLM Key，不再默认依赖 Ollama。
+    此状态下启动会引导用户注册免费 AGNES Key。
     """
-    return not (is_configured("ARK_KEY") or is_configured("GLM_KEY"))
+    return not (is_configured("AGNES_KEY")
+                or is_configured("SAGNES_KEY")
+                or is_configured("STEPFUN_KEY")
+                or is_configured("GLM_KEY")
+                or is_configured("ARK_KEY"))
 
 
 def setup_whitelist_keys() -> list[str]:
@@ -384,16 +450,6 @@ def render_env_template() -> str:
     return "\n".join(env_template_lines()) + "\n"
 
 
-def setup_payload() -> dict[str, str]:
-    """给 /api/setup GET 返回的字典（默认值补齐）"""
-    data: dict[str, str] = {}
-    for e in ENTRIES:
-        if e.tunable:
-            continue
-        data[e.name] = os.getenv(e.name, e.default)
-    return data
-
-
 def status_report() -> list[dict[str, object]]:
     """给 /api/setup/mcp-status 等展示用：每个变量的状态快照"""
     return [
@@ -430,7 +486,11 @@ def render_startup_log() -> list[str]:
                 note = " (Demo 可用)"
             elif not e.is_set and e.required:
                 note = " (必需, 缺失)"
-            lines.append(f"  {tag} {e.name}{note}  {e.description}")
+            # 对 SENSE_VOICE_DISABLED 显示实际生效值（0=启用本地ASR，1=禁用）
+            extra = ""
+            if e.name == "SENSE_VOICE_DISABLED":
+                extra = f"={os.getenv(e.name, e.default)}"
+            lines.append(f"  {tag} {e.name}{extra}{note}  {e.description}")
     return lines
 
 
@@ -446,6 +506,9 @@ def render_welcome_status() -> dict:
         "baidu_configured": (is_configured("BAIDU_APP_ID")
                              and is_configured("BAIDU_API_KEY")
                              and is_configured("BAIDU_SECRET_KEY")),
+        "agnes_configured": is_configured("AGNES_KEY"),
+        "sagnes_configured": is_configured("SAGNES_KEY"),
+        "stepfun_configured": is_configured("STEPFUN_KEY"),
         "glm_configured": is_configured("GLM_KEY"),
         "ark_configured": is_configured("ARK_KEY"),
     }

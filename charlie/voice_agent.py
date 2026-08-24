@@ -41,13 +41,13 @@ from agent.llm_state import (
     session as _session, OLLAMA_SIMPLE_SYSTEM_MSG,
 )
 from agent.llm import (
-    _demo_mode_active, _ollama_online, _llm_has_any_key,
+    _demo_mode_active, _llm_has_any_key,
     _intent_cache_set, intent_classifier_status, _normalize_intent,
     _classify_intent, _wrap_openai_create_unknown_kwargs, _install_openai_compat,
     _build_brain, _get_brain, _ensure_event_loop,
     _record_brain_failure, _record_brain_success, _cleanup_brain_processes,
     restart_brain, reload_brain_config, set_current_user, get_current_user,
-    brain_status, _ollama_fallback, _extract_assistant_text,
+    brain_status, _extract_assistant_text,
     _interrupted_context_message, _remember_conversation_async,
     _brain_llm, brain_stream_sentences, stream_voice_pipeline,
 )
@@ -65,9 +65,7 @@ from agent.device_control import (
 )
 
 # ===== 从其他 agent/ 子模块导入 =====
-from app.llm_config import (
-    OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_OPENAI_BASE, active_chat_endpoint,
-)
+from app.llm_config import active_chat_endpoint
 from agent.intent import LOW_INTENT_ASR_REPLY, is_low_intent_asr, is_garbled_asr
 from agent.cache import _cache_get, _cache_set, _cache_get_interrupted, _cache_lock, _cache, _CACHE_TTL, _CACHE_MAX
 from agent.history import (
@@ -143,6 +141,60 @@ def __getattr__(name: str):
     raise AttributeError(f"module 'voice_agent' has no attribute {name!r}")
 
 
+# ===== 角色切换快路径 =====
+_ROLE_SWITCH_PATTERNS = (
+    (("切换到贾维斯", "变成贾维斯", "切换贾维斯", "我要贾维斯", "换成贾维斯"), "jarvis", "贾维斯"),
+    (("切换到查理", "变成查理", "切换查理", "回到查理", "回到默认", "切换到默认"), "charlie", "Charlie"),
+    (("切换到白泽", "变成白泽", "切换白泽", "我要白泽", "换成白泽"), "baize", "白泽"),
+)
+
+
+def _role_switch_handler(text: str) -> str | None:
+    """角色切换关键词直连 switch_role，不进 LLM（轻量通道无工具，必须在此拦截）。"""
+    for patterns, role_id, role_label in _ROLE_SWITCH_PATTERNS:
+        if any(p in text for p in patterns):
+            try:
+                from agent.roles import switch_role
+                switch_role(role_id)
+                return f"好的，已切换为{role_label}。"
+            except Exception as e:
+                log.warning(f"[role_switch] 切换失败: {e}")
+                return "角色切换失败了，请稍后再试。"
+    return None
+
+
+# ===== 社交礼貌快路径 =====
+_SOCIAL_REPLIES = {
+    "谢谢": "不客气。",
+    "多谢": "不客气。",
+    "辛苦了": "应该的。",
+    "再见": "再见，随时叫我。",
+    "拜拜": "再见，随时叫我。",
+}
+
+
+def _social_reply_handler(text: str) -> str | None:
+    """社交礼貌语直返固定短句，不进 LLM。
+
+    仅限纯社交短句：去掉标点后 >6 字、或含任何领域关键词（天气/提醒等）
+    的复合语句一律返回 None 回退，避免"谢谢，今天天气怎么样"被吞掉真实意图。
+    """
+    import re as _re
+    try:
+        from agent.llm import _ALL_DOMAIN_KEYWORDS
+        if any(kw in text for kw in _ALL_DOMAIN_KEYWORDS):
+            return None
+    except Exception:
+        pass
+    cleaned = _re.sub(r'[，。！？!?,.\s]', '', text)
+    if len(cleaned) > 6:
+        return None
+    for keyword, reply in _SOCIAL_REPLIES.items():
+        if keyword in cleaned:
+            return reply
+    return None
+
+
 # ===== 决策反馈检测 =====
 def _decision_feedback_handler(text: str, session_id: str = "default") -> str | None:
     """检测用户对上轮决策的反馈（确认/取消/修改），匹配则执行并返回回复"""
@@ -185,6 +237,12 @@ def brain(text: str, session_id: str = "default") -> str:
                 audit_log("brain", input_data=text, output_data=reply,
                           action=f"fast_path:{path.name}", session_id=session_id,
                           duration_ms=(_t.time()-_start)*1000)
+                try:
+                    from agent.llm import _remember_conversation_async
+                    import threading as _mem_thread
+                    _mem_thread.Thread(target=_remember_conversation_async, args=(text, reply), daemon=True).start()
+                except Exception as e:
+                    log.debug(f"[brain] fast_path记忆提取线程启动失败: {e}")
                 return reply
         cached = _cache_get(text)
         if cached is not None:
@@ -279,6 +337,12 @@ def _scene_protocol_handler(text: str) -> str | None:
 
 # 快路径链：顺序执行，先命中先返回
 FAST_PATHS = [
+    FastPath("role_switch", ("切换到贾维斯", "变成贾维斯", "切换贾维斯", "我要贾维斯", "换成贾维斯",
+                             "切换到查理", "变成查理", "回到默认", "切换到默认",
+                             "切换到白泽", "变成白泽", "我要白泽", "换成白泽"),
+             "_role_switch_handler"),
+    FastPath("social", ("谢谢", "多谢", "辛苦了", "再见", "拜拜"),
+             "_social_reply_handler"),
     FastPath("time", ('几点', '几点啦'), "_time_handler"),
     FastPath("ac", ('空调', '制冷', '制热', '除湿', '开空调', '调温度', '温度调', '高风', '中风', '低风', '风速'),
              "_direct_ac_control", exclude=('天气',)),

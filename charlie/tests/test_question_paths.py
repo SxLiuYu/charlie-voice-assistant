@@ -71,25 +71,22 @@ class TestWeatherFastPath:
         ]])
         with patch.object(voice_agent, "_direct_weather_play", return_value=""), \
              patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", return_value=fake_brain):
             sentences = list(voice_agent.brain_stream_sentences("今天天气"))
         assert len(sentences) >= 1
         assert "看天" in sentences[-1][1]
 
     def test_direct_weather_parses_amap_json(self):
-        """解析高德返回结构(extensions=all): forecasts[0].casts[0]。"""
-        payload = {"forecasts": [{"casts": [{
-            "dayweather": "多云", "nightweather": "晴",
-            "daytemp": "31", "nighttemp": "21",
-        }]}]}
-        with patch("agent.weather.requests") as m_req:
-            m_req.get.return_value.json.return_value = payload
-            with patch.dict("os.environ", {"AMAP_KEY": "test-key"}, clear=False):
-                reply = voice_agent._direct_weather_play("今天天气咋样")
-        assert reply == "今天多云转晴，31到21度。"
+        """天气快路径通过 app.weather.get_weather_text 返回天气摘要。"""
+        with patch("app.weather.get_weather_text", return_value="今天多云转晴，31到21度。"):
+            reply = voice_agent._direct_weather_play("今天天气咋样")
+        assert "多云" in reply
+        assert "31" in reply
 
     def test_direct_weather_no_key_returns_empty(self):
-        with patch.dict("os.environ", {}, clear=True):
+        """get_weather_text 返回空时快路径回退 brain。"""
+        with patch("app.weather.get_weather_text", return_value=""):
             assert voice_agent._direct_weather_play("天气") == ""
 
 
@@ -244,6 +241,7 @@ class TestCachePath:
             {"role": "assistant", "content": "这是缓存的回答。"}
         ]])
         with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", return_value=fake_brain):
             r1 = voice_agent.brain("讲个笑话")
             r2 = voice_agent.brain("讲个笑话")
@@ -267,6 +265,7 @@ class TestLLMChitchat:
             {"role": "assistant", "content": "你好。很高兴见到你,给你讲个小故事。"}
         ]])
         with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", return_value=fake_brain):
             sentences = list(voice_agent.brain_stream_sentences("你好"))
         assert len(sentences) >= 1
@@ -279,6 +278,7 @@ class TestLLMChitchat:
             {"role": "assistant", "content": "让我想想。这是你的答案。"}
         ]])
         with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", return_value=fake_brain):
             sentences = list(voice_agent.brain_stream_sentences("有个问题想问你"))
         joined = "".join(s[0] for s in sentences)
@@ -292,19 +292,20 @@ class TestLLMChitchat:
 class TestDegradation:
     def test_brain_build_failure(self):
         with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", side_effect=Exception("boot fail")):
             sentences = list(voice_agent.brain_stream_sentences("测试"))
         assert sentences and "失败" in sentences[0][0]
 
-    def test_ollama_fallback_on_run_error(self):
+    def test_ollama_fallback_removed(self):
+        """_ollama_fallback 已删除，run 异常时直接返回兜底语"""
         fake_brain = MagicMock()
         fake_brain.run = MagicMock(side_effect=Exception("run error"))
         with patch("agent.llm._classify_intent", return_value="none"), \
-             patch("agent.llm._get_brain", return_value=fake_brain), \
-             patch("agent.llm._ollama_fallback", return_value="本地回答") as m_oll:
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
+             patch("agent.llm._get_brain", return_value=fake_brain):
             reply = voice_agent.brain("你好")
-        assert reply == "本地回答"
-        m_oll.assert_called_once()
+        assert "忙不过来" in reply or "失败" in reply
 
 
 if __name__ == "__main__":

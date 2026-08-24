@@ -12,6 +12,14 @@ v2 改进:
 - 时间衰减平滑化 (30天以上仍有基础权重)
 - 记忆修正 (correct_memory) 和语义去重 (dedup_memories)
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-memory",
+    "tier": "core",
+    "required_env": [],
+    "label": "叙事性记忆系统"
+}
+
 from mcp.server.fastmcp import FastMCP
 import os, json, datetime, re, threading, time, hashlib
 from collections import defaultdict
@@ -132,7 +140,7 @@ def _extract_events(user_text: str, assistant_reply: str) -> list:
     # 跳过闲聊/问候(不值得记忆)
     _SKIP_KEYWORDS = {"你好", "在吗", "谢谢", "再见", "好的", "嗯", "几点了",
                       "今天天气", "几点啦", "在不在", "你好啊"}
-    if text in _SKIP_KEYWORDS or len(text) <= 3:
+    if any(kw in text for kw in _SKIP_KEYWORDS) or len(text) <= 3:
         return events
     for rule in _EVENT_PATTERNS:
         matched = False
@@ -151,6 +159,28 @@ def _extract_events(user_text: str, assistant_reply: str) -> list:
                 "bigrams": _text_to_bigrams(text[:200]),  # 预计算bigram向量
             })
             break  # 每条对话只提取一个事件
+    # Fallback: 未匹配任何 pattern 但文本足够长的通用陈述，作为 general 记忆存储
+    if not events and len(text) >= 15:
+        # 质量过滤：跳过 ASR 乱码（重复双字词过多或标点密度异常）
+        skip = False
+        for i in range(len(text) - 1):
+            seg = text[i:i+2]
+            if text.count(seg) >= 3:
+                skip = True
+                break
+        if not skip:
+            comma_count = text.count("，") + text.count(",")
+            if comma_count > len(text) / 5:
+                skip = True
+        if not skip:
+            events.append({
+                "timestamp": time.time(),
+                "datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "user_text": text[:200],
+                "tags": ["general"],
+                "summary": f"用户提到: {text[:80]}",
+                "bigrams": _text_to_bigrams(text[:200]),
+            })
     return events
 
 
@@ -160,9 +190,24 @@ def remember_conversation(user_text: str, assistant_reply: str) -> int:
     if not events:
         return 0
     memories = _load_memories()
-    memories.extend(events)
+    new_events = []
+    for event in events:
+        is_dup = False
+        for mem in memories:
+            sim = _cosine_similarity(
+                event.get("bigrams", {}),
+                mem.get("bigrams", {}),
+            )
+            if sim > 0.9:
+                is_dup = True
+                break
+        if not is_dup:
+            new_events.append(event)
+    if not new_events:
+        return 0
+    memories.extend(new_events)
     _save_memories(memories)
-    return len(events)
+    return len(new_events)
 
 
 def get_relevant_memories(query: str, limit: int = 3) -> list:
@@ -269,8 +314,8 @@ def dedup_memories() -> int:
 
 
 def format_memories_for_prompt(query: str, limit: int = 3) -> str:
-    """格式化记忆摘要, 注入到 system prompt"""
-    memories = get_relevant_memories(query, limit)
+    """格式化记忆摘要, 注入到 system prompt（使用混合检索）"""
+    memories = recall_hybrid(query, k=limit)
     if not memories:
         return ""
     lines = []
@@ -307,11 +352,11 @@ def recall(query: str) -> str:
     例: recall("项目") → 返回与项目相关的记忆
         recall("上周说了什么") → 返回最近的记忆
     """
-    memories = get_relevant_memories(query, limit=5)
-    if not memories:
+    results = recall_hybrid(query, k=5)
+    if not results:
         return "没有找到相关记忆。"
     lines = []
-    for m in memories:
+    for m in results:
         lines.append(f"[{m.get('datetime', '')}] {m.get('summary', '')}")
     return "\n".join(lines)
 
@@ -376,6 +421,207 @@ def forget(query: str) -> str:
     _save_memories(remaining)
     deleted = before - len(remaining)
     return f"已删除{deleted}条记忆。" if deleted > 0 else "没有找到匹配的记忆。"
+
+
+# ===== Memory v2: 工作记忆 + 语义记忆 + 混合检索 =====
+
+# 工作记忆：当前会话的短期记忆，会话结束清空
+_working_memory = {
+    "session_facts": {},       # 本轮对话中提到的事实 "project=xxx"
+    "intent_stack": [],        # 用户意图栈
+    "last_topic": "",          # 最后话题
+    "turn_count": 0,           # 本轮对话轮数
+}
+_working_memory_lock = threading.Lock()
+
+
+def reset_working_memory() -> None:
+    """清空工作记忆（会话结束时调用）"""
+    with _working_memory_lock:
+        _working_memory["session_facts"].clear()
+        _working_memory["intent_stack"].clear()
+        _working_memory["last_topic"] = ""
+        _working_memory["turn_count"] = 0
+
+
+def update_working_memory(facts: dict = None, intent: str = "", topic: str = "") -> None:
+    """更新工作记忆"""
+    with _working_memory_lock:
+        if facts:
+            _working_memory["session_facts"].update(facts)
+        if intent:
+            stack = _working_memory["intent_stack"]
+            if not stack or stack[-1] != intent:
+                stack.append(intent)
+        if topic:
+            _working_memory["last_topic"] = topic
+        _working_memory["turn_count"] += 1
+
+
+def get_working_memory() -> dict:
+    """获取当前工作记忆快照"""
+    with _working_memory_lock:
+        return {
+            "session_facts": dict(_working_memory["session_facts"]),
+            "intent_stack": list(_working_memory["intent_stack"]),
+            "last_topic": _working_memory["last_topic"],
+            "turn_count": _working_memory["turn_count"],
+        }
+
+
+# 语义记忆：从 episodic 中提取的语义知识（用户偏好/习惯/关系）
+_SEMANTIC_FILE = None
+_semantic_lock = threading.Lock()
+_semantic_cache = {}
+
+
+def _get_semantic_file() -> str:
+    global _SEMANTIC_FILE
+    if _SEMANTIC_FILE is None:
+        uid = os.environ.get("CHARLIE_USER_ID", "default")
+        name = f"semantic_memories_{uid}.json" if uid != "default" else "semantic_memories.json"
+        _SEMANTIC_FILE = os.path.join(DATA_DIR, name)
+    return _SEMANTIC_FILE
+
+
+def _load_semantic_memories() -> list:
+    with _semantic_lock:
+        try:
+            if os.path.exists(_get_semantic_file()):
+                with open(_get_semantic_file(), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
+
+
+def _save_semantic_memories(memories: list) -> None:
+    with _semantic_lock:
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = _get_semantic_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(memories, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _get_semantic_file())
+        except Exception:
+            pass
+
+
+def _extract_semantic_knowledge(memories: list) -> list:
+    """从叙事记忆中提取语义知识"""
+    knowledge = []
+    pref_patterns = [
+        (r"我喜欢(.+?)[，。]", "preference", "like"),
+        (r"我讨厌(.+?)[，。]", "preference", "dislike"),
+        (r"我习惯(.+?)[，。]", "habit", "routine"),
+        (r"我通常(.+?)[，。]", "habit", "routine"),
+        (r"我的(.+?)是(.+?)[，。]", "attribute", "fact"),
+    ]
+    for mem in memories:
+        text = mem.get("user_text", "") + " " + mem.get("summary", "")
+        for pattern, ktype, ksub in pref_patterns:
+            matches = re.findall(pattern, text)
+            for m in matches:
+                knowledge.append({
+                    "type": ktype,
+                    "subtype": ksub,
+                    "key": m.strip()[:30],
+                    "value": m.strip()[:60],
+                    "source": mem.get("datetime", ""),
+                    "confidence": 0.8,
+                })
+    return knowledge
+
+
+def refresh_semantic_memory() -> int:
+    """刷新语义记忆（从 episodic 重建）"""
+    memories = _load_memories()
+    knowledge = _extract_semantic_knowledge(memories)
+    _save_semantic_memories(knowledge)
+    return len(knowledge)
+
+
+def get_semantic_memories() -> list:
+    """获取语义记忆"""
+    return _load_semantic_memories()
+
+
+# ===== 混合检索 (recency + relevance + importance) =====
+
+def _score_recency(mem: dict) -> float:
+    """时间分：24h内0.8，7天内0.5，30天内0.3，否则0.1"""
+    age_hours = (time.time() - mem.get("timestamp", 0)) / 3600
+    if age_hours < 24:
+        return 0.8
+    if age_hours < 168:
+        return 0.5
+    if age_hours < 720:
+        return 0.3
+    return 0.1
+
+
+def _score_relevance(mem: dict, query: str) -> float:
+    """语义相关分：bigram 余弦相似度"""
+    query_bigrams = _text_to_bigrams(query)
+    mem_bigrams = mem.get("bigrams", {})
+    if not query_bigrams or not mem_bigrams:
+        return 0.0
+    sim = _cosine_similarity(query_bigrams, mem_bigrams)
+    return sim * 6.0
+
+
+def _score_importance(mem: dict) -> float:
+    """重要性分：标签权重 + 互动反馈"""
+    score = 0.0
+    tags = mem.get("tags", [])
+    important_tags = {"deadline", "task", "plan", "problem"}
+    if set(tags) & important_tags:
+        score += 1.0
+    if mem.get("feedback_count", 0) > 0:
+        score += 0.5
+    return score
+
+
+def recall_hybrid(query: str, k: int = 5) -> list:
+    """混合检索：recency + relevance + importance
+
+    参数:
+    - query: 查询文本
+    - k: 返回数量
+
+    例: recall_hybrid("项目进度", k=3) → 返回最相关的3条记忆
+    """
+    memories = _load_memories()
+    if not memories:
+        return []
+    query_bigrams = _text_to_bigrams(query)
+    if not query_bigrams:
+        return []
+
+    scored = []
+    for mem in memories:
+        recency = _score_recency(mem)
+        relevance = _score_relevance(mem, query)
+        importance = _score_importance(mem)
+        total = recency + relevance + importance
+        if total > 0:
+            scored.append((total, recency, relevance, importance, mem))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [m for _, _, _, _, m in scored[:k]]
+
+
+def remember_working_fact(key: str, value: str) -> None:
+    """记住当前会话中的一个事实"""
+    update_working_memory(facts={key: value})
+
+
+def forget_working_fact(key: str) -> None:
+    """忘记当前会话中的一个事实"""
+    with _working_memory_lock:
+        _working_memory["session_facts"].pop(key, None)
 
 
 if __name__ == "__main__":

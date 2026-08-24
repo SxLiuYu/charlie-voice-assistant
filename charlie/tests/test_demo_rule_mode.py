@@ -65,6 +65,7 @@ class TestDemoRuleMode:
     def test_non_demo_mode_unmatched_calls_brain(self):
         """非 Demo 模式（ARK_KEY 已配）下未命中快路径应正常调 LLM。"""
         with patch("agent.llm._demo_mode_active", return_value=False), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain") as mock_brain:
             mock_brain.return_value = MagicMock()
             mock_brain.return_value.run = MagicMock(return_value=["笑话来了"])

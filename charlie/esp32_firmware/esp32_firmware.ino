@@ -1,6 +1,9 @@
 /**
  * Charlie ESP32 全屋语音节点
  * 
+ * 遗留参考代码：实际部署用预编译 bin 固件（xiaozhi v2.1.0 WebSocket 协议，经 /esp32-setup 页面烧录），
+ * 本 .ino 为历史 HTTP POST 版本。
+ * 
  * 硬件: ESP32 + INMP441(I2S麦克风) + MAX98357(I2S功放+喇叭)
  * 接线:
  *   INMP441:  VDD→3.3V  GND→GND  SD→GPIO32  WS→GPIO25  SCK→GPIO33  L/R→GND

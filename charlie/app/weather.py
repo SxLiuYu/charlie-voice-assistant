@@ -40,9 +40,11 @@ def _amap_get(city: str) -> dict | None:
         try:
             geo = requests.get("https://restapi.amap.com/v3/geocode/geo",
                 params={"address": city, "key": amap}, timeout=5).json()
-            adcode = geo.get("geocodes", [{}])[0].get("adcode", "110000")
+            adcode = geo.get("geocodes", [{}])[0].get("adcode")
         except Exception:
-            adcode = "110000"
+            adcode = None
+    if not adcode:
+        return None
     try:
         r = requests.get("https://restapi.amap.com/v3/weather/weatherInfo",
             params={"city": adcode, "key": amap, "extensions": "all"}, timeout=10).json()
@@ -125,18 +127,18 @@ def _open_meteo_get(city: str) -> dict | None:
 
 
 def get_weather(city: str = "北京") -> dict:
-    """统一天气入口：AMAP 优先 → Open-Meteo 兜底 → 默认值。
+    """统一天气入口：Open-Meteo 免费 API 优先 → AMAP 兜底 → 默认值。
 
     返回标准化 dict:
         city, day_weather, night_weather, day_temp, night_temp,
         weather_text, current_temp (可能缺), current_weather (可能缺),
         rain_prob (可能缺), source
     """
-    w = _amap_get(city)
+    w = _open_meteo_get(city)
     if w:
         return w
-    log.info(f"[weather] AMAP 未配置/失败，降级 Open-Meteo: {city}")
-    w = _open_meteo_get(city)
+    log.info(f"[weather] Open-Meteo 失败，降级 AMAP: {city}")
+    w = _amap_get(city)
     if w:
         return w
     # 最终兜底

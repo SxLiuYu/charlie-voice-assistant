@@ -1,4 +1,12 @@
 """magic-music: 网易云音乐播放 (6个工具)"""
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-music",
+    "tier": "optional",
+    "required_env": [],
+    "label": "音乐播放"
+}
+
 from mcp.server.fastmcp import FastMCP
 from mcp_common import NCM_BIN, _ensure_https
 import subprocess, json as _json, random

@@ -425,7 +425,7 @@ def test_idle_after_arm_window_sends_goodbye(xiaozhi_server):
     be re-woken)."""
     import websockets as _ws
     with patch("app.xiaozhi_ws._synth_wake_beep", return_value=b""), \
-         patch("app.xiaozhi_ws.ARM_WINDOW", 0.3):
+         patch("app.xiaozhi_ws._get_arm_window", return_value=0.3):
         with ws_connect(xiaozhi_server) as ws:
             _hello(ws)
             ws.send(json.dumps({"type": "listen", "state": "detect",
@@ -456,6 +456,97 @@ def test_idle_after_arm_window_sends_goodbye(xiaozhi_server):
 
     assert any(m.get("type") == "goodbye" for m in msgs), \
         f"expected goodbye after idle window, got: {[m.get('type') for m in msgs]}"
+
+
+def test_brain_error_sends_fallback(xiaozhi_server):
+    """当 brain 抛异常时，客户端应收到的兜底语（不走死链超时）。"""
+    def raising_brain(text, session_id="default", interrupted_reply=""):
+        raise RuntimeError("brain boom")
+
+    with patch("app.xiaozhi_ws._synth_wake_beep", return_value=b""), \
+         patch("app.xiaozhi_ws._synth_mp3", return_value=b"\x00" * 200), \
+         patch("app.xiaozhi_ws.mp3_to_opus_packets",
+               return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
+         patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
+         patch("voice_agent.asr", return_value="你好"), \
+         patch("voice_agent.brain_stream_sentences", side_effect=raising_brain):
+        with ws_connect(xiaozhi_server) as ws:
+            _hello(ws)
+            ws.send(json.dumps({"type": "listen", "state": "detect",
+                                "text": "你好小智"}))
+            time.sleep(0.6)
+            ws.send(json.dumps({"type": "listen", "state": "start"}))
+            _send_utterance_burst(ws, tone_sec=1.0, silence_sec=2.2)
+            jsons, _, _ = collect_responses(ws, total_timeout=15.0)
+
+    texts = [m.get("text", "") for m in jsons if m.get("type") == "tts"
+             and m.get("state") == "sentence_start"]
+    assert any("出了点问题" in t for t in texts), \
+        f"expected error fallback text, got: {texts}"
+
+
+def test_brain_deadlink_sends_slow_reply_fallback(xiaozhi_server):
+    """brain 死链（永不产出）时，客户端应收到的兜底语且流程正常结束。"""
+    _stop = threading.Event()
+
+    def blocking_brain(text, session_id="default", interrupted_reply=""):
+        # 模拟 brain 死链：在首 yield 前永久阻塞，但可被 Event 取消
+        _stop.wait(timeout=120)
+        yield ("never", "never")
+
+    try:
+        with patch("app.xiaozhi_ws._synth_wake_beep", return_value=b""), \
+             patch("app.xiaozhi_ws._synth_mp3", return_value=b"\x00" * 200), \
+             patch("app.xiaozhi_ws.mp3_to_opus_packets",
+                   return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
+             patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
+             patch("voice_agent.asr", return_value="你好"), \
+             patch("voice_agent.brain_stream_sentences", side_effect=blocking_brain), \
+             patch("app.xiaozhi_ws._FIRST_SENTENCE_TIMEOUT", 3.0):
+            with ws_connect(xiaozhi_server) as ws:
+                _hello(ws)
+                ws.send(json.dumps({"type": "listen", "state": "detect",
+                                    "text": "你好小智"}))
+                time.sleep(0.6)
+                ws.send(json.dumps({"type": "listen", "state": "start"}))
+                _send_utterance_burst(ws, tone_sec=1.0, silence_sec=2.2)
+                jsons, _, _ = collect_responses(ws, total_timeout=15.0)
+
+        types = [(m.get("type"), m.get("state"), m.get("text", "")) for m in jsons]
+        # 必须收到 stop + 兜底语
+        assert any(t == "tts" and s == "stop" for t, s, _ in types), \
+            f"expected tts stop, got: {types}"
+        assert any("反应慢了" in text for _, _, text in types), \
+            f"expected slow-reply fallback, got: {types}"
+    finally:
+        _stop.set()
+
+
+def test_xiaozhi_ws_local_no_token_accepted(xiaozhi_server):
+    """本地直连（无代理头、对端IP为127.0.0.1）不带 token 也应 accept。"""
+    with ws_connect(xiaozhi_server) as ws:
+        resp = _hello(ws)
+    assert resp["type"] == "hello"
+
+
+def test_xiaozhi_ws_proxy_no_token_rejected(xiaozhi_server):
+    """带 X-Forwarded-For 且无 token 时，应 close(1008)。"""
+    with patch("app.xiaozhi_ws.AUTH_TOKEN", "test-secret"):
+        try:
+            with ws_connect(xiaozhi_server, additional_headers={"X-Forwarded-For": "1.2.3.4"}) as ws:
+                ws.recv(timeout=2.0)
+        except Exception:
+            # websockets 库在服务端 close 后可能抛 ConnectionClosed
+            pass
+
+
+def test_xiaozhi_ws_proxy_with_token_accepted(xiaozhi_server):
+    """带 X-Forwarded-For 且 query token 正确时，应 accept。"""
+    with patch("app.xiaozhi_ws.AUTH_TOKEN", "test-secret"):
+        url = f"{xiaozhi_server}?token=test-secret"
+        with ws_connect(url, additional_headers={"X-Forwarded-For": "1.2.3.4"}) as ws:
+            resp = _hello(ws)
+        assert resp["type"] == "hello"
 
 
 if __name__ == "__main__":

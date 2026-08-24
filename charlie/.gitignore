@@ -1,5 +1,6 @@
-# 敏感配置
-.env
+# 敏感配置（全部 env 变体）
+.env*
+!.env.example
 
 # 运行时数据
 conversation_history.json
@@ -46,3 +47,10 @@ audio_000.wav
 evolution_data.json
 models/
 .coverage
+_probe_*.py
+persona_state.json
+_probe_realtime.py
+_probe_rest.sh
+_probe_d.py
+_probe_e.py
+_probe_f.py

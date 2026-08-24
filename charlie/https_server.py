@@ -2,6 +2,7 @@
 后台调度器(提醒/建议/预热)只在HTTP进程跑，HTTPS进程通过环境变量跳过"""
 import os, sys, socket, uvicorn
 os.environ["SKIP_BACKGROUND"] = "1"  # 关键：防止重复启动调度器/建议/预热
+os.environ["LOG_FILE_DISABLE"] = "1"  # 防止双进程同写 app.log 行重复（stdout 由 watchdog 重定向到 voice_https.log）
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from voice_server import app  # 复用同一套 API
 from app.config import https_port

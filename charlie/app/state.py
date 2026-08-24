@@ -291,6 +291,7 @@ _ws_clients = {}           # {ws_id: {"ws":ws,"interrupt":False,"last_active":..
 _ws_session_groups = {}    # {session_id: [ws_id, ...]} — 跨终端会话组
 _ws_client_locations = {}  # {ws_id: {"lat":...,"lng":...,"accuracy":...,"time":...}} — 客户端位置
 _sse_clients_lock = threading.Lock()
+_ws_clients_lock = threading.RLock()
 
 # ===== xiaozhi ESP32 WebSocket 连接（主动推送用） =====
 _xiaozhi_clients = {}       # {client_id: {"ws": ws, "loop": event_loop}}
@@ -364,6 +365,51 @@ def snapshot_sse_clients() -> list[asyncio.Queue]:
 def sse_client_count() -> int:
     with _sse_clients_lock:
         return len(_sse_clients)
+
+
+# ===== 连续对话模式 (Continuous Conversation Mode) =====
+# 来自 gitee assistant-x-openclaw 的「连续对话与打断机制」思路。
+# 会话级状态：上次活跃时间 + 连续模式过期时间。
+# 当用户在某会话内连续互动时，无需重新唤醒即可继续对话。
+
+_CONTINUOUS_MODE_TTL = 8  # 连续对话保持秒数（每轮交互后重置）
+_continuous_mode_lock = threading.Lock()
+_continuous_mode: dict[str, float] = {}  # session_id -> expires_at
+
+
+def enter_continuous_mode(session_id: str) -> None:
+    """进入/续期连续对话模式"""
+    expires = time.time() + _CONTINUOUS_MODE_TTL
+    with _continuous_mode_lock:
+        _continuous_mode[session_id] = expires
+
+
+def exit_continuous_mode(session_id: str) -> None:
+    """退出连续对话模式"""
+    with _continuous_mode_lock:
+        _continuous_mode.pop(session_id, None)
+
+
+def is_continuous_mode(session_id: str) -> bool:
+    """检查会话是否处于连续对话模式"""
+    expires = _continuous_mode.get(session_id)
+    if expires is None:
+        return False
+    if time.time() > expires:
+        # 过期自动清理
+        with _continuous_mode_lock:
+            _continuous_mode.pop(session_id, None)
+        return False
+    return True
+
+
+def refresh_continuous_mode(session_id: str) -> bool:
+    """刷新连续对话模式，返回是否处于连续模式"""
+    if is_continuous_mode(session_id):
+        enter_continuous_mode(session_id)
+        return True
+    return False
+
 
 def _ws_client_count() -> int:
     """当前活跃WebSocket连接数"""

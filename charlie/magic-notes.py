@@ -1,4 +1,12 @@
 """magic-notes: 备忘录 (2个工具)"""
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-notes",
+    "tier": "core",
+    "required_env": [],
+    "label": "备忘录"
+}
+
 from mcp.server.fastmcp import FastMCP
 import os
 import logging
@@ -126,3 +134,7 @@ def clear_shopping_list() -> str:
         return "购物清单已清空。"
     except Exception as e:
         return f"清空购物清单失败: {e}"
+
+
+if __name__ == "__main__":
+    mcp.run()

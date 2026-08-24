@@ -44,8 +44,16 @@ def direct_ac_control(text: str) -> str:
         return ""
     t = text.strip()
 
-    if (re.search(r"关(?:闭|掉|上)?\s*空调|空调\s*关|把空调关|关了", t) or
-            (("空调" in t or "电扇" in t) and "关" in t and "开" not in t)):
+    # 关机判断：只匹配明确的祈使指令（"关空调"/"关闭空调"/"把空调关掉"等），
+    # 不匹配疑问句/质问句（"你是不是把空调关了"/"空调是不是关了"等）。
+    # 历史误触发案例：ASR识别出"你是不是把客厅空调给关了"→ 旧逻辑把空调关了。
+    _is_question = any(k in t for k in ("是不是", "了吗", "了没", "有没有", "刚才"))
+    _power_off_cmd = bool(re.search(
+        r"^(?:帮我把?)?(?:关(?:闭|掉|上)?)(?:一下)?\s*(?:客厅)?(?:空调|电扇)"
+        r"|(?:帮我把?)?(?:客厅)?(?:空调|电扇)\s*关(?:闭|掉|上)?"
+        r"|关了空调$",
+        t))
+    if _power_off_cmd and not _is_question:
         try:
             log.info(f"[ac] 查询当前状态: infrared={infrared_id[:8]}... remote={remote_id[:8]}...")
             cur = api.ac_status(infrared_id, remote_id)
@@ -86,9 +94,9 @@ def direct_ac_control(text: str) -> str:
         fan = 2
     elif "低风" in t or "小风" in t or "微风" in t:
         fan = 1
-    m = re.search(r"(\d{1,3})\s*(?:度|℃|°C|°C|摄氏度)", t)
+    m = re.search(r"(\d{1,3})\s*(?:度|℃|°C|摄氏度)", t)
     if not m:
-        m = re.search(r"(?:调到|设成|调到|调至|开?\s*到)\s*(\d{1,3})", t)
+        m = re.search(r"(?:调到|设成|调至|开?\s*到)\s*(\d{1,3})", t)
     if m:
         try:
             temp = int(m.group(1))

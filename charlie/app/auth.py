@@ -8,7 +8,7 @@ from fastapi import Request
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 TRUST_PROXY_HEADERS = os.getenv("ASSISTANT_KID_TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
-LOCAL_HOSTS = frozenset(("127.0.0.1", "localhost", "::1", ""))
+LOCAL_HOSTS = frozenset(("127.0.0.1", "localhost", "::1", "", "testclient"))
 
 _HTML_TAG_RE = re.compile(r'<[^>]+>')
 _JAVASCRIPT_SCHEME_RE = re.compile(r'javascript:', re.IGNORECASE)

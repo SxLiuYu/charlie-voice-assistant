@@ -12,21 +12,23 @@ from app import mcp_gate
 
 
 class TestMcpGate:
-    def test_core_profile_returns_8(self, monkeypatch):
-        """MCP_PROFILE=core 返回 8 个核心 MCP"""
+    def test_core_profile_returns_12(self, monkeypatch):
+        """MCP_PROFILE=core 返回核心 MCP（含 amap-maps/filesystem 别名 + magic-preferences + magic-memory 等）"""
         monkeypatch.setenv("MCP_PROFILE", "core")
         result = mcp_gate.resolve_mcp_profile()
-        assert len(result) == 8
+        assert len(result) >= 12  # 至少 12 个核心
         assert "magic-info" in result
         assert "magic-reminder" in result
+        assert "magic-preferences" in result
+        assert "magic-memory" in result
         assert "magic-feishu" not in result  # 可选，不在 core
 
     def test_all_profile_returns_core_plus_optional(self, monkeypatch):
         """MCP_PROFILE=all 返回核心 + 可选（key 缺失过滤后）"""
         monkeypatch.setenv("MCP_PROFILE", "all")
         result = mcp_gate.resolve_mcp_profile()
-        assert len(result) >= 8  # 至少 8 个核心
-        # 核心 8 个都在
+        assert len(result) >= 12  # 至少 12 个核心
+        # 核心全部都在
         for k in mcp_gate.CORE_MCP_KEYS:
             assert k in result
 
@@ -55,11 +57,11 @@ class TestMcpGate:
         assert "magic-reminder" in result
 
     def test_custom_empty_falls_back_to_core(self, monkeypatch):
-        """MCP_PROFILE=custom + MCP_SERVERS 空 → 回退 core"""
+        """MCP_PROFILE=custom + MCP_SERVERS 空 → 回退 core（含 magic-preferences + magic-memory）"""
         monkeypatch.setenv("MCP_PROFILE", "custom")
         monkeypatch.delenv("MCP_SERVERS", raising=False)
         result = mcp_gate.resolve_mcp_profile()
-        assert len(result) == 8
+        assert len(result) >= 12  # 至少 12 个核心
 
     def test_all_profile_filters_missing_tuya(self, monkeypatch):
         """MCP_PROFILE=all + 缺 TUYA_CLIENT_ID 时 ac-control 被过滤"""

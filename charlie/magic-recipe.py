@@ -10,10 +10,22 @@
 
 依赖: ~/.charlie/recipe-app/data/ (recipes.json + wife_profile.json + order_history.json)
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-recipe",
+    "tier": "optional",
+    "required_env": [],
+    "label": "AI做菜推荐"
+}
+
 import os, json, random, re
 from datetime import datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 import logging
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 log = logging.getLogger("magic")
 
 # 注意: 不在此处 os.chdir() — 它会全局改变工作目录，破坏其他模块的相对路径
@@ -181,17 +193,17 @@ def _score_recipe(recipe: dict, profile: dict) -> int:
 
 # ── LLM (ARK, 照 magic-wardrobe; 放弃 recipe_core 的 FinnA) ──
 def _call_ark_llm(system_prompt: str, user_message: str, max_tokens: int = 1024) -> str:
-    ark_key = os.getenv("ARK_KEY", "")
-    ark_base = os.getenv("ARK_BASE", "https://ark.cn-beijing.volces.com/api/plan/v3")
-    ark_model = os.getenv("ARK_MODEL", "ark-code-latest")
-    if not ark_key:
+    from app.llm_config import active_chat_endpoint
+
+    base, api_key, model = active_chat_endpoint()
+    if not api_key:
         return ""
     try:
         import requests
-        r = requests.post(f"{ark_base}/chat/completions",
-            headers={"Authorization": f"Bearer {ark_key}", "Content-Type": "application/json"},
+        r = requests.post(f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": ark_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},

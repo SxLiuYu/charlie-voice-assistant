@@ -33,6 +33,7 @@ if [ "$HTTPS_PORT" -lt 1 ] || [ "$HTTPS_PORT" -gt 65535 ]; then
 fi
 RESTART_COUNT=0
 CONSECUTIVE_FAIL=0   # 连续启动失败次数，用于退避
+CHECK_COUNT=0        # 运行检查计数，用于心跳日志
 FEISHU_WEBHOOK="${FEISHU_WEBHOOK:-}"
 
 notify_feishu() {
@@ -45,6 +46,23 @@ notify_feishu() {
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$WATCHDOG_LOG"
+}
+
+pkill_wait() {
+    local pattern="$1"
+    local timeout="${2:-5}"
+    pkill -f "$pattern" 2>/dev/null
+    local waited=0
+    while [ "$waited" -lt "$timeout" ]; do
+        if ! pgrep -f "$pattern" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    # 仍存活则 SIGKILL
+    pkill -9 -f "$pattern" 2>/dev/null
+    return 0
 }
 
 log "看门狗v2启动 - 检查间隔60s"
@@ -61,8 +79,7 @@ while true; do
     if [ "$HTTP_OK" != "200" ]; then
         log "⚠️ HTTP服务异常($HTTP_OK)，重启中..."
         notify_feishu "Charlie HTTP服务异常($HTTP_OK)，已自动重启"
-        pkill -f "voice_server.py" 2>/dev/null
-        sleep 2
+        pkill_wait "voice_server.py" 5
         screen -dmS voice bash -c "cd '$SCRIPT_DIR' && exec '$SCRIPT_DIR/.venv/bin/python' voice_server.py > '$LOG' 2>&1"
         NEED_RESTART=1
     fi
@@ -70,10 +87,24 @@ while true; do
     if [ "$HTTPS_OK" != "200" ]; then
         log "⚠️ HTTPS服务异常($HTTPS_OK)，重启中..."
         notify_feishu "Charlie HTTPS服务异常($HTTPS_OK)，已自动重启"
-        pkill -f "https_server.py" 2>/dev/null
-        sleep 2
+        pkill_wait "https_server.py" 5
         screen -dmS voice-https bash -c "cd '$SCRIPT_DIR' && exec '$SCRIPT_DIR/.venv/bin/python' https_server.py > '$HTTPS_LOG' 2>&1"
         NEED_RESTART=1
+    fi
+
+    # 检查 brain 连续失败（HTTP 服务正常但大脑死链时重启）
+    if [ "$HTTP_OK" == "200" ]; then
+        XIAOZHI_STATUS=$(curl -s --max-time 5 "http://localhost:$HTTP_PORT/api/xiaozhi/status" 2>/dev/null || echo "")
+        if [ -n "$XIAOZHI_STATUS" ]; then
+            BRAIN_FAILURES=$(echo "$XIAOZHI_STATUS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('brain',{}).get('consecutive_failures',0))" 2>/dev/null || echo 0)
+            if [ "$BRAIN_FAILURES" -ge 3 ]; then
+                log "⚠️ Brain连续失败${BRAIN_FAILURES}次，重启服务..."
+                notify_feishu "Charlie Brain连续${BRAIN_FAILURES}次失败，已重启"
+                pkill_wait "voice_server.py" 5
+                screen -dmS voice bash -c "cd '$SCRIPT_DIR' && exec '$SCRIPT_DIR/.venv/bin/python' voice_server.py > '$LOG' 2>&1"
+                NEED_RESTART=1
+            fi
+        fi
     fi
 
     # 检查Cloudflare Tunnel(如果tunnel_url.txt存在则监控)
@@ -101,6 +132,12 @@ while true; do
         fi
     else
         CONSECUTIVE_FAIL=0
+        # 心跳日志：每 30 次检查记录一次服务正常
+        CHECK_COUNT=$((CHECK_COUNT + 1))
+        if [ "$CHECK_COUNT" -ge 30 ]; then
+            log "服务正常(运行检查${CHECK_COUNT}次)"
+            CHECK_COUNT=0
+        fi
         # 内存检查
         MEM_PCT=$(python3 -c "import psutil;print(int(psutil.virtual_memory().percent))" 2>/dev/null || echo 0)
         if [ "$MEM_PCT" -gt 90 ]; then

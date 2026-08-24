@@ -135,7 +135,8 @@ def play_reminder_audio(text: str, reminder_id: int | None = None):
             raise RuntimeError("TTS返回空音频")
 
         # 推送到 ESP32 (xiaozhi WebSocket) — fire and forget
-        push_tts_to_xiaozhi(text, audio)
+        display_text = f"主人，提醒您：{text}"
+        delivery = push_tts_to_xiaozhi(display_text, audio)
 
         # macOS: afplay 放到独立线程，不阻塞决策循环
         if _platform.system() == "Darwin":
@@ -154,10 +155,13 @@ def play_reminder_audio(text: str, reminder_id: int | None = None):
             push_notification_to_sse(sse_event({"type": "audio", "audio": audio_b64, "source": "reminder"}))
             log.info(f"[reminder] 通过SSE推送提醒语音 {len(audio)}字节: {text}")
 
-        # TTS生成成功即完成投递（不等afplay结束，避免调度器超时重试）
+        # 仅直推成功才标记完成；入队/失败保持 pending 等待 ESP32 flush 或重试
         if reminder_id is not None:
             from app.reminders import complete_reminder_delivery
-            complete_reminder_delivery(reminder_id)
+            if delivery == "direct":
+                complete_reminder_delivery(reminder_id)
+            else:
+                log.info(f"[reminder] 提醒{reminder_id}投递状态={delivery}，保持 pending 等待 ESP32 flush")
     except Exception as e:
         log.error(f"[reminder] 播放失败: {e}")
         if reminder_id is not None:
@@ -199,28 +203,73 @@ async def async_push_tts_to_xiaozhi(ws, text: str, mp3_data: bytes):
     except Exception as e:
         log.warning(f"[xiaozhi-push] 推送失败: {e}")
 
-def push_tts_to_xiaozhi(text: str, mp3_data: bytes):
+
+def _https_forward_reminder(text: str, mp3_data: bytes) -> None:
+    """异步线程：将提醒 TTS 转发到 HTTPS 端口（ESP32 可能连 8443）。"""
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        from app.config import https_port
+        _hport = https_port()
+        mp3_b64 = _b64enc.b64encode(mp3_data).decode()
+        r = requests.post(
+            f"https://127.0.0.1:{_hport}/api/internal/xiaozhi-push",
+            json={"text": text, "mp3": mp3_b64},
+            verify=False, timeout=10)
+        if r.status_code in (200, 202):
+            data = r.json()
+            if data.get("pushed", 0) > 0:
+                log.info(f"[xiaozhi-push] HTTPS转发成功({data['pushed']}/{data['total']}): {text[:30]}")
+    except Exception as e:
+        log.debug(f"[xiaozhi-push] HTTPS转发失败: {e}")
+
+
+def push_tts_to_xiaozhi(text: str, mp3_data: bytes) -> str:
     """推送 TTS 到所有连接的 ESP32 设备（从同步线程调用）
-    本进程有连接则直推；无连接时入队待flush + 转发HTTPS进程"""
+    本进程有连接则直推；无连接时入队待 flush + 转发HTTPS进程
+    返回投递状态: "direct" | "enqueued" | "failed"
+    """
     from app.state import snapshot_xiaozhi_clients, enqueue_xiaozhi_pending
     from app.config import https_port
 
+    # 如果正在语音对话 streaming，提醒 TTS 不入队 WS 推送（避免两路音频交错），
+    # 改为只走 afplay（本地播放）+ 入队待 flush。
+    try:
+        from app.xiaozhi_ws import is_xiaozhi_streaming
+        if is_xiaozhi_streaming():
+            log.info("[xiaozhi-push] 对话 streaming 中，提醒 TTS 跳过 WS 推送: %s", text[:30])
+            # 本地 afplay 由 play_reminder_audio 负责；这里只做入队 + HTTPS 转发
+            qsize = enqueue_xiaozhi_pending(text, mp3_data)
+            log.info("[xiaozhi-push] 提醒 TTS 入队待flush(%d): %s", qsize, text[:30])
+            # 仍然尝试 HTTPS 转发（ESP32 可能连 8443）— 异步线程避免阻塞
+            _th = threading.Thread(target=_https_forward_reminder, args=(text, mp3_data), daemon=True)
+            _th.start()
+            return "enqueued"
+    except Exception:
+        pass
+
     # 1. 本进程直推（ESP32 可能连 HTTP 8000）
+    # 等待 future.result() 确认投递成功，避免提醒被误标"已送达"
+    import concurrent.futures as _cf
     clients = snapshot_xiaozhi_clients()
     pushed = 0
     for client_id, info in clients.items():
         ws = info["ws"]
         loop = info["loop"]
         try:
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 async_push_tts_to_xiaozhi(ws, text, mp3_data), loop)
+            future.result(timeout=10)
             pushed += 1
+        except _cf.TimeoutError:
+            future.cancel()  # 阻止 coroutine 继续向 ws 发送，避免与后续 TTS 流交错
+            log.warning(f"[xiaozhi-push] 直推超时 {client_id}: {text[:30]}")
         except Exception as e:
             log.warning(f"[xiaozhi-push] 直推失败 {client_id}: {e}")
 
     if pushed > 0:
         log.info(f"[xiaozhi-push] 直推 {pushed} 个设备: {text[:30]}")
-        return
+        return "direct"
 
     # 2. 本进程无连接 → 尝试 MQTT 直推 + 入队 + HTTPS 转发
     # 2a. MQTT 协议端（ESP32 常驻连接时直接推送，秒级响应）
@@ -228,7 +277,7 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes):
         from app.mqtt_server import push_tts_to_mqtt
         if push_tts_to_mqtt(text, mp3_data):
             log.info(f"[xiaozhi-push] MQTT直推成功: {text[:30]}")
-            return
+            return "direct"
     except Exception:
         pass
 
@@ -236,23 +285,29 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes):
     qsize = enqueue_xiaozhi_pending(text, mp3_data)
     log.info(f"[xiaozhi-push] ESP32未连接，入队({qsize}): {text[:30]}")
 
-    # 3. 同时转发到 HTTPS 进程（ESP32 可能连 8443）
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        _hport = https_port()
-        _lan_ip = _get_lan_ip() or "127.0.0.1"
-        mp3_b64 = _b64enc.b64encode(mp3_data).decode()
-        r = requests.post(
-            f"https://{_lan_ip}:{_hport}/api/internal/xiaozhi-push",
-            json={"text": text, "mp3": mp3_b64},
-            verify=False, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("pushed", 0) > 0:
-                log.info(f"[xiaozhi-push] HTTPS转发成功({data['pushed']}/{data['total']}): {text[:30]}")
-    except Exception as e:
-        log.debug(f"[xiaozhi-push] HTTPS转发失败: {e}")
+    # 3. 异步转发到 HTTPS 进程（ESP32 可能连 8443），不阻塞调度线程
+    import threading as _th
+    _hport = https_port()
+    mp3_b64 = _b64enc.b64encode(mp3_data).decode()
+
+    def _https_forward():
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            r = requests.post(
+                f"https://127.0.0.1:{_hport}/api/internal/xiaozhi-push",
+                json={"text": text, "mp3": mp3_b64},
+                verify=False, timeout=10)
+            if r.status_code in (200, 202):
+                data = r.json()
+                if data.get("pushed", 0) > 0:
+                    log.info(f"[xiaozhi-push] HTTPS转发成功({data['pushed']}/{data['total']}): {text[:30]}")
+        except Exception as e:
+            log.debug(f"[xiaozhi-push] HTTPS转发失败: {e}")
+
+    _th.Thread(target=_https_forward, daemon=True).start()
+
+    return "enqueued"
 
 def _get_lan_ip() -> str | None:
     """获取本机局域网IP (非127.x)"""

@@ -48,6 +48,7 @@ input,select{padding:6px 10px;border:1px solid #333;border-radius:6px;background
   <button onclick="showTab('logs')">日志</button>
   <button onclick="showTab('mcp')">MCP工具</button>
   <button onclick="showTab('tts')">TTS音色</button>
+  <button onclick="showTab('latency')">延迟监控</button>
 </div>
 
 <div id="tab-status"><div class="card"><h3>加载中...</h3></div></div>
@@ -58,6 +59,7 @@ input,select{padding:6px 10px;border:1px solid #333;border-radius:6px;background
 <div id="tab-logs" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
 <div id="tab-mcp" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
 <div id="tab-tts" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
+<div id="tab-latency" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
 
 <script>
 const API = '';
@@ -68,10 +70,8 @@ function showTab(name) {
   document.querySelectorAll('#tabs button').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('[id^="tab-"]').forEach(d => d.style.display = 'none');
   document.getElementById('tab-'+name).style.display = 'block';
-  document.querySelector(`#tabs button:has-text("${name}")`)?.classList?.add('active');
-  // force active on correct button
   document.querySelectorAll('#tabs button').forEach(b => {
-    if (b.textContent.includes({status:'系统状态',memories:'记忆',decisions:'决策',protocols:'协议',evolution:'进化',logs:'日志',mcp:'MCP工具',tts:'TTS音色'}[name])) b.classList.add('active');
+    if (b.textContent.includes({status:'系统状态',memories:'记忆',decisions:'决策',protocols:'协议',evolution:'进化',logs:'日志',mcp:'MCP工具',tts:'TTS音色',latency:'延迟监控'}[name])) b.classList.add('active');
   });
   loadTab(name);
 }
@@ -79,6 +79,12 @@ function showTab(name) {
 async function fetchJSON(url) {
   const r = await fetch(API + url);
   return r.json();
+}
+
+// === XSS 防护：HTML 上下文用 escHtml，JS 字符串上下文用 data-* 属性 + 事件委托 ===
+function escHtml(s) {
+  try { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+  catch(e) { return ''; }
 }
 
 function loadTab(name) {
@@ -91,6 +97,7 @@ function loadTab(name) {
     case 'logs': loadLogs(); break;
     case 'mcp': loadMCP(); break;
     case 'tts': loadTTS(); break;
+    case 'latency': loadLatency(); break;
   }
 }
 
@@ -115,7 +122,7 @@ async function loadStatus() {
       <div>唤醒词: ${(wake.wake_words||[]).join(', ')}</div>
     </div>
     <div class="card">
-      <h3>当前用户: ${user.user_id||'default'}</h3>
+      <h3>当前用户: ${escHtml(user.user_id||'default')}</h3>
       <div class="btn-row">
         <button onclick="switchUser('default')">切换到 default</button>
         <button onclick="switchUser(prompt('用户名:'))">切换用户...</button>
@@ -131,7 +138,7 @@ async function loadStatus() {
 
 async function switchUser(uid) {
   if (!uid) return;
-  await fetch(API + '/api/user/switch?user_id=' + uid, {method:'POST'});
+  await fetch(API + '/api/user/switch?user_id=' + encodeURIComponent(uid), {method:'POST'});
   loadStatus();
 }
 
@@ -143,15 +150,15 @@ async function loadMemories() {
     const html = `
       <div class="card">
         <h3>记忆 (${r.total||0} 条)</h3>
-        <div>标签: ${JSON.stringify(r.tags||{})}</div>
+        <div>标签: ${escHtml(JSON.stringify(r.tags||{}))}</div>
       </div>
       <div class="card">
         <h3>最近记忆</h3>
         ${mems.length ? mems.map(m => `
           <div class="item">
-            <div><span style="color:#a0a0ff">${m.datetime||''}</span> ${m.summary||''}</div>
+            <div><span style="color:#a0a0ff">${escHtml(m.datetime||'')}</span> ${escHtml(m.summary||'')}</div>
             <div class="actions">
-              <button class="danger" onclick="forgetMemory('${(m.summary||'').slice(0,20)}')">删除</button>
+              <button class="danger mem-del" data-query="${escHtml((m.summary||'').slice(0,20))}">删除</button>
             </div>
           </div>
         `).join('') : '<div class="item">暂无记忆</div>'}
@@ -164,6 +171,9 @@ async function loadMemories() {
       </div>
     `;
     document.getElementById('tab-memories').innerHTML = html;
+    document.querySelectorAll('.mem-del').forEach(b => {
+      b.onclick = () => forgetMemory(b.dataset.query || '');
+    });
   } catch(e) {
     document.getElementById('tab-memories').innerHTML = '<div class="card"><h3>记忆系统未就绪</h3></div>';
   }
@@ -172,13 +182,16 @@ async function loadMemories() {
 async function searchMemories() {
   const q = document.getElementById('mem-search').value;
   if (!q) return;
-  const r = await fetchJSON('/api/memory?query=' + q);
+  const r = await fetchJSON('/api/memory?query=' + encodeURIComponent(q));
   const div = document.getElementById('mem-search-results');
-  div.innerHTML = (r.recent||[]).map(m => `<div class="item"><div>${m.summary}</div></div>`).join('') || '无结果';
+  div.innerHTML = (r.recent||[]).map(m => `<div class="item"><div>${escHtml(m.summary||'')}</div><div class="actions"><button class="danger mem-del" data-query="${escHtml((m.summary||'').slice(0,20))}">删除</button></div></div>`).join('') || '无结果';
+  div.querySelectorAll('.mem-del').forEach(b => {
+    b.onclick = () => forgetMemory(b.dataset.query || '');
+  });
 }
 
 async function forgetMemory(q) {
-  await fetch(API + '/api/memory?query=' + q, {method:'DELETE'});
+  await fetch(API + '/api/memory?query=' + encodeURIComponent(q), {method:'DELETE'});
   loadMemories();
 }
 
@@ -191,15 +204,15 @@ async function loadDecisions() {
         <h3>决策规则</h3>
         ${(r.rules||[]).map(rule => `
           <div class="item">
-            <div><span style="color:#a0a0ff">P${rule.priority}</span> ${rule.id} ${rule.confirm?'[需确认]':''}</div>
-            <div class="meta">${rule.condition?.check_desc||''}</div>
+            <div><span style="color:#a0a0ff">P${rule.priority}</span> ${escHtml(rule.id||'')} ${rule.confirm?'[需确认]':''}</div>
+            <div class="meta">${escHtml(rule.condition?.check_desc||'')}</div>
           </div>
         `).join('')}
       </div>
       <div class="card">
         <h3>触发历史</h3>
         ${(r.history||[]).map(h => `
-          <div class="item"><div>${h.rule_id}: ${h.trigger_time}</div></div>
+          <div class="item"><div>${escHtml(h.rule_id||'')}: ${escHtml(h.trigger_time||'')}</div></div>
         `).join('') || '<div class="item">暂无触发记录</div>'}
       </div>
     `;
@@ -219,8 +232,8 @@ async function loadProtocols() {
         <h3>场景协议 (${protos.length} 个)</h3>
         ${protos.map(p => `
           <div class="item">
-            <div><span style="color:#a0a0ff">${p.is_builtin?'[内置]':'[自定义]'}</span> ${p.name}</div>
-            <div class="meta">触发词: ${p.triggers} | ${p.step_count}步</div>
+            <div><span style="color:#a0a0ff">${p.is_builtin?'[内置]':'[自定义]'}</span> ${escHtml(p.name||'')}</div>
+            <div class="meta">触发词: ${escHtml(p.triggers||'')} | ${p.step_count}步</div>
           </div>
         `).join('')}
       </div>
@@ -259,18 +272,18 @@ async function loadEvolution() {
       <div class="card">
         <h3>进化数据</h3>
         <div class="stat"><span class="val">${r.total_conversations||0}</span>对话</div>
-        <div class="stat"><span class="val">${r.response_style||'默认'}</span>回复风格</div>
+        <div class="stat"><span class="val">${escHtml(r.response_style||'默认')}</span>回复风格</div>
         <div class="stat"><span class="val">${r.topic_count||0}</span>话题</div>
       </div>
       <div class="card">
         <h3>用户偏好</h3>
         ${Object.entries(r.preferences||{}).map(([k,v]) => `
-          <div class="item"><div>${k}</div><div class="meta">${v}</div></div>
+          <div class="item"><div>${escHtml(k)}</div><div class="meta">${escHtml(v)}</div></div>
         `).join('') || '<div class="item">暂无偏好数据</div>'}
       </div>
       <div class="card">
         <h3>活跃时段</h3>
-        ${(r.active_hours||[]).join(', ') || '暂无数据'}
+        ${(r.active_hours||[]).map(h => escHtml(String(h))).join(', ') || '暂无数据'}
       </div>
       <div class="btn-row">
         <button onclick="triggerEvolution()">触发学习</button>
@@ -298,11 +311,11 @@ async function loadLogs() {
         <h3>日志查看器</h3>
         <div style="display:flex;gap:8px;margin-bottom:8px">
           <input id="log-lines" type="number" value="100" min="10" max="1000" style="width:80px" placeholder="行数">
-          <input id="log-filter" placeholder="关键词过滤..." value="${filter}" style="flex:1">
+          <input id="log-filter" placeholder="关键词过滤..." value="${escHtml(filter)}" style="flex:1">
           <button onclick="loadLogs()">刷新</button>
         </div>
-        <div style="font-size:10px;color:#888;margin-bottom:4px">${r.file||''} | 共 ${r.total} 行</div>
-        <pre style="font-size:10px;max-height:400px;overflow-y:auto;background:#111;padding:8px;border-radius:4px;line-height:1.4;white-space:pre-wrap;word-break:break-all">${(r.lines||[]).map(l => `<span style="color:#aaa">${l.replace(/</g,'&lt;')}</span>`).join('')}</pre>
+        <div style="font-size:10px;color:#888;margin-bottom:4px">${escHtml(r.file||'')} | 共 ${r.total} 行</div>
+        <pre style="font-size:10px;max-height:400px;overflow-y:auto;background:#111;padding:8px;border-radius:4px;line-height:1.4;white-space:pre-wrap;word-break:break-all">${(r.lines||[]).map(l => `<span style="color:#aaa">${escHtml(l)}</span>`).join('')}</pre>
       </div>
     `;
     document.getElementById('tab-logs').innerHTML = html;
@@ -312,6 +325,7 @@ async function loadLogs() {
 }
 
 // === MCP Tools ===
+// 使用事件委托：data-mcp-id 存储服务器 ID，避免在 onclick 字符串中注入用户可控字段
 async function loadMCP() {
   try {
     const r = await fetchJSON('/api/mcp/servers');
@@ -322,12 +336,12 @@ async function loadMCP() {
           <div class="item">
             <div>
               <span class="status-dot ${s.enabled?'ok':'err'}"></span>
-              <span style="color:#a0a0ff">${s.name}</span>
-              <span class="meta">${s.id}</span>
+              <span style="color:#a0a0ff">${escHtml(s.name||'')}</span>
+              <span class="meta">${escHtml(s.id||'')}</span>
             </div>
             <div style="display:flex;gap:8px;align-items:center">
               <span class="meta">${s.cached?'已缓存':'未加载'}</span>
-              <button class="${s.enabled?'danger':''}" onclick="toggleMCP('${s.id}', ${!s.enabled})" style="font-size:10px;padding:2px 8px">
+              <button class="mcp-toggle ${s.enabled?'danger':''}" data-mcp-id="${escHtml(s.id||'')}" data-mcp-enable="${!s.enabled}" style="font-size:10px;padding:2px 8px">
                 ${s.enabled?'禁用':'启用'}
               </button>
             </div>
@@ -335,7 +349,14 @@ async function loadMCP() {
         `).join('')}
       </div>
     `;
-    document.getElementById('tab-mcp').innerHTML = html;
+    const container = document.getElementById('tab-mcp');
+    container.innerHTML = html;
+    // 事件委托：从 data-mcp-id 读取服务器 ID，不在 JS 字符串中拼接用户可控值
+    container.querySelectorAll('.mcp-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        toggleMCP(btn.dataset.mcpId, btn.dataset.mcpEnable === 'true');
+      });
+    });
   } catch(e) {
     document.getElementById('tab-mcp').innerHTML = '<div class="card"><h3>MCP 系统未就绪</h3></div>';
   }
@@ -351,18 +372,19 @@ async function toggleMCP(serverId, enabled) {
 }
 
 // === TTS Voices ===
+// 使用事件委托：data-voice-id 存储音色 ID，避免在 onclick 字符串中拼接用户可控值
 async function loadTTS() {
   try {
     const r = await fetchJSON('/api/tts/voices');
     const html = `
       <div class="card">
         <h3>TTS 音色切换</h3>
-        <div style="margin-bottom:8px;font-size:12px">当前音色: <strong>${r.current}</strong></div>
+        <div style="margin-bottom:8px;font-size:12px">当前音色: <strong>${escHtml(r.current||'')}</strong></div>
         ${r.voices.map(v => `
-          <div class="item" style="cursor:pointer" onclick="setTTSVoice('${v.id}')">
+          <div class="item tts-voice" data-voice-id="${escHtml(v.id||'')}" style="cursor:pointer">
             <div>
               <span class="status-dot ${v.current?'ok':'err'}"></span>
-              ${v.name}
+              ${escHtml(v.name||'')}
             </div>
             <div>
               ${v.current ? '<span style="color:#22c55e;font-size:10px">✓ 当前</span>' : '<button style="font-size:10px;padding:2px 8px">使用</button>'}
@@ -371,7 +393,13 @@ async function loadTTS() {
         `).join('')}
       </div>
     `;
-    document.getElementById('tab-tts').innerHTML = html;
+    const container = document.getElementById('tab-tts');
+    container.innerHTML = html;
+    container.querySelectorAll('.tts-voice').forEach(el => {
+      el.addEventListener('click', () => {
+        setTTSVoice(el.dataset.voiceId);
+      });
+    });
   } catch(e) {
     document.getElementById('tab-tts').innerHTML = '<div class="card"><h3>TTS 系统未就绪</h3></div>';
   }
@@ -384,6 +412,72 @@ async function setTTSVoice(voiceId) {
     body: JSON.stringify({voice_id: voiceId})
   });
   loadTTS();
+}
+
+// === Latency ===
+function barHtml(name, stats, maxMs) {
+  const pct = maxMs > 0 ? Math.min(100, (stats.avg_ms / maxMs) * 100) : 0;
+  const color = stats.avg_ms < 500 ? '#22c55e' : stats.avg_ms < 2000 ? '#f59e0b' : '#ef4444';
+  return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+    <div style="width:120px;font-size:11px;color:#aaa">${escHtml(name)}</div>
+    <div style="flex:1;height:20px;background:#1a1a2e;border-radius:4px;overflow:hidden">
+      <div style="height:100%;width:${pct}%;background:${color};border-radius:4px;opacity:0.8;transition:width .3s"></div>
+    </div>
+    <div style="width:80px;text-align:right;font-size:11px">
+      <span style="color:#a0a0ff">${Math.round(stats.avg_ms)}ms</span><br>
+      <span style="color:#666">${stats.count}次/${stats.fail}败</span>
+    </div>
+  </div>`;
+}
+
+function statusCard(title, data) {
+  const active = data.remaining_seconds > 0 || data.circuit_open;
+  const color = active ? '#ef4444' : '#22c55e';
+  return `<div style="display:inline-block;margin:4px;padding:8px 12px;border:1px solid #2a2a3e;border-radius:7px;background:#0f0f17">
+    <div style="font-size:11px;color:#888">${escHtml(title)}</div>
+    <div style="font-size:13px;color:${color}">${active ? '熔断中' : '正常'}</div>
+    ${active ? `<div style="font-size:10px;color:#666">剩余 ${Math.round(data.remaining_seconds||0)}s</div>` : ''}
+  </div>`;
+}
+
+async function loadLatency() {
+  try {
+    const [audit, status] = await Promise.all([
+      fetchJSON('/api/audit').catch(() => ({})),
+      fetchJSON('/api/status').catch(() => ({})),
+    ]);
+    const userStats = audit.user || audit;
+    const features = userStats.features || {};
+    const entries = Object.entries(features);
+    const maxMs = entries.length ? Math.max(...entries.map(([, s]) => s.avg_ms || 0)) : 0;
+    const totalCalls = userStats.total || 0;
+    const successCalls = userStats.success || 0;
+    const successRate = totalCalls > 0 ? ((successCalls / totalCalls) * 100).toFixed(1) : '0.0';
+    const bars = entries.length
+      ? entries.map(([name, stats]) => barHtml(name, stats, maxMs)).join('')
+      : '<div class="item">暂无调用数据</div>';
+    const html = `
+      <div class="card">
+        <h3>调用汇总</h3>
+        <div class="stat"><span class="val">${totalCalls}</span>总调用</div>
+        <div class="stat"><span class="val">${successRate}%</span>成功率</div>
+        <div class="stat"><span class="val">${userStats.fail||0}</span>失败</div>
+      </div>
+      <div class="card">
+        <h3>Feature 延迟</h3>
+        ${bars}
+      </div>
+      <div class="card">
+        <h3>熔断状态</h3>
+        ${status.brain_status !== undefined ? statusCard('大脑', status.brain_status) : ''}
+        ${status.tts !== undefined ? statusCard('TTS', status.tts) : ''}
+        ${status.intent_classifier !== undefined ? statusCard('意图分类', status.intent_classifier) : ''}
+      </div>
+    `;
+    document.getElementById('tab-latency').innerHTML = html;
+  } catch(e) {
+    document.getElementById('tab-latency').innerHTML = '<div class="card"><h3>延迟数据加载失败</h3></div>';
+  }
 }
 
 // Start

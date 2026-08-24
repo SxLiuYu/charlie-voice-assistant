@@ -62,14 +62,19 @@ _LOG_DIR = os.environ.get("ASSISTANT_KID_LOG_DIR", os.path.join(PROJECT_DIR, "lo
 TUNNEL_FILE = os.path.join(PROJECT_DIR, "tunnel_url.txt")
 
 os.makedirs(_LOG_DIR, exist_ok=True)
-_file_handler = _loghandlers.RotatingFileHandler(
-    os.path.join(_LOG_DIR, "app.log"), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-_file_handler.setFormatter(_logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-_file_handler.setLevel(_logging.INFO)
-for _lg in (_logging.getLogger(), _logging.getLogger("uvicorn"),
-            _logging.getLogger("uvicorn.error"), _logging.getLogger("uvicorn.access")):
-    _lg.addHandler(_file_handler)
-log.info(f"文件日志已启用: {os.path.join(_LOG_DIR, 'app.log')}")
+if os.environ.get("LOG_FILE_DISABLE") == "1":
+    # https_server 进程设置此变量：避免双进程同写 app.log 导致行重复
+    # （HTTPS 进程日志只走 stdout，由 watchdog 重定向到 voice_https.log）
+    log.info("文件日志已禁用(LOG_FILE_DISABLE=1，HTTPS 进程)")
+else:
+    _file_handler = _loghandlers.RotatingFileHandler(
+        os.path.join(_LOG_DIR, "app.log"), maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    _file_handler.setFormatter(_logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    _file_handler.setLevel(_logging.INFO)
+    for _lg in (_logging.getLogger(), _logging.getLogger("uvicorn"),
+                _logging.getLogger("uvicorn.error"), _logging.getLogger("uvicorn.access")):
+        _lg.addHandler(_file_handler)
+    log.info(f"文件日志已启用: {os.path.join(_LOG_DIR, 'app.log')}")
 
 # ===== 导入拆分后的模块 =====
 from app.audio import MAX_AUDIO_SIZE
@@ -100,7 +105,7 @@ from app.routes.reminders import router as reminders_router
 from app.routes.websocket import router as websocket_router, start_ws_cleanup
 from app.routes.manage import router as manage_router, set_start_time
 from app.http_helpers import weak_etag, if_none_matches, not_modified_response
-from app.xiaozhi_ws import register_xiaozhi_routes
+from app.xiaozhi_ws import register_xiaozhi_routes, _brain_pool
 from tuya_proxy import router as tuya_router
 from voice_agent import LOW_INTENT_ASR_REPLY, is_low_intent_asr
 
@@ -127,6 +132,8 @@ if env_catalog.demo_mode_active():
     log.warning("=== Demo 模式已启用 ===")
     log.warning("未配置 ARK_KEY / GLM_KEY，大脑将使用 Ollama 本地模型。")
     log.warning("推荐: 打开 http://localhost:%d/welcome 引导页" % http_port())
+if not AUTH_TOKEN and os.path.exists(TUNNEL_FILE):
+    log.warning("隧道已启用但未设置 AUTH_TOKEN，管理接口公网裸奔")
 
 try:
     from app.preflight import run_preflight
@@ -156,7 +163,8 @@ async def lifespan(app):
         start_scheduler()
         start_proactive()
         start_evolution()
-        # start_decision_engine()  # 暂停自主决策引擎：防止自动触发 goodnight/leaving_home 场景控制空调
+        if os.getenv("DECISION_ENGINE_ENABLED", "1") == "1":
+            start_decision_engine()
         start_wake_listener()
         start_ws_cleanup()
         _warmup_brain()
@@ -172,6 +180,12 @@ async def lifespan(app):
                 _th.Thread(target=personalized_push_loop, daemon=True).start()
             except Exception:
                 pass
+        # 飞书 WebSocket 长连接（双向对话，无需公网回调地址/事件订阅配置）
+        try:
+            from feishu_ws import start as _start_feishu_ws
+            _start_feishu_ws()
+        except Exception as e:
+            log.warning(f"飞书 WebSocket 长连接启动失败: {e}")
     yield
     log.info("[shutdown] 保存状态并退出...")
     try:
@@ -180,6 +194,18 @@ async def lifespan(app):
     except Exception:
         pass
     _io_pool.shutdown(wait=False, cancel_futures=True)
+    try:
+        _brain_pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+    # MCPManager 是单例，其 clients/processes 全局共享。
+    # 运行期 brain 淘汰不再杀进程（_cleanup_brain_processes 已改为 no-op）；
+    # 此处进程退出时彻底清理，shutdown() 内部正确处理 async cleanup + processes terminate。
+    try:
+        from qwen_agent.tools.mcp_manager import MCPManager
+        MCPManager().shutdown()
+    except Exception:
+        pass
 
 app = FastAPI(title="Charlie语音服务", lifespan=lifespan)
 app.include_router(system_router)
@@ -189,6 +215,8 @@ app.include_router(reminders_router)
 app.include_router(websocket_router)
 app.include_router(manage_router)
 from app.routes import wardrobe_photo as _wardrobe_photo_mod
+from app.routes.feishu import router as feishu_router
+app.include_router(feishu_router)
 app.include_router(_wardrobe_photo_mod.router)
 
 # ===== 全局异常处理 =====
@@ -197,7 +225,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     import traceback as _tb
     tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
     log.error(f"[500] 未处理异常 {request.method} {request.url.path}: {exc}\n{tb}")
-    return JSONResponse({"error": "internal_server_error", "detail": str(exc), "path": request.url.path}, status_code=500)
+    return JSONResponse({"error": "internal_server_error", "detail": None, "path": request.url.path}, status_code=500)
 
 # ===== 请求体大小限制 =====
 @app.middleware("http")
@@ -217,12 +245,19 @@ app.add_middleware(DynamicCORSMiddleware,
     max_age=3600)
 
 # ===== 请求日志 + 认证 + 限流 =====
+# 设备/外部回调端点豁免 header 鉴权：这些路径用各自的方式校验合法性，
+# 不能走全局 Bearer header 校验——否则 ESP32 固件和飞书回调服务器永远拿不到门票。
+#   /xiaozhi/ota         → 设备引导，返回内嵌 token 的 WS 地址（无任何敏感数据）
+#   /ws/xiaozhi          → ESP32 WebSocket，handler 内用 hmac.compare_digest 校验 query token
+#   /api/feishu/webhook  → 飞书事件回调，handler 内用 FEISHU_VERIFICATION_TOKEN 校验
+_DEVICE_OPEN_PATHS = frozenset(("/xiaozhi/ota", "/ws/xiaozhi", "/api/feishu/webhook"))
+
 @app.middleware("http")
 async def request_logger(request: Request, call_next):
     rid = str(uuid.uuid4())[:8]
     start = time.time()
     log.debug(f"[{rid}] {request.method} {request.url.path}")
-    if not _check_auth(request):
+    if request.url.path not in _DEVICE_OPEN_PATHS and not _check_auth(request):
         return JSONResponse({"error": "未授权"}, status_code=401)
     ip = _client_ip(request)
     path = request.url.path

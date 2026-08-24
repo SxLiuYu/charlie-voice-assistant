@@ -73,6 +73,14 @@ def _retry(fn, name: str = "请求") -> Any:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_BACKOFF[attempt])
         except Exception as e:
+            # TTSUnavailableError is a terminal signal (cooldown/rate-limit);
+            # pass it through unchanged so callers can handle it directly.
+            try:
+                from agent.asr_tts import TTSUnavailableError
+                if isinstance(e, TTSUnavailableError):
+                    raise
+            except ImportError:
+                pass
             last_exc = e
             message = _exception_message(e)
             log.warning(f"{name}第{attempt+1}次异常: {message}，{'重试...' if attempt < MAX_RETRIES-1 else '放弃'}")
@@ -86,4 +94,11 @@ def _retry(fn, name: str = "请求") -> Any:
         raise Exception(f"{name}超时: {_exception_message(last_exc)}") from last_exc
     if isinstance(last_exc, requests.exceptions.ConnectionError):
         raise Exception(f"{name}连接失败: {_exception_message(last_exc)}") from last_exc
+    # TTSUnavailableError is terminal — re-raise as-is
+    try:
+        from agent.asr_tts import TTSUnavailableError
+        if isinstance(last_exc, TTSUnavailableError):
+            raise
+    except ImportError:
+        pass
     raise Exception(f"{name}失败: {_exception_message(last_exc)}") from last_exc

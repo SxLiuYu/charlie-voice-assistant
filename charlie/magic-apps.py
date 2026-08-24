@@ -5,6 +5,14 @@
 
 底层 ego-browser 调用已迁移至共享库 ego_lite_client.EgoClient。
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-apps",
+    "tier": "optional",
+    "required_env": [],
+    "label": "常用App浏览器控制"
+}
+
 import json, os, time
 from mcp.server.fastmcp import FastMCP
 from ego_lite_client import EgoClient, EgoError

@@ -2,6 +2,15 @@
 """MCP Server: 红外遥控 — 通过 Tuya OpenClaw API 控制空调/电视等家电
 替代旧版 ESP32 HTTP API 方案。
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "ac-control",
+    "tier": "optional",
+    "required_env": ['TUYA_CLIENT_ID', 'TUYA_ACCESS_KEY'],
+    "label": "空调控制",
+    "disabled": True
+}
+
 import os, json
 from mcp.server.fastmcp import FastMCP
 import logging
@@ -40,24 +49,7 @@ def _get_api():
 def ac_control(action: str, temperature: int = 0, fan_speed: str = "") -> str:
     """[已禁用] 空调控制仅支持语音指令"""
     log.warning(f"[ir] 空调控制已被禁用(仅语音可用): {action}")
-    return "空调控制已禁用，请用语音指令操作（如'打开空调制冷26度'）"
-    else:
-        return f"不支持的动作: {action}"
-    eff_temp = max(16, min(30, temperature if temperature > 0 else 26))
-    wind = None
-    if fan_speed:
-        fs = fan_speed.lower()
-        if fs in FAN_MAP:
-            wind = FAN_MAP[fs]
-        else:
-            return f"不支持的风速: {fan_speed}"
-    try:
-        api.ac_scenes_command(IR_DEVICE_ID, AC_DEVICE_ID, power=power, mode=mode, temp=eff_temp, wind=wind)
-        log.info(f"[ir] 空调控制成功: {action} {eff_temp}度 风速={fan_speed or '自动'}")
-        return f"✅ 空调已{action}，温度 {eff_temp}°C" + (f"，风速 {fan_speed}" if fan_speed else "")
-    except Exception as e:
-        log.error(f"[ir] 空调控制失败: {e}")
-        return f"❌ 控制失败: {e}"
+    return "空调控制已禁用，请用语音指令操作（如'打开空调制冷26度')"
 
 @mcp.tool()
 def ac_status() -> str:

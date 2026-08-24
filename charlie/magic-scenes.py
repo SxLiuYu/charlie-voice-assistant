@@ -8,8 +8,19 @@ v2 改进:
 - learn_protocol() 用 ARK LLM 解析自然语言步骤, 替代关键词匹配
 - execute_protocol() 支持条件分支和步骤间延迟
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-scenes",
+    "tier": "core",
+    "required_env": [],
+    "label": "场景自动化 Protocol 引擎"
+}
+
 from mcp.server.fastmcp import FastMCP
-import os, requests, datetime, subprocess, json as _json, threading, time, logging, re
+import os, requests, datetime as _datetime, subprocess, json as _json, threading, time, logging, re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 log = logging.getLogger("magic")
 
@@ -24,11 +35,11 @@ _BUILTIN_PROTOCOLS = {
     "goodnight": {
         "name": "晚安",
         "triggers": ["晚安", "睡觉", "好梦", "睡了", "我累了", "goodnight"],
-        "auto_trigger": {"state": "home_sleeping"},
+        "auto_trigger": {"state": "home_sleeping", "require_confirm": True},
         "steps": [
             {"action": "ac_sleep", "params": {}},
             {"action": "tv_control", "params": {"action": "power_off"}},
-            {"action": "reminder", "params": {"text": "起床", "time": "tomorrow 08:00"}},
+            {"action": "reminder", "params": {"text": "起床", "time": "明天8点"}},
             {"action": "tts", "params": {"template": "晚安，明天{weather}。"}},
         ],
     },
@@ -53,11 +64,9 @@ _BUILTIN_PROTOCOLS = {
     "leaving_home": {
         "name": "出门",
         "triggers": ["出门", "我走了", "上班了", "leaving"],
-        "auto_trigger": {"state": "away"},
+        "auto_trigger": {"state": "away", "require_confirm": True},
         "steps": [
-            {"action": "ac_control", "params": {"action": "off"}},
-            {"action": "tv_control", "params": {"action": "power_off"}},
-            {"action": "tts", "params": {"template": "出门注意，{weather}。"}},
+            {"action": "tts", "params": {"template": "出门注意，{weather}。如需关空调请说'关闭空调'。"}},
         ],
     },
 }
@@ -109,6 +118,19 @@ def _save_custom_protocol(key: str, protocol: dict):
         except Exception as e:
             log.warning(f"[scenes] 保存自定义协议失败: {e}")
     _protocols_cache = None  # 使缓存失效
+
+
+def check_auto_triggers(user_state: str) -> list[str]:
+    """检查哪些场景的 auto_trigger 匹配当前用户状态，返回待执行的 Protocol key 列表"""
+    protocols = _load_protocols()
+    triggered = []
+    for key, proto in protocols.items():
+        auto = proto.get("auto_trigger")
+        if not auto:
+            continue
+        if auto.get("state") == user_state:
+            triggered.append(key)
+    return triggered
 
 
 def _get_weather() -> str:
@@ -164,37 +186,15 @@ def _get_today_todos() -> list:
     """获取今日待办"""
     try:
         from app.reminders import _load_reminders
-        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        today_str = _datetime.datetime.now().strftime("%Y-%m-%d")
         rems = _load_reminders()
         return [r for r in rems if not r.get("done") and r.get("due", "").startswith(today_str)]
     except Exception:
         return []
 
 
-def _ac_control(action: str) -> str:
-    """控制空调(通过 Tuya 2B 红外云 API 触发红外发码)"""
-    try:
-        from tuya_api import TuyaCloudAPI
-        infrared_id = os.getenv("TUYA_IR_DEVICE_ID", "")
-        remote_id = os.getenv("TUYA_AC_DEVICE_ID", "")
-        if not infrared_id or not remote_id:
-            log.warning("[ac] 红外网关/空调设备ID未配置, TUYA_IR_DEVICE_ID/TUYA_AC_DEVICE_ID")
-            return "空调控制失败(未配置TUYA_IR/AC_DEVICE_ID)"
-        act = action.lower()
-        mode_map = {"cool": 0, "heat": 1, "auto": 2, "fan": 3, "dry": 4}
-        if act == "off":
-            power, mode = 0, None
-        else:
-            power, mode = 1, mode_map.get(act)
-        temp, wind = 26, 1
-        log.info(f"[ac] scenes命令: power={power} mode={mode} temp={temp} wind={wind} (action={action!r})")
-        api = TuyaCloudAPI()
-        api.ac_scenes_command(infrared_id, remote_id, power=power, mode=mode, temp=temp, wind=wind)
-        log.info(f"[ac] scenes指令发送成功: {action}")
-        return f"空调已{action}"
-    except Exception as e:
-        log.warning(f"[ac] scenes控制失败(action={action!r}): {e}")
-        return "空调控制失败"
+def _ac_control(action: str) -> str:  # dead code – kept for import compat only
+    return "空调控制功能已停用"
 
 
 # 睡眠时保留空调的夜间最低温度阈值（℃）：夜间温度 >= 该值则保留空调助眠（热天），
@@ -203,29 +203,30 @@ SLEEP_AC_KEEP_TEMP = int(os.getenv("SLEEP_AC_KEEP_TEMP", "24"))
 
 
 def _ac_sleep() -> str:
-    """睡眠场景的空调处理：根据夜间天气决定关空调或保留。
+    """睡眠场景的空调处理：已禁用自动关空调，只播报建议。
 
-    - 夜间最低温 >= SLEEP_AC_KEEP_TEMP(默认24℃) → 保留空调助眠（热天不能关空调睡）
-    - 夜间最低温 < 阈值 → 关闭空调（凉爽可关）
-    - 天气获取失败 → 保守保留空调（避免热天误关）
+    历史问题：goodnight 场景自动调 _ac_control("off") 关空调，
+    LLM 大脑可通过 magic-scenes MCP 的 execute_scene("goodnight") 触发，
+    导致用户没说话空调也被关。
 
-    返回用于播报与协议结果拼接的自然语言描述。
+    现在：只播报天气建议，不自动操作空调。用户想关空调用语音指令。
     """
+    from agent.preferences import get_preference
+    ac_control_pref = get_preference("sleep_ac_action")  # "leave_alone" / "keep"
+    if ac_control_pref == "leave_alone":
+        return "已按你的偏好，睡眠时不操作空调。"
+    elif ac_control_pref == "keep":
+        return "已按你的偏好，睡眠时保持空调开启。"
+    # else: 默认逻辑继续
     forecast = _get_weather_forecast()
     nighttemp_str = str(forecast.get("nighttemp", "")).strip()
     try:
         nighttemp = int(nighttemp_str)
     except (ValueError, TypeError):
-        log.info(f"[ac] 睡眠空调: 天气数据不可用，保守保留空调助眠")
         return "天气未知，空调保持开启。"
     if nighttemp >= SLEEP_AC_KEEP_TEMP:
-        log.info(f"[ac] 睡眠空调: 夜间{nighttemp}℃≥{SLEEP_AC_KEEP_TEMP}℃，保留空调助眠")
         return f"夜间{nighttemp}度较热，空调保持开启助眠。"
-    log.info(f"[ac] 睡眠空调: 夜间{nighttemp}℃<{SLEEP_AC_KEEP_TEMP}℃，关闭空调")
-    result = _ac_control("off")
-    if "失败" in result:
-        return f"夜间{nighttemp}度凉爽，空调关闭失败。"
-    return f"夜间{nighttemp}度凉爽，已关闭空调。"
+    return f"夜间{nighttemp}度凉爽，如需关空调请说'关闭空调'。"
 
 
 def _tv_control(action: str) -> str:
@@ -298,7 +299,7 @@ def _fill_template(template: str) -> str:
     result = result.replace("{weather}", _get_weather() or "天气未知")
     todos = _get_today_todos()
     result = result.replace("{todo_count}", f"{len(todos)}" if todos else "没有")
-    result = result.replace("{date}", datetime.datetime.now().strftime("%Y年%m月%d日"))
+    result = result.replace("{date}", _datetime.datetime.now().strftime("%Y年%m月%d日"))
     return result
 
 
@@ -327,14 +328,14 @@ def _evaluate_condition(condition: str) -> bool:
             return keyword in weather
         elif condition.startswith("hour_after="):
             h = int(condition.split("=", 1)[1])
-            return datetime.datetime.now().hour >= h
+            return _datetime.datetime.now().hour >= h
         elif condition.startswith("hour_before="):
             h = int(condition.split("=", 1)[1])
-            return datetime.datetime.now().hour < h
+            return _datetime.datetime.now().hour < h
         elif condition == "weekday":
-            return datetime.datetime.now().weekday() < 5
+            return _datetime.datetime.now().weekday() < 5
         elif condition == "weekend":
-            return datetime.datetime.now().weekday() >= 5
+            return _datetime.datetime.now().weekday() >= 5
     except Exception:
         pass
     return False
@@ -364,18 +365,18 @@ def _llm_step(params: dict) -> str:
     - prompt: 提示词 (如 "根据当前时间说一句早安问候")
     - max_tokens: 最大token数 (默认100)
     """
+    from app.llm_config import active_chat_endpoint
+
     prompt = params.get("prompt", "说一句话。")
     max_tokens = int(params.get("max_tokens", 100))
-    ark_key = os.getenv("ARK_KEY", "")
-    ark_base = os.getenv("ARK_BASE", "https://ark.cn-beijing.volces.com/api/plan/v3")
-    ark_model = os.getenv("ARK_MODEL", "ark-code-latest")
-    if not ark_key:
+    base, api_key, model = active_chat_endpoint()
+    if not api_key:
         return _fill_template(params.get("template", "无法生成回复。"))
     try:
-        r = requests.post(f"{ark_base}/chat/completions",
-            headers={"Authorization": f"Bearer {ark_key}", "Content-Type": "application/json"},
+        r = requests.post(f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": ark_model,
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
             }, timeout=10)
@@ -442,11 +443,19 @@ def execute_protocol(key: str) -> str:
 
 @mcp.tool()
 def goodnight() -> str:
-    """晚安模式: 关空调+关电视+播明天天气+设起床提醒
-
-    例: goodnight() → 关空调、关电视、设明天8点起床提醒、播报天气
-    """
-    return execute_protocol("goodnight")
+    """晚安模式: 播明天天气+设起床提醒（空调不再自动关，需语音指令）"""
+    from agent.preferences import get_preference
+    sleep_time = get_preference("sleep_time")
+    result = execute_protocol("goodnight")
+    if sleep_time:
+        try:
+            sleep_hour = int(sleep_time.split(":")[0])
+            now_hour = _datetime.datetime.now().hour
+            if now_hour >= sleep_hour - 1 and now_hour < sleep_hour + 1:
+                return f"现在是{sleep_time}左右，晚安模式已启动。{result}"
+        except (ValueError, IndexError, TypeError):
+            pass
+    return result
 
 
 @mcp.tool()
@@ -469,10 +478,7 @@ def movie_time() -> str:
 
 @mcp.tool()
 def leaving_home() -> str:
-    """出门模式: 关空调+关电视+播报天气
-
-    例: leaving_home() → 关空调、关电视、播报天气
-    """
+    """出门模式: 播报天气提醒（空调/电视不再自动关，需语音指令）"""
     return execute_protocol("leaving_home")
 
 
@@ -480,10 +486,10 @@ def leaving_home() -> str:
 
 def _parse_steps_with_llm(steps_description: str) -> list:
     """用 ARK LLM 将自然语言步骤描述转为结构化步骤列表"""
-    ark_key = os.getenv("ARK_KEY", "")
-    ark_base = os.getenv("ARK_BASE", "https://ark.cn-beijing.volces.com/api/plan/v3")
-    ark_model = os.getenv("ARK_MODEL", "ark-code-latest")
-    if not ark_key:
+    from app.llm_config import active_chat_endpoint
+
+    base, api_key, model = active_chat_endpoint()
+    if not api_key:
         return _parse_steps_keyword(steps_description)
 
     system_prompt = """你是一个场景步骤解析器。将用户的自然语言步骤描述转为JSON数组。
@@ -500,10 +506,10 @@ def _parse_steps_with_llm(steps_description: str) -> list:
 只输出JSON数组, 不要其他文字。"""
 
     try:
-        r = requests.post(f"{ark_base}/chat/completions",
-            headers={"Authorization": f"Bearer {ark_key}", "Content-Type": "application/json"},
+        r = requests.post(f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": ark_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"步骤描述: {steps_description}"},

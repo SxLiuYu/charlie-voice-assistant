@@ -15,7 +15,7 @@ import voice_server
 @pytest.fixture(scope="module")
 def client():
     os.environ["SKIP_BACKGROUND"] = "1"
-    os.environ.setdefault("GLM_KEY", "test")
+    os.environ.setdefault("AGNES_KEY", "test")
     os.environ.setdefault("TTS_KEY", "test")
     os.environ.setdefault("ASR_KEY", "test")
     os.environ.setdefault("AMAP_KEY", "test")

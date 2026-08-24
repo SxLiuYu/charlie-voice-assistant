@@ -15,6 +15,7 @@ from app.auth import _sanitize_text
 from app.http_helpers import sse_event, SSE_DONE_FRAME, SSE_HEARTBEAT_FRAME
 from app.state import (
     _metrics, _RATE_PER_SESSION, _RATE_LOCK, _session_buckets, _RATE_WINDOW,
+    enter_continuous_mode, exit_continuous_mode, refresh_continuous_mode,
 )
 from voice_agent import LOW_INTENT_ASR_REPLY, is_low_intent_asr
 
@@ -114,9 +115,8 @@ async def _synthesize_tts_event(tts_buffer: str):
 async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "default"):
     """流式大脑+TTS生成器(SSE事件流) — 并行版。"""
     from voice_agent import brain_stream_sentences
+    from agent.tts_player import TTSParallelPlayer
     q = _queue.Queue()
-    tts_q = _queue.Queue()
-    brain_thread = None
 
     def brain_worker():
         try:
@@ -135,30 +135,21 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
     brain_thread = threading.Thread(target=brain_worker, daemon=True)
     brain_thread.start()
 
+    # TTS 并行合成 + 顺序播放 (来自 gitee assistant-x-openclaw)
+    player = TTSParallelPlayer(max_workers=2)
     tts_buffer = ""
     tts_failed = False
     first_audio_sent = False
     brain_done = False
-    pending_tts = []
+    pending_seqs: list[int] = []  # seq numbers waiting to be played
     total_wait = 0
     HEARTBEAT_INTERVAL = 0.15
     MAX_WAIT = 120
 
-    def _submit_tts(text_to_synth: str):
-        try:
-            if not text_to_synth or len(text_to_synth) < 2:
-                tts_q.put(("result", text_to_synth, "", None))
-                return
-            audio_b64 = _flush_tts_buffer(text_to_synth)
-            tts_q.put(("result", text_to_synth, audio_b64, None))
-        except Exception as e:
-            try:
-                from agent import asr_tts as _at
-                configured = bool(_at.BAIDU_APP_ID and _at.BAIDU_API_KEY and _at.BAIDU_SECRET_KEY)
-            except Exception:
-                configured = True
-            msg = TTS_DEGRADED_MESSAGE if configured else TTS_UNCONFIGURED_MESSAGE
-            tts_q.put(("error", text_to_synth, None, {"type": "warning", "message": msg}))
+    def _submit_tts(text_to_synth: str) -> int:
+        if not text_to_synth or len(text_to_synth) < 2:
+            return -1
+        return player.submit(text_to_synth, _flush_tts_buffer)
 
     while True:
         brain_item = None
@@ -167,16 +158,13 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
             total_wait = 0
         except _queue.Empty:
             pass
-        tts_result = None
-        try:
-            tts_result = tts_q.get_nowait()
-        except _queue.Empty:
-            pass
+        # Event-driven: await async result instead of polling
+        player_result = await player.async_get_next(timeout=HEARTBEAT_INTERVAL if not brain_item else 0.01)
         if brain_item:
             etype, sentence, full_reply = brain_item
             if etype == "done":
                 brain_done = True
-                if not pending_tts and not tts_buffer.strip():
+                if not pending_seqs and not tts_buffer.strip():
                     yield SSE_DONE_FRAME
                     break
             elif etype == "error":
@@ -192,29 +180,29 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
                         buf = tts_buffer
                         tts_buffer = ""
                         first_audio_sent = True
-                        pending_tts.append(buf)
-                        threading.Thread(target=_submit_tts, args=(buf,), daemon=True).start()
-        if tts_result:
-            rtype, txt, audio_b64, warning = tts_result
-            if rtype == "result" and audio_b64:
-                yield sse_event({"type": "audio", "audio": audio_b64})
-                if txt in pending_tts:
-                    pending_tts.remove(txt)
-            elif rtype == "error":
-                if txt in pending_tts:
-                    pending_tts.remove(txt)
+                        seq = _submit_tts(buf)
+                        if seq >= 0:
+                            pending_seqs.append(seq)
+        if player_result:
+            seq, txt, audio_b64, warning = player_result
+            if warning:
                 if not tts_failed:
                     tts_failed = True
                     yield sse_event(warning)
-        if brain_done and not pending_tts:
+            elif audio_b64:
+                yield sse_event({"type": "audio", "audio": audio_b64})
+                if seq in pending_seqs:
+                    pending_seqs.remove(seq)
+        if brain_done and not pending_seqs:
             if tts_buffer.strip() and not tts_failed:
-                threading.Thread(target=_submit_tts, args=(tts_buffer,), daemon=True).start()
-                pending_tts.append(tts_buffer)
+                seq = _submit_tts(tts_buffer)
+                if seq >= 0:
+                    pending_seqs.append(seq)
                 tts_buffer = ""
-            elif not pending_tts:
+            elif not pending_seqs:
                 yield SSE_DONE_FRAME
                 break
-        if not brain_item and not tts_result:
+        if not brain_item and not player_result:
             if total_wait >= MAX_WAIT:
                 yield sse_event({"type": "error", "message": "思考超时"})
                 yield SSE_DONE_FRAME
@@ -222,6 +210,7 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
             yield SSE_HEARTBEAT_FRAME
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             total_wait += HEARTBEAT_INTERVAL
+    player.stop()
 
 # ===== Routes =====
 
@@ -266,41 +255,51 @@ async def chat_stream_api(req: ChatRequest):
                   action="429", session_id=session_id)
         return JSONResponse({"error": f"请求过于频繁, 请{retry_after}秒后重试"}, status_code=429, headers={"Retry-After": str(retry_after)})
     audit_log("api:chat_stream", input_data=text, action="start", session_id=session_id)
-    return StreamingResponse(_stream_brain_tts(text, session_id=session_id), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    # 连续对话模式
+    if refresh_continuous_mode(session_id):
+        log.debug(f"[api:chat_stream] 连续对话模式续期 (session={session_id[:8]})")
+    else:
+        enter_continuous_mode(session_id)
+    try:
+        return StreamingResponse(_stream_brain_tts(text, session_id=session_id), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    finally:
+        exit_continuous_mode(session_id)
 
 @router.post("/api/voice/stream")
 async def voice_stream_api(request: Request, file: UploadFile = File(...), session_id: str = "default"):
+    import time as _t
     from app.audit_log import audit_log
     audit_log("api:voice_stream", input_data="start", action="start", session_id=session_id)
-    data = await file.read()
-    ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
-    if len(data) > MAX_AUDIO_SIZE:
-        return JSONResponse({"error": f"音频过大({len(data)//1024}KB), 上限{MAX_AUDIO_SIZE//1024//1024}MB"}, status_code=413)
-    wav = to_wav(data, ext)
-    if likely_empty_audio(wav):
-        return StreamingResponse(_empty_asr_events(True), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    from voice_agent import asr
+    # 连续对话模式
+    if refresh_continuous_mode(session_id):
+        log.debug(f"[api:voice_stream] 连续对话模式续期 (session={session_id[:8]})")
+    else:
+        enter_continuous_mode(session_id)
     try:
-        asr_text = await asyncio.wait_for(asyncio.to_thread(asr, wav, "wav"), timeout=30)
-    except asyncio.TimeoutError:
-        return JSONResponse({"error": "语音识别超时"}, status_code=504)
-    except Exception as e:
-        return JSONResponse({"error": f"识别失败: {e}"}, status_code=500)
-    if not asr_text:
-        return StreamingResponse(_empty_asr_events(True), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    if is_low_intent_asr(asr_text):
-        return StreamingResponse(_low_intent_asr_events(asr_text, True), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    from voice_agent import is_garbled_asr
-    if is_garbled_asr(asr_text):
-        return StreamingResponse(_empty_asr_events(True), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    return StreamingResponse(_stream_brain_tts(asr_text, asr_text, session_id=session_id),
-                             media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        data = await file.read()
+        ext = (file.filename or "audio.webm").rsplit(".", 1)[-1].lower()
+        if len(data) > MAX_AUDIO_SIZE:
+            return JSONResponse({"error": f"音频过大({len(data)//1024}KB), 上限{MAX_AUDIO_SIZE//1024//1024}MB"}, status_code=413)
+        log.info(f"/api/voice/stream 收到音频: {len(data)}字节, 格式={ext}")
+        wav = to_wav(data, ext)
+        if likely_empty_audio(wav):
+            return JSONResponse({"text": EMPTY_ASR_TEXT, "reply": EMPTY_ASR_REPLY, "audio": "", "format": "mp3", "degraded": True})
+        from voice_agent import voice_loop
+        try:
+            text, reply, audio_out = await asyncio.wait_for(asyncio.to_thread(voice_loop, wav, "wav"), timeout=60)
+            mp3_out = _wav_to_mp3(audio_out)
+            degraded = not mp3_out
+            audit_log("api:voice_stream", input_data=text, output_data=reply[:100],
+                      action="complete", session_id=session_id, duration_ms=(_t.time()-_start)*1000)
+            return {"text": text, "reply": reply, "audio": _b64enc.b64encode(mp3_out).decode(), "format": "mp3", "degraded": degraded}
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": "处理超时，请重试"}, status_code=504)
+        except Exception as e:
+            from utils import sanitize_error
+            return JSONResponse({"error": sanitize_error(str(e))}, status_code=500)
+    finally:
+        exit_continuous_mode(session_id)
 
 @router.post("/api/chat")
 async def chat_api(req: ChatRequest):

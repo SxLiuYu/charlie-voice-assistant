@@ -30,6 +30,13 @@ def _warmup_brain():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             from voice_agent import _get_brain, _classify_intent, _baidu_get_token, _tts_baidu
+            # 0. 预热 SenseVoice 本地 ASR（首次冷启动 ~528ms，预热后首请求 0ms）
+            try:
+                from agent.asr_tts import _load_sense_voice
+                _load_sense_voice()
+                log.info("[warmup] SenseVoice 本地ASR预热完成")
+            except Exception as e:
+                log.warning(f"[warmup] SenseVoice预热失败(不影响使用): {e}")
             # 1. 预热 ARK 意图分类(prefix-cache初次构建)
             try:
                 _classify_intent("你好")

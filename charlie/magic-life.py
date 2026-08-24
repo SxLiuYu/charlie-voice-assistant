@@ -1,4 +1,12 @@
 """magic-life: 生活服务 (4个工具: 外卖/充电桩/特斯拉空调/出门场景)"""
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-life",
+    "tier": "optional",
+    "required_env": ['ESP32_IP'],
+    "label": "生活服务(外卖/充电桩/特斯拉空调)"
+}
+
 from mcp.server.fastmcp import FastMCP
 from mcp_common import ESP32_IP
 import os, requests

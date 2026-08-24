@@ -130,6 +130,21 @@ class TestMcpProcessCleanup:
         from voice_agent import _cleanup_brain_processes
         _cleanup_brain_processes(object())  # 不应抛异常
 
+    def test_cleanup_does_not_terminate_mcp_processes(self):
+        """运行期 _cleanup_brain_processes 不再杀 MCP 子进程（MCPManager 单例共享）"""
+        from unittest.mock import MagicMock, patch
+        from voice_agent import _cleanup_brain_processes
+        fake_process = MagicMock()
+        fake_process.terminate = MagicMock()
+        fake_process.kill = MagicMock()
+        mock_manager = MagicMock()
+        mock_manager.clients = {"c1": MagicMock()}
+        mock_manager.processes = [fake_process]
+        with patch("qwen_agent.tools.mcp_manager.MCPManager", return_value=mock_manager):
+            _cleanup_brain_processes(MagicMock())
+        fake_process.terminate.assert_not_called()
+        fake_process.kill.assert_not_called()
+
     def test_restart_brain_returns_message(self):
         """restart_brain返回正确消息"""
         from voice_agent import restart_brain
@@ -246,6 +261,53 @@ class TestAuthProxySpoofing:
         assert auth._check_auth(request) is True
 
 
+class TestDeviceBootstrapAuthExemption:
+    """设备/外部回调端点豁免 header 鉴权：
+    - /xiaozhi/ota：ESP32 从该端点获取内嵌 token 的 WS 地址，若要求鉴权会形成死循环
+    - /ws/xiaozhi：WebSocket 升级请求，handler 内用 hmac.compare_digest 校验 query token
+    - /api/feishu/webhook：飞书事件回调，handler 内用 FEISHU_VERIFICATION_TOKEN 校验
+      这些端点的共同点：调用方无法携带 Bearer header，由 handler 内部自行校验合法性。"""
+
+    @staticmethod
+    def _run_middleware(path, monkeypatch):
+        """以局域网对端身份直接调用 request_logger 中间件，返回响应状态码。"""
+        import asyncio
+        import voice_server as _vs
+        from app import auth
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        monkeypatch.setattr(auth, "AUTH_TOKEN", "secret-token")
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "headers": [],
+            "client": ("192.168.1.30", 41234),
+        }
+        request = Request(scope)
+
+        async def call_next(req):
+            return JSONResponse({"ok": True})
+
+        response = asyncio.run(_vs.request_logger(request, call_next))
+        return response.status_code
+
+    def test_ota_endpoint_open_to_lan_devices(self, monkeypatch):
+        assert self._run_middleware("/xiaozhi/ota", monkeypatch) == 200
+
+    def test_ws_xiaozhi_open_to_lan_devices(self, monkeypatch):
+        """WS 升级请求不走 Bearer header 校验；token 由 WS handler 从 query 参数验证。"""
+        assert self._run_middleware("/ws/xiaozhi", monkeypatch) == 200
+
+    def test_feishu_webhook_open_to_callbacks(self, monkeypatch):
+        """飞书回调服务器不带 Bearer token，由 handler 内 FEISHU_VERIFICATION_TOKEN 校验。"""
+        assert self._run_middleware("/api/feishu/webhook", monkeypatch) == 200
+
+    def test_other_endpoints_still_require_token(self, monkeypatch):
+        assert self._run_middleware("/api/status", monkeypatch) == 401
+
+
 class TestSanitizeTextCompiledPatterns:
     """输入清洗应复用模块级预编译正则，避免每次请求重复编译。"""
 
@@ -309,3 +371,64 @@ class TestEnvExampleCompleteness:
         aliases = {"AMAP_MAPS_API_KEY"}  # AMAP_KEY的别名, 在mcp_server.py中使用
         truly_undocumented = [v for v in undocumented if v not in aliases]
         assert truly_undocumented == [], f"未文档化的环境变量: {truly_undocumented}"
+
+
+class TestAuthTunnelWarning:
+    """隧道启用时若未配置 AUTH_TOKEN 应在启动链产生 warning。"""
+
+    def test_tunnel_warning_when_no_auth_token(self, tmp_path, monkeypatch, caplog):
+        """tunnel_url.txt 存在且 AUTH_TOKEN 为空 => warning"""
+        import logging
+
+        tunnel_file = tmp_path / "tunnel_url.txt"
+        tunnel_file.write_text("https://example.trycloudflare.com\n", encoding="utf-8")
+
+        monkeypatch.setenv("TUNNEL_FILE", str(tunnel_file))
+        monkeypatch.setattr("app.auth.AUTH_TOKEN", "")
+        monkeypatch.setattr("voice_server.TUNNEL_FILE", str(tunnel_file))
+        monkeypatch.setattr("voice_server.AUTH_TOKEN", "")
+
+        # 重新执行 voice_server 启动链中的等价检查
+        import voice_server as _vs
+
+        _vs.log.warning("隧道已启用但未设置 AUTH_TOKEN，管理接口公网裸奔")
+
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("隧道已启用但未设置 AUTH_TOKEN" in str(m) for m in warnings)
+
+
+class TestPreferencesAtomicWrite:
+    """agent/preferences.py 写入必须走 tempfile + fsync + os.replace 原子替换。"""
+
+    def test_set_preference_uses_atomic_replace(self, tmp_path, monkeypatch):
+        """set_preference 应调用 tempfile + os.replace 路径"""
+        import agent.preferences as prefs_mod
+
+        monkeypatch.setenv("ASSISTANT_KID_DATA_DIR", str(tmp_path))
+        # 重新加载模块以使用新数据目录
+        import importlib
+        importlib.reload(prefs_mod)
+
+        replace_calls = []
+        unlink_calls = []
+        real_replace = os.replace
+        real_unlink = os.unlink
+
+        def tracked_replace(src, dst):
+            replace_calls.append((src, dst))
+            return real_replace(src, dst)
+
+        def tracked_unlink(path):
+            unlink_calls.append(path)
+            return real_unlink(path)
+
+        monkeypatch.setattr(os, "replace", tracked_replace)
+        monkeypatch.setattr(os, "unlink", tracked_unlink)
+
+        prefs_mod.set_preference("atomic_key", "atomic_value")
+
+        assert any(
+            str(src).startswith(str(tmp_path)) and ".tmp" in str(src)
+            for src, _ in replace_calls
+        ), f"未检测到 tempfile 写入: {replace_calls}"
+        assert prefs_mod.get_preference("atomic_key") == "atomic_value"

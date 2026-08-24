@@ -1,10 +1,10 @@
 """MCP 分层 + key 缺失自动跳过
 
-核心 MCP（8个）：不依赖外部 key，基础能力（时间/提醒/备忘录/系统/摘要/进化/场景/文件）
+核心 MCP（12个）：不依赖外部 key，基础能力（时间/提醒/备忘录/系统/摘要/进化/场景/文件/偏好/记忆/角色/地图）
 可选 MCP（12个）：依赖各自 key 或 binary，缺失自动跳过 + warning
 
 MCP_PROFILE 环境变量控制：
-- core（默认）：仅 8 个核心
+- core（默认）：仅 12 个核心
 - all：核心 + 可选（key 缺失过滤后）
 - custom：读 MCP_SERVERS 自定义列表
 """
@@ -13,53 +13,19 @@ import logging
 
 log = logging.getLogger("magic")
 
-# 核心 MCP（8个）：不依赖外部 key
-CORE_MCP_KEYS = [
-    "magic-info",       # 时间/天气/新闻/翻译/计算（天气需AMAP_KEY但其他不需，混合保留）
-    "magic-reminder",   # 提醒/定时任务
-    "magic-notes",      # 备忘录/购物清单
-    "magic-system",     # 系统控制/音量/语速
-    "magic-summary",    # 对话摘要
-    "magic-evolution",  # 自进化
-    "magic-scenes",     # 场景Protocol（内置4个不需key）
-    "filesystem",       # 文件读写（=magic-notes）
-]
 
-# 可选 MCP（13个）：依赖各自 key 或外部 binary
-OPTIONAL_MCP_KEYS = [
-    "amap-maps",         # = magic-info（重复，可选）
-    "magic-music",       # ncm binary
-    "magic-life",        # ESP32_IP
-    "magic-apps",        # ego-browser
-    "magic-feishu",      # FEISHU_APP_ID/SECRET
-    "magic-douyin",      # ego-browser
-    "magic-taobao",      # ego-browser
-    "magic-wardrobe",    # AMAP_KEY
-    "magic-recipe",      # 本地菜谱（不需key但归可选）
-    "magic-browser",     # ego-browser
-    "magic-jarvis",      # 贾维斯能力（金融/环境/体育，免费无Key）
-    "magic-habits",      # 习惯追踪（无key依赖）
-    "baize-skills",      # TAVILY/ALIYUN
-    # "ac-control",      # 已禁用：空调仅通过语音快路径控制，LLM不可自动调用
-]
+def _load_mcp_meta():
+    """从 mcp_registry 的动态发现结果派生分层信息"""
+    from app.mcp_registry import _discover_mcp_metas
+    metas = _discover_mcp_metas()
+    core = [m["name"] for m in metas if m.get("tier") == "core"]
+    optional = [m["name"] for m in metas if m.get("tier") == "optional"]
+    required_env = {m["name"]: m.get("required_env", []) for m in metas}
+    labels = {m["name"]: m.get("label", m["name"]) for m in metas}
+    return core, optional, required_env, labels
 
-# 每个可选 MCP 需要的 env key（任一缺失则跳过该 MCP）
-REQUIRED_ENV = {
-    "magic-music": [],
-    "magic-life": ["ESP32_IP"],
-    "magic-apps": [],
-    "magic-feishu": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
-    "magic-douyin": [],
-    "magic-taobao": [],
-    "magic-wardrobe": ["AMAP_KEY"],
-    "magic-recipe": [],
-    "magic-browser": [],
-    "magic-jarvis": [],
-    "magic-habits": [],
-    "baize-skills": [],
-    "ac-control": ["TUYA_CLIENT_ID", "TUYA_ACCESS_KEY"],
-    "amap-maps": [],
-}
+
+CORE_MCP_KEYS, OPTIONAL_MCP_KEYS, REQUIRED_ENV, MCP_LABELS = _load_mcp_meta()
 
 
 def _is_configured(key: str) -> bool:

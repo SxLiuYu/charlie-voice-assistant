@@ -2,6 +2,14 @@
 
 通过飞书开放平台API操作，需要配置 FEISHU_APP_ID 和 FEISHU_APP_SECRET。
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-feishu",
+    "tier": "optional",
+    "required_env": ['FEISHU_APP_ID', 'FEISHU_APP_SECRET'],
+    "label": "飞书集成(文档/消息/日历)"
+}
+
 import os, json, requests, time
 from mcp.server.fastmcp import FastMCP
 import logging

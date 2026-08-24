@@ -143,6 +143,42 @@ async def audit_stats(request: Request):
     source = request.query_params.get("source")
     return get_call_stats(source)
 
+@router.get("/api/setup/llm-priority")
+async def llm_priority_status():
+    from app.llm_config import PROVIDERS, _get_priority_list, _is_provider_configured
+    import os
+    priority = _get_priority_list()
+    return {
+        "priority": priority,
+        "providers": [
+            {
+                "name": n,
+                "label": p["label"],
+                "key_env": p["key_env"],
+                "model": os.getenv(p["model_env"], p["default_model"]),
+                "configured": _is_provider_configured(n),
+            }
+            for n, p in PROVIDERS.items()
+        ],
+    }
+
+@router.post("/api/setup/llm-priority")
+async def save_llm_priority(request: Request):
+    from app.audit_log import audit_log
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "JSON 格式错误"}, status_code=400)
+    priority = data.get("priority", [])
+    from app.llm_config import PROVIDERS
+    valid = [p for p in priority if p in PROVIDERS]
+    if not valid:
+        return JSONResponse({"ok": False, "error": "优先级链不能为空"}, status_code=400)
+    _write_env_file(_ENV_FILE, {"LLM_PRIORITY": ",".join(valid)})
+    _reload_runtime_env()
+    audit_log("api:setup:llm_priority", input_data=",".join(valid), action="save")
+    return {"ok": True, "message": "LLM 优先级已保存", "priority": valid}
+
 @router.get("/api/tunnel")
 async def tunnel_status(request: Request):
     cached = file_not_modified_response(request, TUNNEL_FILE, "tunnel")
@@ -206,6 +242,40 @@ async def del_preference_api(key: str):
     msg = del_preference(key)
     audit_log("api:preferences", input_data=key, output_data=msg, action="delete")
     return {"ok": True, "message": msg}
+
+@router.get("/api/roles")
+async def list_roles():
+    """获取所有可用角色"""
+    from agent.roles import get_all_roles, get_current_role
+    roles = get_all_roles()
+    current = get_current_role()
+    return {
+        "current": current,
+        "roles": [
+            {
+                "id": rid,
+                "name": r["name"],
+                "description": r["description"],
+                "wake_words": r.get("wake_words", []),
+            }
+            for rid, r in roles.items()
+        ],
+    }
+
+
+class RoleSwitchRequest(BaseModel):
+    role_id: str = Field(..., min_length=1, max_length=20)
+
+
+@router.post("/api/roles/switch")
+async def switch_role_api(req: RoleSwitchRequest):
+    """切换角色"""
+    from app.audit_log import audit_log
+    from agent.roles import switch_role
+    ok, msg = switch_role(req.role_id)
+    audit_log("api:roles", input_data=req.role_id, output_data=msg, action="switch")
+    return {"ok": ok, "message": msg, "role_id": req.role_id}
+
 
 @router.get("/api/sessions")
 async def list_sessions():
@@ -352,12 +422,37 @@ async def habits_status():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @router.get("/api/memory")
-async def memory_status():
+async def memory_status(request: Request):
+    query = request.query_params.get("query", "").strip()
     try:
         from app import load_magic_module
         _mem = load_magic_module("magic_memory", "magic-memory.py")
-        if _mem:
-            return _mem.get_memory_summary()
+        if not _mem:
+            return {"total": 0, "tags": {}, "recent": []}
+        if query:
+            results = _mem.recall_hybrid(query, k=10)
+            return {
+                "total": len(results),
+                "tags": {},
+                "recent": [{"datetime": m.get("datetime", ""), "summary": m.get("summary", "")} for m in results],
+                "query": query,
+            }
+        return _mem.get_memory_summary()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@router.delete("/api/memory")
+async def memory_delete(request: Request):
+    query = request.query_params.get("query", "").strip()
+    if not query:
+        return JSONResponse({"error": "缺少 query 参数"}, status_code=400)
+    try:
+        from app import load_magic_module
+        _mem = load_magic_module("magic_memory", "magic-memory.py")
+        if not _mem:
+            return JSONResponse({"error": "记忆模块未加载"}, status_code=500)
+        result = _mem.forget(query)
+        return {"ok": True, "message": result}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -378,6 +473,20 @@ def _parse_env_file(path):
     except Exception:
         pass
     return result
+
+def _mask_sensitive(key: str, value: str) -> str:
+    """对敏感配置值做脱敏：以 _KEY/_SECRET/_TOKEN/_PASSWORD 结尾且非空时掩码末4位。"""
+    if not value:
+        return value
+    upper_key = key.upper()
+    if any(
+        upper_key.endswith(suffix)
+        for suffix in ("_KEY", "_SECRET", "_TOKEN", "_PASSWORD")
+    ):
+        if len(value) <= 8:
+            return "******"
+        return f"****{value[-4:]}"
+    return value
 
 def _write_env_file(path, data):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -438,12 +547,58 @@ def _reload_runtime_env():
 
 _SETUP_WHITELIST = set(env_catalog.setup_whitelist_keys())
 
+
+def _verify_openai_compat_key(api_key: str, base: str, label: str) -> tuple[bool, str]:
+    """验证 OpenAI 兼容 API Key（GET /models）"""
+    if not api_key:
+        return False, f"请填入 {label} API Key"
+    try:
+        r = requests.get(f"{base}/models",
+                         headers={"Authorization": f"Bearer {api_key}"},
+                         timeout=8)
+        if r.status_code == 200 and r.json().get("data"):
+            return True, f"{label} Key 验证通过"
+        return False, f"{label} Key 无效: HTTP {r.status_code}"
+    except Exception as e:
+        return False, f"无法连接 {label} 验证服务器（{e}），Key 已保存"
+
+
+def _verify_stepfun_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("STEPFUN_KEY", ""),
+        os.getenv("STEPFUN_LLM_BASE", "https://api.stepfun.com/step_plan/v1"),
+        "StepFun",
+    )
+
+
+def _verify_agnes_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("AGNES_KEY", ""),
+        os.getenv("AGNES_BASE", "https://apihub.agnes-ai.com/v1"),
+        "Agnes",
+    )
+
+
+def _verify_glm_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("GLM_KEY", ""),
+        os.getenv("GLM_BASE", "https://open.bigmodel.cn/api/paas/v4"),
+        "智谱 GLM",
+    )
+
+
+def _verify_ark_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("ARK_KEY", ""),
+        os.getenv("ARK_BASE", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+        "火山 ARK",
+    )
+
 @router.get("/api/welcome/status")
 async def welcome_status():
-    from app.llm_config import ollama_online
     status = env_catalog.render_welcome_status()
     status["has_env"] = os.path.exists(_ENV_FILE)
-    status["ollama_online"] = ollama_online()
+    status["ollama_online"] = False  # Ollama已移除
     return status
 
 @router.get("/api/setup")
@@ -452,6 +607,8 @@ async def get_setup():
     for entry in env_catalog.all_entries():
         if entry.name not in data:
             data[entry.name] = entry.default
+    for key in list(data.keys()):
+        data[key] = _mask_sensitive(key, data[key])
     data["__demo_mode"] = env_catalog.demo_mode_active()
     data["__llm_available"] = env_catalog.llm_available()
     data["__missing_required"] = [e.name for e in env_catalog.missing_required()]
@@ -465,13 +622,13 @@ async def post_setup(request: Request):
     except Exception:
         audit_log("api:setup", input_data="invalid_json", success=False, error="bad_request", action="save")
         return JSONResponse({"ok": False, "error": "请求数据格式错误"}, status_code=400)
-    safe_data = {k: str(v).strip() for k, v in data.items() if k in _SETUP_WHITELIST and str(v).strip()}
+    safe_data = {k: str(v).strip() for k, v in data.items() if k in _SETUP_WHITELIST and str(v).strip() and not str(v).startswith("****")}
     demo_accept = str(data.get("demo_accept", "false")).lower() in ("1", "true", "yes", "on")
     try:
         _write_env_file(_ENV_FILE, safe_data)
         _reload_runtime_env()
         existing = _parse_env_file(_ENV_FILE)
-        llm_ready = bool(existing.get("ARK_KEY")) or bool(existing.get("GLM_KEY"))
+        llm_ready = env_catalog.llm_available()
         audit_log("api:setup", input_data=f"keys={list(safe_data.keys())}", output_data=f"llm_ready={llm_ready}", action="save")
         return {"ok": True, "message": "配置已保存并即时生效", "llm_ready": llm_ready}
     except Exception as e:
@@ -487,17 +644,31 @@ async def verify_setup(request: Request):
         body = {}
     results = {}
     audit_log("api:setup:verify", input_data=f"verify_keys={list(body.keys())}", action="verify")
+    def _check_stepfun():
+        ok, msg = _verify_stepfun_key(body.get("STEPFUN_KEY", ""))
+        results["stepfun"] = {"ok": ok, "message": msg}
+    def _check_agnes():
+        ok, msg = _verify_agnes_key(body.get("AGNES_KEY", ""))
+        results["agnes"] = {"ok": ok, "message": msg}
     def _check_glm():
-        from app import llm_config as _lc
-        ok, msg = _lc.verify_glm_key(body.get("GLM_KEY", ""), body.get("GLM_MODEL", ""))
+        ok, msg = _verify_glm_key(body.get("GLM_KEY", ""))
         results["glm"] = {"ok": ok, "message": msg}
+    def _check_ark():
+        ok, msg = _verify_ark_key(body.get("ARK_KEY", ""))
+        results["ark"] = {"ok": ok, "message": msg}
     def _check_baidu():
         from agent import asr_tts as _at
         ok, msg = _at.verify_baidu_key(body.get("BAIDU_APP_ID", ""), body.get("BAIDU_API_KEY", ""), body.get("BAIDU_SECRET_KEY", ""))
         results["baidu"] = {"ok": ok, "message": msg}
     tasks = []
+    if body.get("STEPFUN_KEY") or env_catalog.is_configured("STEPFUN_KEY"):
+        tasks.append(_check_stepfun)
+    if body.get("AGNES_KEY") or env_catalog.is_configured("AGNES_KEY"):
+        tasks.append(_check_agnes)
     if body.get("GLM_KEY") or env_catalog.is_configured("GLM_KEY"):
         tasks.append(_check_glm)
+    if body.get("ARK_KEY") or env_catalog.is_configured("ARK_KEY"):
+        tasks.append(_check_ark)
     if body.get("BAIDU_API_KEY") or env_catalog.is_configured("BAIDU_API_KEY"):
         tasks.append(_check_baidu)
     loop = asyncio.get_event_loop()
@@ -593,7 +764,10 @@ def _esp32_flash_worker(port):
 async def esp32_config_info():
     lan_ip = _get_lan_ip() or ""
     port = http_port()
-    return {"lan_ip": lan_ip, "http_port": port, "ota_url": f"http://{lan_ip}:{port}/xiaozhi/ota", "ws_url": f"ws://{lan_ip}:{port}/ws/xiaozhi", "ap_prefix": "lc-s3-wifi-1.54tft-", "portal_url": "http://192.168.4.1"}
+    ws_url = f"ws://{lan_ip}:{port}/ws/xiaozhi"
+    if AUTH_TOKEN:
+        ws_url += f"?token={AUTH_TOKEN}"
+    return {"lan_ip": lan_ip, "http_port": port, "ota_url": f"http://{lan_ip}:{port}/xiaozhi/ota", "ws_url": ws_url, "ap_prefix": "lc-s3-wifi-1.54tft-", "portal_url": "http://192.168.4.1"}
 
 @router.get("/api/esp32/flash-status")
 async def esp32_flash_status():
@@ -732,43 +906,51 @@ AVAILABLE_TTS_VOICES = {
     "Cherry": "Cherry - 自然女声", "Stella": "Stella - 温柔女声",
     "Alex": "Alex - 沉稳男声", "Vega": "Vega - 活力女声",
     "Nova": "Nova - 甜美女声", "Echo": "Echo - 中性声",
+    "Ethan": "Ethan - 成熟男声",
 }
 
 @router.get("/api/tts/voices")
 async def list_tts_voices():
-    import voice_agent
-    current = voice_agent.TTS_VOICE
+    import agent.asr_tts
+    # 读 get_effective_tts_config（角色级优先）而非全局 TTS_VOICE：
+    # 角色音色持久化到 preferences.json，重启后全局回退 env 默认值，
+    # 二者会分叉；UI 展示必须与实际合成音色一致
+    current, _ = agent.asr_tts.get_effective_tts_config()
     voices = [{"id": key, "name": desc, "current": key == current} for key, desc in AVAILABLE_TTS_VOICES.items()]
     return {"voices": voices, "current": current}
 
 @router.post("/api/tts/voice")
-async def set_tts_voice(voice_id: str = "Cherry"):
+async def set_tts_voice(request: Request):
     from app.audit_log import audit_log
-    import voice_agent
+    import agent.asr_tts as _at
+    from agent.roles import get_current_role, set_role_tts_voice
+    try:
+        data = await request.json()
+        voice_id = data.get("voice_id", "Cherry")
+    except Exception:
+        voice_id = "Cherry"
     if voice_id not in AVAILABLE_TTS_VOICES:
         audit_log("api:tts_voice", input_data=voice_id, success=False, error="unknown_voice", action="set")
         return JSONResponse({"error": f"未知音色: {voice_id}"}, status_code=400)
-    voice_agent.TTS_VOICE = voice_id
-    voice_agent._tts_cache.clear()
+    _at.TTS_VOICE = voice_id
+    _at._tts_cache.clear()
+    # 同步更新当前激活角色的 tts_voice，使 get_effective_tts_config() 返回新值
+    try:
+        role_id = get_current_role()
+        set_role_tts_voice(role_id, voice_id)
+    except Exception:
+        pass
     audit_log("api:tts_voice", input_data=voice_id, output_data=voice_id, action="set")
     return {"ok": True, "voice": voice_id, "name": AVAILABLE_TTS_VOICES[voice_id]}
 
 # ===== MCP =====
 @router.get("/api/mcp/servers")
 async def list_mcp_servers():
+    from app.mcp_gate import MCP_LABELS
     from voice_agent import _build_brain, _brains
     enabled_env = os.getenv("MCP_SERVERS", "amap-maps,baize-skills,filesystem,magic-music,magic-reminder,magic-notes,magic-system,magic-info,magic-life,magic-scenes,magic-evolution,magic-summary,magic-wardrobe,magic-browser,magic-apps,magic-feishu,magic-douyin,magic-taobao").split(",")
     enabled_env = [s.strip() for s in enabled_env if s.strip()]
-    mcp_servers = {
-        "amap-maps": "高德地图/天气", "magic-info": "信息查询(时间/天气/新闻/翻译)",
-        "magic-music": "音乐播放", "magic-reminder": "提醒/定时器", "magic-notes": "备忘录",
-        "magic-system": "系统控制(音量/语速)", "magic-life": "生活服务(外卖/充电桩)",
-        "magic-scenes": "场景自动化", "magic-apps": "App控制", "magic-feishu": "飞书集成",
-        "magic-douyin": "抖音", "magic-taobao": "淘宝/京东", "magic-evolution": "自进化",
-        "magic-summary": "每日摘要", "magic-wardrobe": "穿搭推荐", "magic-browser": "浏览器控制",
-        "baize-skills": "互联网搜索", "filesystem": "文件系统", "ac-control": "空调控制", "mimo-vision": "视觉识别",
-    }
-    result = [{"id": key, "name": name, "enabled": key in enabled_env, "cached": key in _brains} for key, name in mcp_servers.items()]
+    result = [{"id": key, "name": name, "enabled": key in enabled_env, "cached": key in _brains} for key, name in MCP_LABELS.items()]
     return {"servers": result, "enabled_list": ",".join(enabled_env)}
 
 @router.post("/api/mcp/toggle")
@@ -809,6 +991,15 @@ async def _internal_xiaozhi_push(payload: dict, request: Request):
     if not text or not mp3_b64:
         audit_log("api:xiaozhi_push", success=False, error="missing_params", action="push")
         return {"ok": False, "error": "missing text or mp3"}
+    # 与 push_tts_to_xiaozhi 保持一致：streaming 中不直推 WS，延迟投递
+    try:
+        from app.xiaozhi_ws import is_xiaozhi_streaming
+        if is_xiaozhi_streaming():
+            audit_log("api:xiaozhi_push", input_data=text[:50], action="push",
+                      output_data="deferred: streaming")
+            return JSONResponse({"ok": True, "deferred": True, "reason": "streaming"}, status_code=202)
+    except Exception:
+        pass
     audit_log("api:xiaozhi_push", input_data=text[:50], action="push")
     import base64 as _b64
     from app.state import snapshot_xiaozhi_clients

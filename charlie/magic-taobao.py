@@ -2,6 +2,14 @@
 
 通过淘宝网页版搜索商品信息，无需官方API密钥。
 """
+# --- MCP 元数据（供 mcp_registry 自动发现，用 ast.parse 读取，不执行文件）---
+__mcp_meta__ = {
+    "name": "magic-taobao",
+    "tier": "optional",
+    "required_env": [],
+    "label": "淘宝/京东MCP"
+}
+
 import os, json, requests, re
 from mcp.server.fastmcp import FastMCP
 import logging

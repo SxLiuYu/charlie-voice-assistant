@@ -16,6 +16,71 @@ import agent.asr_tts
 import agent.retry
 
 
+class TestTTSDefaults:
+    def test_tts_cache_max_chars_default_is_200(self):
+        """P0: TTS_CACHE_MAX_CHARS 默认值应为 200，否则长句缓存永远不命中"""
+        assert agent.asr_tts.TTS_CACHE_MAX_CHARS == 200
+
+    def test_tts_cache_max_default_is_200(self):
+        """P0: TTS_CACHE_MAX 默认值应为 200"""
+        assert agent.asr_tts.TTS_CACHE_MAX == 200
+
+
+# ---------- shared fakes for _build_brain unit tests ----------
+class _FakeCreate:
+    def __init__(self):
+        self.calls = []
+    def __call__(self, *args, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise TypeError("Completions.create() got an unexpected keyword argument 'enable_thinking'")
+        return []
+
+
+class _FakeLlm:
+    def __init__(self):
+        self.create = _FakeCreate()
+        self._chat_complete_create = self.create
+    def _conv_qwen_agent_messages_to_oai(self, messages):
+        return [dict(m) for m in messages]
+
+
+class _FakeMem:
+    def __init__(self, llm):
+        self.llm = llm
+
+
+class _FakeAssistant:
+    def __init__(self, **kwargs):
+        self.llm = _FakeLlm()
+        self.mem = _FakeMem(self.llm)
+        self.function_list = kwargs.get("function_list", [])
+
+
+class _FakeMemory:
+    percent = 50
+    total = 17179869184
+    available = 8589934592
+
+
+_fake_qwen_agent = types.ModuleType("qwen_agent")
+_fake_qwen_agents = types.ModuleType("qwen_agent.agents")
+_fake_qwen_agents.Assistant = _FakeAssistant
+_fake_modules = {
+    "qwen_agent": _fake_qwen_agent,
+    "qwen_agent.agents": _fake_qwen_agents,
+}
+_fake_psutil = types.ModuleType("psutil")
+_fake_psutil.virtual_memory = lambda: _FakeMemory()
+
+
+def _build_brain_fake_modules():
+    return _fake_modules.copy(), _fake_psutil
+
+
+# -------------------------------------------------------------
+
+
 def _sync_agent_state():
     """Sync voice_agent module attributes back to agent.* modules.
     Tests monkeypatch voice_agent.* but the functions now live in agent.* modules."""
@@ -310,6 +375,37 @@ class TestCleanForTTS:
         result = voice_agent._clean_for_tts("你好世界")
         assert result == "你好世界"
 
+    def test_normalize_digits_with_units(self):
+        """数字归一化：带单位的中文读法转换"""
+        # 个位数
+        assert voice_agent._clean_for_tts("下午3点") == "下午三点"
+        # 10-19 特殊处理
+        assert voice_agent._clean_for_tts("10度") == "十度"
+        # 整十
+        assert voice_agent._clean_for_tts("20分") == "二十分"
+        # 十几非零尾数
+        assert voice_agent._clean_for_tts("15秒") == "十五秒"
+        # 两位数非整十
+        assert voice_agent._clean_for_tts("23楼") == "二十三楼"
+        # 个位+岁
+        assert voice_agent._clean_for_tts("今年18岁") == "今年十八岁"
+        # 无单位数字不变
+        assert voice_agent._clean_for_tts("123") == "123"
+        # 块/号
+        assert voice_agent._clean_for_tts("3号") == "三号"
+        assert voice_agent._clean_for_tts("5块") == "五块"
+
+    def test_normalize_digits_does_not_over_normalize(self):
+        """不在单位列表中的数字不应被转换"""
+        result = voice_agent._clean_for_tts("我有3个苹果")
+        assert result == "我有3个苹果"
+
+    def test_normalize_digits_preserves_markdown_cleaning(self):
+        """数字归一化在 markdown 清理之后执行"""
+        result = voice_agent._clean_for_tts("**下午3点**")
+        assert result == "下午三点"
+
+
     def test_clean_for_tts_reuses_compiled_patterns(self, monkeypatch):
         """TTS热路径复用预编译正则，避免每个片段重复编译。"""
         import re
@@ -345,7 +441,8 @@ class TestBuildSystemMsg:
         """包含角色定义"""
         msg = voice_agent._build_system_msg()
         assert "Charlie" in msg
-        assert "私人AI助理" in msg
+        # 角色切换后，默认 charlie 角色的 system prompt 使用「智能语音助手」
+        assert "智能语音助手" in msg or "私人AI助理" in msg
 
     def test_contains_tools(self):
         """工具说明按需注入: 指定MCP时包含工具文档"""
@@ -380,8 +477,12 @@ class TestBuildSystemMsg:
 
         msg = voice_agent._build_system_msg()
 
-        assert calls == {"load": 1, "open": 0}
-        assert "今日有1项待办" in msg
+        # 核心安全断言：不得直接 open(reminders.json)，必须走 _load_reminders
+        assert calls["open"] == 0
+        # _load_reminders 至少被调用一次（context 复用此加载器）
+        assert calls["load"] >= 1
+        # 待办通过 format_context_for_prompt 注入（格式：今日待办：...）
+        assert "今日待办" in msg
 
 
 class TestBrainStreamSentences:
@@ -401,6 +502,7 @@ class TestBrainStreamSentences:
         ])
 
         with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", return_value=mock_brain):
             voice_agent.reset_history()
             sentences = list(voice_agent.brain_stream_sentences("你好"))
@@ -415,6 +517,7 @@ class TestBrainStreamSentences:
     def test_stream_brain_not_built(self):
         """大脑未构建且无法构建时返回错误"""
         with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", side_effect=Exception("mock build failed")):
                 sentences = list(voice_agent.brain_stream_sentences("test"))
                 assert len(sentences) >= 1
@@ -467,6 +570,33 @@ class TestBrainStreamSentences:
         assert second[-1][1] == "明天日程是上午十点开会。"
         assert mock_brain.run.call_count == 2
 
+    def test_stream_scene_protocol_extracts_memory(self):
+        """场景协议触发时应在返回前提取记忆。"""
+        mock_scenes = MagicMock()
+        mock_scenes.match_protocol.return_value = "goodnight"
+        mock_scenes.execute_protocol.return_value = "晚安模式已启动"
+
+        with patch("agent.llm._classify_intent", return_value="magic-scenes"), \
+             patch("agent.llm._get_brain", side_effect=Exception("should not build brain")), \
+             patch("app.load_magic_module", return_value=mock_scenes):
+            voice_agent.reset_history()
+            sentences = list(voice_agent.brain_stream_sentences("晚安"))
+
+        assert len(sentences) >= 1
+        assert "晚安" in sentences[0][0]
+        mock_scenes.execute_protocol.assert_called_once_with("goodnight")
+
+    def test_stream_brain_build_failure_extracts_memory(self):
+        """大脑构建失败时应在返回错误前提取记忆。"""
+        with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
+             patch("agent.llm._get_brain", side_effect=Exception("mock build failed")), \
+             patch("agent.llm._remember_conversation_async") as mock_remember:
+            sentences = list(voice_agent.brain_stream_sentences("test"))
+            assert len(sentences) >= 1
+            assert "失败" in sentences[0][0] or "未" in sentences[0][0]
+        mock_remember.assert_called_once_with("test", sentences[0][0])
+
 
 class TestOpenAICompat:
     """OpenAI SDK 与上游模型私有参数的兼容层。"""
@@ -497,56 +627,52 @@ class TestOpenAICompat:
             wrapped(model="deepseek", messages=[])
 
     def test_build_brain_installs_compat_wrapper(self):
-        class FakeCreate:
-            def __init__(self):
-                self.calls = []
-
-            def __call__(self, *args, **kwargs):
-                self.calls.append(kwargs)
-                if len(self.calls) == 1:
-                    raise TypeError("Completions.create() got an unexpected keyword argument 'enable_thinking'")
-                return []
-
-        class FakeLlm:
-            def __init__(self):
-                self.create = FakeCreate()
-                self._chat_complete_create = self.create
-
-            def _conv_qwen_agent_messages_to_oai(self, messages):
-                return [dict(m) for m in messages]
-
-        class FakeMem:
-            def __init__(self, llm):
-                self.llm = llm
-
-        class FakeAssistant:
-            def __init__(self, **kwargs):
-                self.llm = FakeLlm()
-                self.mem = FakeMem(self.llm)
-
-        class FakeMemory:
-            percent = 50
-            total = 17179869184
-            available = 8589934592
-
-        fake_psutil = type("FakePsutil", (), {"virtual_memory": staticmethod(lambda: FakeMemory())})
-
-        fake_qwen_agent = types.ModuleType("qwen_agent")
-        fake_qwen_agents = types.ModuleType("qwen_agent.agents")
-        fake_qwen_agents.Assistant = FakeAssistant
-        fake_modules = {
-            "qwen_agent": fake_qwen_agent,
-            "qwen_agent.agents": fake_qwen_agents,
-        }
-
-        with patch.dict(sys.modules, fake_modules), \
-             patch.dict(sys.modules, {"psutil": fake_psutil}):
+        with patch.dict(sys.modules, _fake_modules), \
+             patch.dict(sys.modules, {"psutil": _fake_psutil}):
             brain = voice_agent._build_brain("none")
 
         assert brain.llm._chat_complete_create is not brain.llm.create
         assert brain.mem.llm._chat_complete_create is brain.llm._chat_complete_create
         assert brain.llm._chat_complete_create(model="deepseek", messages=[], enable_thinking=False) == []
         assert brain.llm.create.calls[1]["extra_body"] == {"enable_thinking": False}
+
+    def test_none_brain_mcp_list_excludes_jarvis_includes_preferences(self):
+        """none brain 应含 magic-preferences，但不应含 magic-jarvis"""
+        with patch.dict(sys.modules, _fake_modules), \
+             patch.dict(sys.modules, {"psutil": _fake_psutil}):
+            brain = voice_agent._build_brain("none")
+
+        mcps = brain.function_list[0]["mcpServers"] if brain.function_list else {}
+        assert "magic-preferences" in mcps, "none brain 应始终注入 magic-preferences"
+        assert "magic-jarvis" not in mcps, "none brain 不应注入 magic-jarvis（避免闲聊延迟）"
+
+    def test_non_none_brain_mcp_list_includes_jarvis(self):
+        """非 none brain（如 all）应同时含 preferences 和 jarvis"""
+        with patch.dict(sys.modules, _fake_modules), \
+             patch.dict(sys.modules, {"psutil": _fake_psutil}):
+            brain = voice_agent._build_brain("all")
+
+        mcps = brain.function_list[0]["mcpServers"] if brain.function_list else {}
+        assert "magic-preferences" in mcps
+        assert "magic-jarvis" in mcps, "非 none brain 应注入 magic-jarvis"
+
+    def test_brain_cache_evicts_oldest_when_full(self):
+        """_get_brain 缓存达到上限时应淘汰最旧条目"""
+        import agent.llm as _llm_mod
+        with patch.dict(sys.modules, _fake_modules), \
+             patch.dict(sys.modules, {"psutil": _fake_psutil}):
+            # 填满缓存（上限由 _BRAIN_CACHE_MAX 决定）
+            cache_max = _llm_mod._BRAIN_CACHE_MAX
+            keys = [f"set{i}" for i in range(cache_max)]
+            for k in keys:
+                voice_agent._get_brain(k)
+            assert len(voice_agent._brains) == cache_max
+            # 再建一个应淘汰 set0
+            voice_agent._get_brain(f"set{cache_max}")
+            assert len(voice_agent._brains) == cache_max
+            assert f"set0" not in voice_agent._brains
+            assert f"set{cache_max}" in voice_agent._brains
+        voice_agent.restart_brain()
 
 
 class TestRetry:
@@ -617,18 +743,19 @@ class TestIntentClassification:
     def test_consecutive_local_intent_failures_trip_short_circuit(self):
         # 用不含领域关键词的长句, 绕过关键词/短句短路, 走真实LLM分类通道
         sentence = "顺带给我讲讲古筝这几种流派的发展脉络"
-        with patch("agent.llm.INTENT_FAILURE_THRESHOLD", 2), \
+        with patch("agent.llm.INTENT_FAILURE_THRESHOLD", 1), \
              patch("agent.llm.INTENT_FAILURE_COOLDOWN", 30), \
              patch.object(voice_agent.time, "time", return_value=100.0), \
              patch.object(voice_agent._session, "post", side_effect=requests.exceptions.Timeout("slow")) as mock_post:
             voice_agent._intent_cache.clear()
             assert voice_agent._classify_intent(sentence) == "none"
-            # 第一次调用触发 ARK + Ollama 降级共2次请求, 失败2次达到阈值后熔断
-            assert mock_post.call_count == 2
+            # 本地分类失败后直接降级 none（Ollama retry 已移除），共1次请求
+            assert mock_post.call_count == 1
+            # 阈值=1，失败1次即熔断
             assert voice_agent._intent_disabled_until == 130.0
             # 熔断生效后不再打上游
             assert voice_agent._classify_intent(sentence) == "none"
-            assert mock_post.call_count == 2
+            assert mock_post.call_count == 1
 
     def test_successful_intent_classification_resets_failure_state(self):
         import agent.llm_state
@@ -639,7 +766,8 @@ class TestIntentClassification:
         }
 
         with patch.object(voice_agent._session, "post", return_value=response):
-            assert voice_agent._classify_intent("顺便讲讲今天路况怎么样") == "amap-maps"
+            # 句子须 >15 字且不含域名关键词，才能穿过短句闲聊跳过逻辑到达 LLM 分类
+            assert voice_agent._classify_intent("顺便给我讲讲今天的路况怎么样好不好呀") == "amap-maps"
 
         assert voice_agent._intent_failures == 0
 
@@ -725,39 +853,31 @@ class TestTTSCache:
         agent.asr_tts._tts_cache.clear()
         voice_agent._tts_unavailable_until = 0.0
         agent.asr_tts._tts_unavailable_until = 0.0
-        from subprocess import CompletedProcess
 
-        wav = b"wav-audio-bytes" + b"x" * 120
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
-        with patch.object(agent.asr_tts, "tts", return_value=wav) as mock_tts, \
-             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)) as mock_ffmpeg, \
+        audio = b"tts-audio-bytes" + b"x" * 120
+        with patch.object(agent.asr_tts, "tts", return_value=audio) as mock_tts, \
              patch.object(agent.asr_tts, "_LOCAL_TTS_ENABLED", False):
             first = voice_agent.tts_to_mp3("提醒时间到了")
             second = voice_agent.tts_to_mp3(" 提醒时间到了 ")
 
-        assert first == mp3
-        assert second == mp3
+        assert first == audio
+        assert second == audio
         mock_tts.assert_called_once_with("提醒时间到了")
-        mock_ffmpeg.assert_called_once()
         voice_agent._tts_cache.clear()  # 清残留, 后续test从空缓存开始
 
     def test_public_tts_to_mp3_cleans_markdown_before_synthesis(self):
-        from subprocess import CompletedProcess
-
-        wav = b"wav-audio-bytes" + b"x" * 120
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
-        with patch.object(agent.asr_tts, "tts", return_value=wav) as mock_tts, \
-             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)):
+        audio = b"tts-audio-bytes" + b"x" * 120
+        with patch.object(agent.asr_tts, "tts", return_value=audio) as mock_tts:
             result = voice_agent.tts_to_mp3("## 标题 **粗体**")
 
-        assert result == mp3
+        assert result == audio
         mock_tts.assert_called_once_with("标题 粗体")
 
     def test_tts_cache_path_does_not_reclean_already_cleaned_text(self, monkeypatch):
-        from subprocess import CompletedProcess
-
-        wav = b"wav-audio-bytes" + b"x" * 120
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        _sync_agent_state()
+        voice_agent._tts_cache.clear()
+        agent.asr_tts._tts_cache.clear()
+        audio = b"tts-audio-bytes" + b"x" * 120
         original_clean = voice_agent._clean_for_tts
         calls = []
 
@@ -766,39 +886,31 @@ class TestTTSCache:
             return original_clean(text)
 
         monkeypatch.setattr(agent.asr_tts, "_clean_for_tts", counting_clean)
-        with patch.object(agent.asr_tts, "tts", return_value=wav) as mock_tts, \
-             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)) as mock_ffmpeg, \
+        with patch.object(agent.asr_tts, "tts", return_value=audio) as mock_tts, \
              patch.object(agent.asr_tts, "_LOCAL_TTS_ENABLED", False):
             voice_agent.tts_to_mp3("提醒时间到了")
             voice_agent.tts_to_mp3("提醒时间到了")
 
         assert calls == ["提醒时间到了", "提醒时间到了"]
         mock_tts.assert_called_once_with("提醒时间到了")
-        mock_ffmpeg.assert_called_once()
 
     def test_failed_tts_is_not_cached(self):
-        from subprocess import CompletedProcess
-
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        audio = b"tts-audio-bytes" + b"x" * 120
         with patch.object(agent.asr_tts, "tts", side_effect=[
                     voice_agent.TTSUnavailableError("TTSHTTP异常: 429"),
-                    b"wav-two" + b"x" * 120,
-                ]) as mock_tts, \
-             patch("subprocess.run", return_value=CompletedProcess([], 0, stdout=mp3)) as mock_ffmpeg:
+                    audio,
+                ]) as mock_tts:
             with pytest.raises(voice_agent.TTSUnavailableError):
                 voice_agent.tts_to_mp3("重试这段")
             second = voice_agent.tts_to_mp3("重试这段")
 
-        assert second.startswith(b"mp3-audio-bytes")
+        assert second == audio
         assert mock_tts.call_count == 2
-        mock_ffmpeg.assert_called_once()
 
     def test_long_tts_is_not_cached(self):
-        wav = b"wav-audio-bytes" + b"x" * 120
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        audio = b"tts-audio-bytes" + b"x" * 120
         long_text = "很" * (voice_agent.TTS_CACHE_MAX_CHARS + 1)
-        with patch.object(agent.asr_tts, "tts", return_value=wav) as mock_tts, \
-             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+        with patch.object(agent.asr_tts, "tts", return_value=audio) as mock_tts:
             voice_agent.tts_to_mp3(long_text)
             voice_agent.tts_to_mp3(long_text)
 
@@ -806,46 +918,43 @@ class TestTTSCache:
         assert voice_agent._tts_cache == {}
 
     def test_cache_key_includes_voice_and_model(self):
-        wav = b"wav-audio-bytes" + b"x" * 120
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
-        with patch.object(agent.asr_tts, "tts", return_value=wav) as mock_tts, \
-             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+        audio = b"tts-audio-bytes" + b"x" * 120
+        with patch.object(agent.asr_tts, "tts", return_value=audio) as mock_tts, \
+             patch.object(agent.asr_tts, "get_effective_tts_config", side_effect=[
+                 ("Cherry", 1.0), ("Serena", 1.0), ("Alex", 1.0)
+             ]):
             voice_agent.tts_to_mp3("同一句话")
-            with patch.object(agent.asr_tts, "TTS_VOICE", "Serena"):
-                voice_agent.tts_to_mp3("同一句话")
-            with patch.object(agent.asr_tts, "TTS_MODEL", "another-tts-model"):
-                voice_agent.tts_to_mp3("同一句话")
+            voice_agent.tts_to_mp3("同一句话")
+            voice_agent.tts_to_mp3("同一句话")
 
         assert mock_tts.call_count == 3
 
     def test_cache_respects_ttl(self):
-        wav = b"wav-audio-bytes" + b"x" * 120
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        audio = b"tts-audio-bytes" + b"x" * 120
         with patch.object(agent.asr_tts, "TTS_CACHE_TTL", 0.01), \
-             patch.object(agent.asr_tts, "tts", return_value=wav) as mock_tts, \
-             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+             patch.object(agent.asr_tts, "tts", return_value=audio) as mock_tts, \
+             patch.object(agent.asr_tts, "get_effective_tts_config", return_value=("Cherry", 1.0)):
             voice_agent.tts_to_mp3("第一句")
-            assert voice_agent._tts_cache_get("第一句") == mp3
+            assert voice_agent._tts_cache_get("第一句", "Cherry", voice_agent.TTS_MODEL) == audio
             time.sleep(0.02)
-            assert voice_agent._tts_cache_get("第一句") is None
+            assert voice_agent._tts_cache_get("第一句", "Cherry", voice_agent.TTS_MODEL) is None
             voice_agent.tts_to_mp3("第一句")
 
         assert mock_tts.call_count == 2
 
     def test_cache_respects_max_size(self):
-        wav = b"wav-audio-bytes" + b"x" * 120
-        mp3 = b"mp3-audio-bytes" + b"x" * 120
+        audio = b"tts-audio-bytes" + b"x" * 120
         with patch.object(agent.asr_tts, "TTS_CACHE_MAX", 2), \
-             patch.object(agent.asr_tts, "tts", return_value=wav) as mock_tts, \
-             patch("subprocess.run", return_value=MagicMock(stdout=mp3)):
+             patch.object(agent.asr_tts, "tts", return_value=audio) as mock_tts, \
+             patch.object(agent.asr_tts, "get_effective_tts_config", return_value=("Cherry", 1.0)):
             voice_agent.tts_to_mp3("第一句")
             voice_agent.tts_to_mp3("第二句")
             voice_agent.tts_to_mp3("第三句")
             voice_agent.tts_to_mp3("第三句")
 
         assert mock_tts.call_count == 3
-        assert voice_agent._tts_cache_get("第一句") is None
-        assert voice_agent._tts_cache_get("第三句", "Cherry", voice_agent.TTS_MODEL) == mp3
+        assert voice_agent._tts_cache_get("第一句", "Cherry", voice_agent.TTS_MODEL) is None
+        assert voice_agent._tts_cache_get("第三句", "Cherry", voice_agent.TTS_MODEL) == audio
 
 
 class TestTTSFailureCooldown:
@@ -1187,6 +1296,7 @@ class TestTimestamps:
              {"role": "assistant", "content": "reply"}]
         ])
         with patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
              patch("agent.llm._get_brain", return_value=mock_brain):
             voice_agent.brain("test")
         

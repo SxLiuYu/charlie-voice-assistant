@@ -88,10 +88,13 @@ class TestMagicMemory:
         assert "下周三" in results[0].get("summary", "")
 
     def test_memory_dedup(self):
-        self.mem.remember_conversation("我在做项目", "加油")
-        self.mem.remember_conversation("我在做项目", "加油")
+        # remember_conversation 应在写入时做 bigram 去重，重复文本不应二次入库
+        n1 = self.mem.remember_conversation("我在做项目", "加油")
+        n2 = self.mem.remember_conversation("我在做项目", "加油")
+        assert n1 >= 1
+        assert n2 == 0  # 重复内容被去重
         removed = self.mem.dedup_memories()
-        assert removed >= 1  # Should find and merge duplicates
+        assert removed == 0  # 无残留重复
 
 
 # ===== magic-decisions tests =====
@@ -190,7 +193,7 @@ class TestMagicScenes:
         assert "28" in msg
 
     def test_ac_sleep_cool_night_turns_off(self):
-        """凉爽夜间(<24℃)关闭空调。"""
+        """凉爽夜间(<24℃)不再自动关空调，只播报建议。"""
         def cool_forecast():
             return {"dayweather": "多云", "nightweather": "多云", "daytemp": "22", "nighttemp": "18"}
         calls = []
@@ -200,9 +203,9 @@ class TestMagicScenes:
             msg = self.sc._ac_sleep()
         finally:
             self.sc._ac_control = lambda action: "空调已off"
-        assert calls == ["off"]
-        assert "已关闭空调" in msg
+        assert calls == []  # 不再自动关空调
         assert "18" in msg
+        assert "关空调" in msg  # 提示用户手动关
 
     def test_ac_sleep_no_weather_keeps_ac(self):
         """天气数据不可用时保守保留空调，不误关。"""

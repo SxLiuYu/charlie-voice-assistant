@@ -11,19 +11,28 @@ from contextlib import contextmanager
 log = logging.getLogger("magic")
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", PROJECT_DIR)
+
+def _get_data_dir() -> str:
+    """动态读取 DATA_DIR，避免模块级冻结导致测试隔离失败"""
+    return os.environ.get("ASSISTANT_KID_DATA_DIR", PROJECT_DIR)
+
+def _get_reminders_file() -> str:
+    return os.path.join(_get_data_dir(), "reminders.json")
+
+def _get_suggestions_state_file() -> str:
+    return os.path.join(_get_data_dir(), "suggestions_state.json")
 
 # 项目根 = app/ 的上级目录(与voice_server.py同层)；测试可通过 ASSISTANT_KID_DATA_DIR 隔离。
-REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
+REMINDERS_FILE = _get_reminders_file()
 REMINDERS_LOCK_FILE = REMINDERS_FILE + ".lock"
 SCHEDULER_LOCK_FILE = REMINDERS_FILE + ".scheduler.lock"
-SUGGESTIONS_STATE_FILE = os.path.join(DATA_DIR, "suggestions_state.json")
+SUGGESTIONS_STATE_FILE = _get_suggestions_state_file()
 PROACTIVE_LOCK_FILE = SUGGESTIONS_STATE_FILE + ".runner.lock"
-DECISION_LOCK_FILE = os.path.join(DATA_DIR, "decision_engine.runner.lock")
+DECISION_LOCK_FILE = os.path.join(_get_data_dir(), "decision_engine.runner.lock")
 DELIVERY_RETRY_DELAYS = [60, 180, 600]
 DELIVERY_CLAIM_TIMEOUT = 900  # 秒；播报线程崩溃后允许重新申领
 
-os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(_get_data_dir(), exist_ok=True)
 
 
 @contextmanager
@@ -41,6 +50,7 @@ def _acquire_file_lock(lock_path: str, log_prefix: str):
     """非阻塞获取机器级 flock；失败返回 None，不等待其他进程释放。"""
     lock_file = None
     try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         lock_file = open(lock_path, "a+", encoding="utf-8")
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lock_file.seek(0)
@@ -87,7 +97,7 @@ def _lock_status(lock_path: str) -> dict:
             locked = False
         else:
             try:
-                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 locked = False
             except BlockingIOError:
                 locked = True
@@ -204,6 +214,18 @@ def _load_reminders():
         return _read_locked_reminders()
 
 
+def list_reminders(include_completed: bool = False) -> list:
+    """返回提醒列表，按 due 升序。
+
+    include_completed=False 时过滤已完成提醒。
+    """
+    reminders = _load_reminders()
+    if not include_completed:
+        reminders = [r for r in reminders if not r.get("done")]
+    reminders = sorted(reminders, key=lambda r: r.get("due", "") or "")
+    return reminders
+
+
 def reminder_delivery_status(reminders: list) -> dict:
     """汇总提醒投递状态，供状态接口和监控面板只读展示。"""
     status = {"active": 0, "delivering": 0, "retry": 0, "failed": 0}
@@ -225,6 +247,17 @@ def _save_reminders(data):
         if removed > 0:
             log.info(f"[reminders] 保存时清理{removed}条旧提醒")
         _write_locked_reminders(data)
+        # 失效上下文缓存和 system_msg 缓存，确保下次看到最新待办
+        try:
+            from agent.context import invalidate_context_cache
+            invalidate_context_cache()
+        except Exception:
+            pass
+        try:
+            from agent.system_msg import invalidate_system_msg_cache
+            invalidate_system_msg_cache()
+        except Exception:
+            pass
 
 
 def append_reminder(text: str, time_str: str = "", due: str | None = None, repeat: str = "") -> dict:
@@ -287,6 +320,17 @@ def append_reminder(text: str, time_str: str = "", due: str | None = None, repea
         if removed > 0:
             log.info(f"[reminders] 新增时清理{removed}条旧提醒")
         _write_locked_reminders(reminders)
+        # 失效上下文缓存和 system_msg 缓存，确保下次看到最新待办
+        try:
+            from agent.context import invalidate_context_cache
+            invalidate_context_cache()
+        except Exception:
+            pass
+        try:
+            from agent.system_msg import invalidate_system_msg_cache
+            invalidate_system_msg_cache()
+        except Exception:
+            pass
         return copy.deepcopy(item)
 
 
@@ -351,6 +395,20 @@ def release_failed_reminder(reminder_id: int, claimed_at, error: str = ""):
             _write_locked_reminders(reminders)
 
 
+def update_reminder_delivery_state(reminder_id: int, state: str):
+    """更新提醒投递状态（不标记 done），用于 enqueued 等中间状态。"""
+    with _locked_reminders():
+        reminders = _read_locked_reminders()
+        changed = False
+        for reminder in reminders:
+            if reminder.get("id") != reminder_id:
+                continue
+            reminder["delivery_state"] = state
+            changed = True
+            break
+        if changed:
+            _write_locked_reminders(reminders)
+
 def complete_reminder_delivery(reminder_id: int):
     """播报成功后标记完成；如果是循环提醒，生成下一次到期。"""
     now = dt.datetime.now()
@@ -376,10 +434,18 @@ def complete_reminder_delivery(reminder_id: int):
                     old_due = dt.datetime.fromisoformat(due_str)
                     if repeat == "daily":
                         next_due = old_due + dt.timedelta(days=1)
+                        while next_due < now:
+                            next_due += dt.timedelta(days=1)
                     elif repeat == "weekly":
                         next_due = old_due + dt.timedelta(weeks=1)
+                        while next_due < now:
+                            next_due += dt.timedelta(weeks=1)
                     elif repeat == "weekdays":
                         next_due = old_due + dt.timedelta(days=1)
+                        # 1. 先跳过所有已过期的循环点（补触发过去的）
+                        while next_due < now:
+                            next_due += dt.timedelta(days=1)
+                        # 2. 再跳过周末，但保留 >= now 的工作日
                         while next_due.weekday() >= 5:
                             next_due += dt.timedelta(days=1)
                     else:
@@ -408,6 +474,16 @@ def complete_reminder_delivery(reminder_id: int):
 
         if changed:
             _write_locked_reminders(reminders)
+            try:
+                from agent.context import invalidate_context_cache
+                invalidate_context_cache()
+            except Exception:
+                pass
+            try:
+                from agent.system_msg import invalidate_system_msg_cache
+                invalidate_system_msg_cache()
+            except Exception:
+                pass
 
 
 def claim_due_reminders(now=None):
