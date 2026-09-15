@@ -31,6 +31,10 @@ class TestModelDownload:
         assert "downloading" in data
         assert "error" in data
         assert "model_exists" in data
+        # 类型断言：error 在无错误时为 None，有错误时为 str
+        assert isinstance(data["downloading"], bool)
+        assert data["error"] is None or isinstance(data["error"], str)
+        assert isinstance(data["model_exists"], bool)
 
     def test_download_model_returns_started_when_not_downloading(self, client):
         """POST /api/setup/download-model 在无下载进行时返回 started（mock 模型不存在）"""
@@ -51,3 +55,13 @@ class TestModelDownload:
         data = r.json()
         assert data["started"] is False
         assert data["model_exists"] is True
+
+    def test_download_model_active_returns_in_progress(self, client):
+        """mock is_active()=True 时 POST 返回 started=False 且 message 含"进行中"."""
+        with patch.object(voice_server, "_check_model_exists", return_value=False), \
+             patch.object(voice_server._model_download, "is_active", return_value=True):
+            r = client.post("/api/setup/download-model")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["started"] is False
+        assert "进行中" in data.get("message", "")

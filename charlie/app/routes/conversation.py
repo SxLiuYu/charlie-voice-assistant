@@ -60,6 +60,11 @@ def _friendly_brain_error(error: Exception) -> str:
     if "429" in raw_message or "too many requests" in lowered or "rate limit" in lowered or "限流" in raw_message:
         log.warning(f"大脑服务限流，返回友好提示: {raw_message}")
         return BRAIN_BUSY_MESSAGE
+    s = raw_message.lower()
+    if "timeout" in s or "timed out" in s:
+        return "抱歉，刚才的请求响应超时了，请稍后再试。"
+    if "mcp工具" in s or "暂时不可用" in s:
+        return "抱歉，这个功能暂时不可用，请稍后重试或换个说法。"
     log.error(f"大脑流式生成失败: {raw_message}")
     return sanitize_error(raw_message)
 
@@ -71,6 +76,36 @@ def _flush_tts_buffer(tts_buffer: str) -> str:
     if not mp3 or len(mp3) < 100:
         return ""
     return _b64enc.b64encode(mp3).decode()
+
+
+def _flush_tts_buffer_stream(tts_buffer: str):
+    """流式 TTS — 逐块 yield base64 WAV 音频片段。
+
+    仅当 TTS_PRIORITY 首选 provider 为 audio8 时使用流式路径，
+    否则降级到非流式 _flush_tts_buffer 返回完整 MP3。
+    """
+    from agent.asr_tts import TTS_PRIORITY, _tts_audio8_stream, _clean_for_tts
+    if not tts_buffer or len(tts_buffer) < 2:
+        return
+    cleaned = _clean_for_tts(tts_buffer).strip()
+    if not cleaned:
+        return
+    # 只有 audio8 在首位时走流式
+    if not TTS_PRIORITY or TTS_PRIORITY[0] != "audio8":
+        # 降级：非流式返回完整 MP3
+        b64 = _flush_tts_buffer(tts_buffer)
+        if b64:
+            yield b64
+        return
+    # Audio8 流式
+    try:
+        for wav_b64 in _tts_audio8_stream(cleaned):
+            yield wav_b64
+    except Exception as e:
+        log.warning(f"[tts-stream] Audio8 流式失败, 降级非流式: {e}")
+        b64 = _flush_tts_buffer(tts_buffer)
+        if b64:
+            yield b64
 
 def _empty_asr_events(as_event_stream: bool):
     from voice_agent import EMPTY_ASR_REPLY
@@ -151,66 +186,68 @@ async def _stream_brain_tts(text: str, asr_text: str = "", session_id: str = "de
             return -1
         return player.submit(text_to_synth, _flush_tts_buffer)
 
-    while True:
-        brain_item = None
-        try:
-            brain_item = q.get_nowait()
-            total_wait = 0
-        except _queue.Empty:
-            pass
-        # Event-driven: await async result instead of polling
-        player_result = await player.async_get_next(timeout=HEARTBEAT_INTERVAL if not brain_item else 0.01)
-        if brain_item:
-            etype, sentence, full_reply = brain_item
-            if etype == "done":
-                brain_done = True
-                if not pending_seqs and not tts_buffer.strip():
+    try:
+        while True:
+            brain_item = None
+            try:
+                brain_item = q.get_nowait()
+                total_wait = 0
+            except _queue.Empty:
+                pass
+            # Event-driven: await async result instead of polling
+            player_result = await player.async_get_next(timeout=HEARTBEAT_INTERVAL if not brain_item else 0.01)
+            if brain_item:
+                etype, sentence, full_reply = brain_item
+                if etype == "done":
+                    brain_done = True
+                    if not pending_seqs and not tts_buffer.strip():
+                        yield SSE_DONE_FRAME
+                        break
+                elif etype == "error":
+                    yield sse_event({"type": "error", "message": sentence})
                     yield SSE_DONE_FRAME
                     break
-            elif etype == "error":
-                yield sse_event({"type": "error", "message": sentence})
-                yield SSE_DONE_FRAME
-                break
-            elif etype == "sentence":
-                yield sse_event({"type": "text", "text": sentence})
-                if sentence and len(sentence) >= 2 and not sentence.startswith("__MUSIC__") and sentence != "__MUSIC_STOP__":
-                    tts_buffer = (tts_buffer + "， " + sentence) if tts_buffer else sentence
-                    should_flush = not first_audio_sent
-                    if should_flush and not tts_failed:
-                        buf = tts_buffer
-                        tts_buffer = ""
-                        first_audio_sent = True
-                        seq = _submit_tts(buf)
-                        if seq >= 0:
-                            pending_seqs.append(seq)
-        if player_result:
-            seq, txt, audio_b64, warning = player_result
-            if warning:
-                if not tts_failed:
-                    tts_failed = True
-                    yield sse_event(warning)
-            elif audio_b64:
-                yield sse_event({"type": "audio", "audio": audio_b64})
-                if seq in pending_seqs:
-                    pending_seqs.remove(seq)
-        if brain_done and not pending_seqs:
-            if tts_buffer.strip() and not tts_failed:
-                seq = _submit_tts(tts_buffer)
-                if seq >= 0:
-                    pending_seqs.append(seq)
-                tts_buffer = ""
-            elif not pending_seqs:
-                yield SSE_DONE_FRAME
-                break
-        if not brain_item and not player_result:
-            if total_wait >= MAX_WAIT:
-                yield sse_event({"type": "error", "message": "思考超时"})
-                yield SSE_DONE_FRAME
-                break
-            yield SSE_HEARTBEAT_FRAME
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            total_wait += HEARTBEAT_INTERVAL
-    player.stop()
+                elif etype == "sentence":
+                    yield sse_event({"type": "text", "text": sentence})
+                    if sentence and len(sentence) >= 2 and not sentence.startswith("__MUSIC__") and sentence != "__MUSIC_STOP__":
+                        tts_buffer = (tts_buffer + "， " + sentence) if tts_buffer else sentence
+                        should_flush = not first_audio_sent
+                        if should_flush and not tts_failed:
+                            buf = tts_buffer
+                            tts_buffer = ""
+                            first_audio_sent = True
+                            seq = _submit_tts(buf)
+                            if seq >= 0:
+                                pending_seqs.append(seq)
+            if player_result:
+                seq, txt, audio_b64, warning = player_result
+                if warning:
+                    if not tts_failed:
+                        tts_failed = True
+                        yield sse_event(warning)
+                elif audio_b64:
+                    yield sse_event({"type": "audio", "audio": audio_b64})
+                    if seq in pending_seqs:
+                        pending_seqs.remove(seq)
+            if brain_done and not pending_seqs:
+                if tts_buffer.strip() and not tts_failed:
+                    seq = _submit_tts(tts_buffer)
+                    if seq >= 0:
+                        pending_seqs.append(seq)
+                    tts_buffer = ""
+                elif not pending_seqs:
+                    yield SSE_DONE_FRAME
+                    break
+            if not brain_item and not player_result:
+                if total_wait >= MAX_WAIT:
+                    yield sse_event({"type": "error", "message": "思考超时"})
+                    yield SSE_DONE_FRAME
+                    break
+                yield SSE_HEARTBEAT_FRAME
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                total_wait += HEARTBEAT_INTERVAL
+    finally:
+        player.stop()
 
 # ===== Routes =====
 
@@ -376,6 +413,8 @@ async def asr_api(file: UploadFile = File(...)):
     from app.audit_log import audit_log as _al
     _start = _t.time()
     data = await file.read()
+    if len(data) > MAX_AUDIO_SIZE:
+        return JSONResponse({"error": "音频文件过大"}, status_code=413)
     ext = (file.filename or "audio.wav").rsplit(".", 1)[-1].lower()
     wav = to_wav(data, ext)
     if likely_empty_audio(wav):
@@ -418,6 +457,8 @@ def _get_vosk_model():
 async def wakecheck_api(file: UploadFile = File(...)):
     import wave, io, json as json_mod
     data = await file.read()
+    if len(data) > MAX_AUDIO_SIZE:
+        return JSONResponse({"error": "音频文件过大"}, status_code=413)
     if len(data) < 1000:
         return {"wake": False, "text": ""}
     try:

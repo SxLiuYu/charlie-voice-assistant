@@ -10,8 +10,9 @@ services:
     container_name: charlie
     ports:
       - "8000:8000"
-      - "1883:1883"       # MQTT broker
+      - "1883:1883"       # MQTT broker（需外部提供，例如本地 mosquitto 或设置 MQTT_BROKER 环境变量指向已有服务）
       - "8888:8888/udp"   # UDP 音频（MQTT 协议）
+      - "8443:8443"       # HTTPS
     env_file:
       - .env
     volumes:

@@ -153,7 +153,7 @@ async def wardrobe_photo(file: UploadFile = File(...)):
     log.info(f"[wardrobe] 照片分析: 色调={colors}, 尺寸={img.size}")
     
     # 分类
-    result = classify_clothing(colors, img.size)
+    result = await classify_clothing(colors, img.size)
     if not result:
         raise HTTPException(500, "衣物识别失败, 请重试")
     

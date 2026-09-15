@@ -19,7 +19,7 @@ def mock_tuya():
             instance.ac_status.return_value = {
                 "power": 0, "mode": 0, "temp": 26, "wind": 1,
             }
-            instance.ac_scenes_command.return_value = {}
+            instance.ac_scenes_command.return_value = True
             yield instance
 
 

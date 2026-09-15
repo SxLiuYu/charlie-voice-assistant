@@ -89,7 +89,9 @@ class TuyaAPI:
     """Tuya Open Platform 2C end-user API client"""
 
     def __init__(self, api_key: str = None, base_url: str = None,
-                 timeout: int = 30):
+                 timeout: int = None):
+        if timeout is None:
+            timeout = int(os.getenv("TUYA_API_TIMEOUT", "8"))
         if api_key is None:
             api_key = os.environ.get("TUYA_API_KEY")
         if base_url is None:

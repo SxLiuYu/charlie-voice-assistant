@@ -85,10 +85,11 @@ VAD_CHUNK = 512              # Silero VAD 要求的帧大小 (16kHz)
 
 # Silero VAD 模型 (懒加载)
 _silero_model = None
+_silero_failed = False  # import 失败后置 True，热路径(每音频块)不再重复尝试
 
 def _load_silero_vad():
-    global _silero_model
-    if _silero_model is not None:
+    global _silero_model, _silero_failed
+    if _silero_model is not None or _silero_failed:
         return _silero_model
     try:
         from silero_vad import load_silero_vad
@@ -97,6 +98,7 @@ def _load_silero_vad():
         return _silero_model
     except Exception as e:
         log.warning(f"[wake] Silero VAD 加载失败, 降级到能量阈值: {e}")
+        _silero_failed = True  # 只警告一次；装包后重启进程重试
         return None
 
 def _is_speech(audio_chunk: np.ndarray) -> float:
@@ -128,13 +130,14 @@ _is_running = False
 _is_enabled = True  # 可通过 /api/wake/toggle 切换
 _wake_callback = None
 _oww_model = None
+_oww_failed = False
 _detector_thread = None
 
 
 def _load_oww_model():
     """加载 openWakeWord 唤醒词模型（ONNX，低CPU）"""
-    global _oww_model
-    if _oww_model is not None:
+    global _oww_model, _oww_failed
+    if _oww_model is not None or _oww_failed:
         return _oww_model
     try:
         from openwakeword import Model
@@ -158,9 +161,11 @@ def _load_oww_model():
         return _oww_model
     except ImportError:
         log.warning("[wake] openwakeword 未安装，运行 pip install openwakeword")
+        _oww_failed = True
         return None
     except Exception as e:
         log.warning(f"[wake] openWakeWord 加载失败: {e}")
+        _oww_failed = True
         return None
 
 
@@ -188,7 +193,7 @@ def _load_sherpa_kws():
         keywords_path = os.getenv("KWS_KEYWORDS", "")
 
         if not model_dir:
-            log.debug("[wake] 未设置 KWS_MODEL，跳过 sherpa KeywordSpotter")
+            log.info("[wake] 未设置 KWS_MODEL，跳过 sherpa KeywordSpotter（配置方法：在 .env 中设置 KWS_MODEL=模型目录路径，KWS_KEYWORDS=keywords.txt 路径）")
             return None
 
         # 自动补齐 tokens/keywords
@@ -581,13 +586,26 @@ def stop_wake_detector():
     log.info("[wake] 唤醒词检测器已停止")
 
 
-def toggle_wake(enabled: bool = None) -> bool:
-    """启用/禁用唤醒词检测, 返回当前状态"""
+def toggle_wake(enabled: bool = None) -> dict:
+    """启用/禁用唤醒词检测，返回状态字典（含 reason 字段）。"""
     global _is_enabled
+    model_loaded = _oww_model is not None or _sherpa_kws is not None
     if enabled is not None:
+        if enabled and not model_loaded:
+            # 无模型时拒绝启用，返回 reason
+            return {
+                "enabled": _is_enabled,
+                "running": _is_running,
+                "model_loaded": model_loaded,
+                "reason": "no_model",
+            }
         _is_enabled = enabled
         log.info(f"[wake] 唤醒词检测 {'启用' if enabled else '禁用'}")
-    return _is_enabled
+    return {
+        "enabled": _is_enabled,
+        "running": _is_running,
+        "model_loaded": model_loaded,
+    }
 
 
 def is_listening() -> bool:

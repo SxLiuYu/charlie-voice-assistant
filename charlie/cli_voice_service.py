@@ -83,8 +83,6 @@ def msec() -> float:
 
 def vad_loop(device: int, stop_event: threading.Event):
     """连续录音 + VAD 自动断句，返回 (wav_bytes, text, reply, audio)"""
-    import audioop
-
     # 启动 ffmpeg 实时音频流
     cmd = ["ffmpeg", "-f", "avfoundation", "-i", f":{device}",
            "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),

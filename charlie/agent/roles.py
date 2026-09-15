@@ -60,13 +60,26 @@ _ROLES: Dict[str, Dict[str, Any]] = {
         "tts_speed": 1.0,
         "wake_words": ["白泽", "百泽"],
     },
+    "kid": {
+        "name": "小助手",
+        "description": "儿童模式，温柔、简单、鼓励式回应",
+        "system_prompt": (
+            "你是小助手，一个温柔友好的儿童伙伴。"
+            "用简单易懂的语言回答，多用鼓励和赞美。"
+            "回复短小有趣，避免复杂术语。"
+            "不讨论恐怖、暴力或成人话题——遇到时说'我们换个好玩的聊聊吧'。"
+        ),
+        "tts_voice": "Kid",
+        "tts_speed": 0.9,
+        "wake_words": ["小助手", "儿童模式", "小朋友"],
+    },
 }
 
 # 当前角色（内存缓存，启动时从偏好读取）
 _current_role: Optional[str] = None
 
 # 合法规范音色集合（与 asr_tts._VOICE_MAP 保持一致）
-_VALID_TTS_VOICES = {"Ethan", "Cherry", "Stella", "Alex", "Vega", "Nova", "Echo"}
+_VALID_TTS_VOICES = {"Ethan", "Cherry", "Stella", "Alex", "Vega", "Nova", "Echo", "Kid"}
 
 
 def get_all_roles() -> Dict[str, Dict[str, Any]]:
@@ -120,14 +133,16 @@ def switch_role(role_id: str) -> tuple[bool, str]:
             with _tts_lock:
                 _tts_cache.clear()
             log.info("[roles] TTS 缓存已清空（角色切换）")
-        except Exception:
+        except Exception as e:
+            log.debug(f"[agent.roles] error at line 123: {e}")
             pass
         # 通知 agent.intent 失效其动态唤醒词正则缓存，使下次 strip_wake_word
         # 时用新角色对应的唤醒词集合重建（避免旧正则残留）。
         try:
             import agent.intent as _intent_mod
             _intent_mod._WAKE_STRIP_RE_DYNAMIC = None
-        except Exception:
+        except Exception as e:
+            log.debug(f"[agent.roles] error at line 130: {e}")
             pass
         return True, f"已切换为 {role['name']} 模式"
     except Exception as e:
@@ -165,7 +180,8 @@ def set_role_tts_voice(role_id: str, voice: str) -> None:
         try:
             from agent.preferences import set_preference
             set_preference(f"tts_voice:{role_id}", voice)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[agent.roles] error at line 168: {e}")
             pass
 
 
@@ -178,7 +194,8 @@ def _load_persisted_voice_overrides() -> None:
             if saved and saved in _VALID_TTS_VOICES:
                 _ROLES[role_id]["tts_voice"] = saved
                 log.info(f"[roles] 加载持久化音色: {role_id} -> {saved}")
-    except Exception:
+    except Exception as e:
+        log.debug(f"[agent.roles] error at line 181: {e}")
         pass
 
 

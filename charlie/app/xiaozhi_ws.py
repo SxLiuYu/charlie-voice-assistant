@@ -13,11 +13,11 @@ import json
 import logging
 import os
 import re
+import struct
 import threading
 import subprocess
 import time
 import uuid
-import audioop
 import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +27,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from app.audio import likely_empty_audio
-from app.auth import AUTH_TOKEN
+from app.auth import AUTH_TOKEN, XIAOZHI_DEVICE_TOKEN
 from app.xiaozhi_codec import (
     opus_decode_to_wav, mp3_to_opus_packets, mp3_to_ogg_opus,
     url_to_opus_packets,
@@ -84,8 +84,21 @@ SILENCE_RMS_DEFAULT = 150   # fallback before a noise baseline exists
 # starts a new utterance. (KWS echo protection / wake cooldown, see below.)
 # Must stay short (~beep length + a little reverb) so a user who speaks right
 # after the wake word isn't dropped.
-WAKE_ECHO_COOLDOWN = 0.5
-_FIRST_SENTENCE_TIMEOUT = float(os.getenv("XIAOZHI_FIRST_SENTENCE_TIMEOUT", "15.0"))
+# Hot beep plays ~3 packets × 60ms = ~180ms; 0.25s cooldown gives ~70ms
+# headroom for the acknowledgement tone and wake-word echo to settle before
+# the mic starts a fresh utterance. Previously 0.5s dropped first words from
+# fast speakers (269-320ms after wake).
+WAKE_ECHO_COOLDOWN = 0.25
+_FIRST_SENTENCE_TIMEOUT = float(os.getenv("XIAOZHI_FIRST_SENTENCE_TIMEOUT", "8.0"))
+
+
+def _pcm_rms(data: bytes) -> int:
+    """替代 audioop.rms (Python 3.13 弃用)。"""
+    if len(data) < 2:
+        return 0
+    n = len(data) // 2
+    samples = struct.unpack(f"<{n}h", data[: n * 2])
+    return int((sum(s * s for s in samples) / n) ** 0.5)
 
 
 def _get_arm_window() -> float:
@@ -111,12 +124,38 @@ _prewarm_lock = threading.Lock()
 
 # 独立 brain collect 线程池，避免卡死时耗尽共享 _io_pool（ASR/TTS/opus 等）
 _brain_pool = ThreadPoolExecutor(max_workers=int(os.getenv("BRAIN_POOL_SIZE", "8")), thread_name_prefix="brain-collect")
+# Silero VAD torch 前向专用小池：WS 收包循环每帧(~17fps)调一次，
+# 同步跑在事件循环里会占住主循环、拖慢同进程所有 WS/HTTP 连接
+_vad_pool = ThreadPoolExecutor(max_workers=int(os.getenv("VAD_POOL_SIZE", "2")), thread_name_prefix="vad")
 _dead_link_count = 0
 _rebuild_last_time = 0.0
 _REBUILD_MIN_INTERVAL = 10.0
 _tts_streaming = False
 _tts_streaming_lock = threading.Lock()
 _rebuild_lock = threading.Lock()
+
+# session metrics (module-level, thread-safe counters)
+_xiaozhi_metrics = {
+    "connections_total": 0,
+    "ws_active": 0,
+    "utterances_total": 0,
+    "barges_total": 0,
+    "resumes_total": 0,
+    "asr_failures": 0,
+    "tts_sentences": 0,
+    "tts_failures": 0,
+    "opus_cache_hits": 0,
+    "url_cache_mem_hits": 0,
+    "url_cache_disk_hits": 0,
+    "music_plays": 0,
+}
+_xiaozhi_metrics_lock = threading.Lock()
+
+
+def bump_metric(name: str, delta: int = 1):
+    """Increment a session metric counter (thread-safe)."""
+    with _xiaozhi_metrics_lock:
+        _xiaozhi_metrics[name] = _xiaozhi_metrics.get(name, 0) + delta
 
 
 def is_xiaozhi_streaming() -> bool:
@@ -156,17 +195,18 @@ def rebuild_brain_pool() -> None:
 
 # ── Silero VAD (懒加载, 复用 local_wake 的模型单例避免重复加载) ──
 _silero_vad = None
+_silero_failed = False  # import 失败后置 True，热路径(每音频帧)不再重复尝试
 _silero_lock = threading.Lock()
 
 def _load_silero_vad():
     """加载 Silero VAD 模型(懒加载, 失败返回 None→端点降级 RMS)"""
-    global _silero_vad
-    if _silero_vad is not None:
+    global _silero_vad, _silero_failed
+    if _silero_vad is not None or _silero_failed:
         return _silero_vad
     if not VAD_ENABLED:
         return None
     with _silero_lock:
-        if _silero_vad is not None:
+        if _silero_vad is not None or _silero_failed:
             return _silero_vad
         try:
             from silero_vad import load_silero_vad
@@ -174,7 +214,8 @@ def _load_silero_vad():
             log.info("[xiaozhi] Silero VAD loaded (端点检测: 0.48s vs RMS 1.2s)")
         except Exception as e:
             log.warning("[xiaozhi] Silero VAD load fail, fallback to RMS endpointing: %s", e)
-            _silero_vad = None  # 显式 None, 降级 RMS
+            _silero_vad = None
+            _silero_failed = True  # 只警告一次；装包后重启进程重试
         return _silero_vad
 
 def _vad_speech_prob(pcm_bytes: bytes) -> float:
@@ -201,6 +242,12 @@ def _is_speech_vad(pcm_bytes: bytes, rms: int, rms_threshold: float) -> bool:
         return prob >= VAD_THRESHOLD
     # 降级 RMS
     return rms >= rms_threshold
+
+
+async def _is_speech_vad_async(pcm_bytes: bytes, rms: int, rms_threshold: float) -> bool:
+    """_is_speech_vad 的异步版：torch 前向挪到 _vad_pool，不阻塞事件循环"""
+    return await asyncio.get_running_loop().run_in_executor(
+        _vad_pool, _is_speech_vad, pcm_bytes, rms, rms_threshold)
 
 _beep_mp3 = None
 _beep_lock = threading.Lock()
@@ -237,7 +284,7 @@ def _synth_wake_beep() -> bytes:
 _finna_cooldown_until = 0.0  # Finna 429 冷却截止时间戳（限流后60s内跳过Finna）
 
 
-def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None) -> bytes:
+def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None, cancel_evt=None) -> bytes:
     """TTS via Baidu → Finna (SSE streaming) → StepFun → say. Falls back gracefully.
 
     Cached in the shared TTS mp3 cache so repeated hints / replies skip the
@@ -246,7 +293,12 @@ def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None) -> bytes:
 
     _cache_get/_cache_put are injection points for tests to verify cache keys
     include the role voice (avoiding cross-role cache pollution).
+
+    cancel_evt: optional threading.Event; when set, aborts synthesis immediately
+    and returns b"" without invoking any network TTS backend.
     """
+    if cancel_evt is not None and cancel_evt.is_set():
+        return b""
     from agent.asr_tts import _tts_cache_get, _tts_cache_put
     from agent.asr_tts import get_effective_tts_config, TTS_MODEL as _TTS_MODEL
     from agent.asr_tts import resolve_voice
@@ -260,6 +312,8 @@ def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None) -> bytes:
         cached = _tts_cache_get(sentence, _role_voice, _TTS_MODEL, speed=_role_speed)
     if cached:
         return cached
+    if cancel_evt is not None and cancel_evt.is_set():
+        return b""
     api_key = os.getenv("FINNA_API_KEY", "")
     global _finna_cooldown_until
     # Finna 只支持 "Ethan" 音色；用 resolve_voice 判断映射结果是否为 Ethan
@@ -282,6 +336,8 @@ def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None) -> bytes:
             return raw
     except Exception as e:
         log.warning("[xiaozhi] baidu TTS fail: %s", e)
+    if cancel_evt is not None and cancel_evt.is_set():
+        return b""
 
     # Finna second (SSE streaming, only for Ethan voice)
     if finna_ok:
@@ -349,6 +405,8 @@ def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None) -> bytes:
             if "429" in str(e) or "Too Many" in str(e):
                 _finna_cooldown_until = time.time() + 60
                 log.warning("[xiaozhi] finna 限流，冷却60s直接走百度")
+    if cancel_evt is not None and cancel_evt.is_set():
+        return b""
 
     # StepFun third (cloud TTS, no known rate-limit)
     try:
@@ -362,6 +420,8 @@ def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None) -> bytes:
             return raw
     except Exception as e:
         log.warning("[xiaozhi] stepfun TTS fail: %s", e)
+    if cancel_evt is not None and cancel_evt.is_set():
+        return b""
 
     # Last-resort offline TTS via macOS `say` → mp3, so the device still talks
     # even when every network TTS is down (ASR already worked, net may be flaky).
@@ -386,6 +446,40 @@ def _synth_mp3(sentence: str, *, _cache_get=None, _cache_put=None) -> bytes:
     raise RuntimeError("no TTS available")
 
 
+def _decode_check_asr(frames: list) -> tuple:
+    """Decode opus frames → wav, check for silence, run ASR race.
+
+    All three steps run in a single thread call to eliminate the ~590ms
+    overhead of three separate asyncio.to_thread round-trips.
+
+    Returns:
+        (None, "", "")      – empty / silent audio (caller should return)
+        (wav, text, provider, duration_ms) – normal result with ASR text,
+            provider name, and measured processing duration in ms.
+    """
+    t_start = time.perf_counter()
+    t0 = time.perf_counter()
+    wav = opus_decode_to_wav(frames, UPLINK_SAMPLE_RATE)
+    decode_ms = (time.perf_counter() - t0) * 1000
+
+    if not wav or likely_empty_audio(wav):
+        log.info("[xiaozhi] latency: decode=%.0fms empty/silent → skip ASR", decode_ms)
+        return None, "", "", 0.0
+
+    from voice_agent import asr_race
+    t1 = time.perf_counter()
+    try:
+        text, provider = asr_race(wav, "wav")
+    except Exception as e:
+        log.warning("[xiaozhi] latency: decode=%.0fms ASR error: %s", decode_ms, e)
+        raise
+    asr_ms = (time.perf_counter() - t1) * 1000
+    total_ms = (time.perf_counter() - t_start) * 1000
+    log.info("[xiaozhi] latency: decode=%.0fms ASR=%.0fms total=%.0fms provider=%s",
+             decode_ms, asr_ms, total_ms, provider)
+    return wav, text, provider, total_ms
+
+
 def register_xiaozhi_routes(app: FastAPI):
 
     # Pre-synthesize the common hint phrases once per process so the first
@@ -398,38 +492,43 @@ def register_xiaozhi_routes(app: FastAPI):
             _prewarm_started = True
         from agent.intent import LOW_INTENT_ASR_REPLY
         try:
-            for phrase in ("你好，有什么需要帮忙的", LOW_INTENT_ASR_REPLY):
+            for phrase in ("你好，有什么需要帮忙的", LOW_INTENT_ASR_REPLY,
+                           "嗯？", "没听清，再说一遍？"):
                 try:
                     mp3 = _synth_mp3(phrase)
                     if mp3:
                         log.info("[xiaozhi] prewarmed TTS: %.30s", phrase)
                 except Exception as e:
                     log.warning("[xiaozhi] prewarm %r fail: %s", phrase, e)
+            # 唤醒反馈音也预热：首次唤醒若在事件循环里同步跑 ffmpeg（上限10s）
+            # 会冻结整个服务
+            _synth_wake_beep()
+            # 预热 beep 的 opus 包（否则每次重启后的第一次唤醒要现场跑
+            # ffmpeg 转码 ~400ms，之后才命中 opus 缓存降到 ~50ms）
+            try:
+                _beep = _synth_wake_beep()
+                if _beep:
+                    mp3_to_opus_packets(_beep, DOWNLINK_SAMPLE_RATE,
+                                        OPUS_FRAME_DURATION_MS, 0.0)
+                    log.info("[xiaozhi] wake beep opus 预热完成")
+            except Exception as _be:
+                log.debug(f"[xiaozhi] wake beep opus 预热失败(不影响功能): {_be}")
+            # 罐头应答音预热（空回复/音乐失败兜底用，进 TTS 缓存后零延迟）
+            for _canned in ("嗯？", "抱歉，音乐加载失败"):
+                try:
+                    _synth_mp3(_canned)
+                except Exception as _ce:
+                    log.debug(f"[xiaozhi] 罐头音预热失败({_canned}): {_ce}")
+            # Silero VAD 预加载：首帧推理否则 ~1.4s 延迟（torch 懒加载）
+            try:
+                _load_silero_vad()
+                log.info("[xiaozhi] Silero VAD 预热完成")
+            except Exception as _vad:
+                log.debug(f"[xiaozhi] Silero VAD 预热失败(不影响功能): {_vad}")
         except Exception as e:
             log.warning("[xiaozhi] prewarm thread err: %s", e)
 
     threading.Thread(target=_prewarm_hints, daemon=True).start()
-
-    # ---- session metrics (module-level, thread-safe counters) ----
-    metrics = {
-        "connections_total": 0,
-        "ws_active": 0,
-        "utterances_total": 0,
-        "barges_total": 0,
-        "resumes_total": 0,
-        "asr_failures": 0,
-        "tts_sentences": 0,
-        "tts_failures": 0,
-        "opus_cache_hits": 0,
-        "url_cache_mem_hits": 0,
-        "url_cache_disk_hits": 0,
-        "music_plays": 0,
-    }
-    metrics_lock = threading.Lock()
-
-    def bump_metric(name: str, delta: int = 1):
-        with metrics_lock:
-            metrics[name] = metrics.get(name, 0) + delta
 
     @app.get("/api/xiaozhi/status")
     def xiaozhi_status():
@@ -439,8 +538,8 @@ def register_xiaozhi_routes(app: FastAPI):
             stats = _cs()
         except Exception:
             stats = {}
-        with metrics_lock:
-            snap = dict(metrics)
+        with _xiaozhi_metrics_lock:
+            snap = dict(_xiaozhi_metrics)
         snap["cache"] = stats
         try:
             from voice_agent import brain_status
@@ -457,11 +556,19 @@ def register_xiaozhi_routes(app: FastAPI):
         is_local = (not has_proxy_headers) and (peer_ip in ("127.0.0.1", "localhost", "::1", "", "testclient"))
         if AUTH_TOKEN and not is_local:
             token = ws.query_params.get("token", "")
-            if not hmac.compare_digest(token or "", AUTH_TOKEN or ""):
+            # ESP32 固件预置 token=device；同时接受管理面 AUTH_TOKEN
+            if not (hmac.compare_digest(token or "", AUTH_TOKEN or "") or
+                    hmac.compare_digest(token or "", XIAOZHI_DEVICE_TOKEN or "")):
                 await ws.close(code=1008)
                 return
         await ws.accept()
         log.info("[xiaozhi] client connected from %s", ws.client)
+
+        if opuslib is None:
+            log.error("[xiaozhi] opuslib not available, closing connection")
+            await ws.close(code=1011)
+            return
+
         bump_metric("connections_total")
         bump_metric("ws_active", 1)
 
@@ -472,9 +579,17 @@ def register_xiaozhi_routes(app: FastAPI):
         resume_played = 0             # how many pending_sentences fully played
         stream_task: Optional[asyncio.Task] = None
         _stream_cancelled = threading.Event()  # 当前流的取消标志槽位（每流换新事件）
+        _connection_tasks: set = set()  # 后台任务追踪，断开时统一取消防止泄漏
+        _processing_utterance = False  # ASR→brain→TTS 处理中，抑制 barge-in 误触发
+        _barge_times: list = []  # barge-in 时间戳（风暴守卫：10s 内 ≥3 次且无有效语音→goodbye）
+
+        def _track_task(t: asyncio.Task) -> asyncio.Task:
+            _connection_tasks.add(t)
+            t.add_done_callback(lambda _: _connection_tasks.discard(t))
+            return t
 
         # 注册到全局连接表（主动推送用）+ flush 待推送队列
-        from app.state import register_xiaozhi_client, unregister_xiaozhi_client
+        from app.state import register_xiaozhi_client, unregister_xiaozhi_client, flush_xiaozhi_pending, snapshot_xiaozhi_clients
         _loop = asyncio.get_running_loop()
         _pending = register_xiaozhi_client(session_id, ws, _loop)
         # flush 暂存的推送
@@ -493,7 +608,7 @@ def register_xiaozhi_routes(app: FastAPI):
                         log.info(f"[xiaozhi] 补发推送: {item['text'][:30]}")
                     except Exception as e:
                         log.warning(f"[xiaozhi] 补发失败: {e}")
-            asyncio.ensure_future(_flush(), loop=_loop)
+            _track_task(asyncio.ensure_future(_flush(), loop=_loop))
 
         async def cancel_stream():
             nonlocal stream_task
@@ -505,6 +620,37 @@ def register_xiaozhi_routes(app: FastAPI):
                 except (asyncio.CancelledError, Exception):
                     pass
             stream_task = None
+
+        async def _play_canned_ack(text: str = "嗯？"):
+            """轻量语音应答：brain 正常跑完但零句产出时避免 beep 后纯沉默。
+
+            仅在无回复流活跃时播放；乱码 ASR 路径不使用（TTS 声音可能被设备
+            麦克风回收造成反馈循环）。罐头音频经 _synth_mp3 缓存，prewarm 已热。
+            """
+            if stream_task and not stream_task.done():
+                return
+            try:
+                mp3 = await _loop.run_in_executor(None, _synth_mp3, text)
+            except Exception:
+                return
+            if not mp3 or len(mp3) < 100:
+                return
+            try:
+                pkts = await _loop.run_in_executor(
+                    None, mp3_to_opus_packets, mp3,
+                    DOWNLINK_SAMPLE_RATE, OPUS_FRAME_DURATION_MS, 0.0)
+            except Exception:
+                return
+            if not pkts:
+                return
+            await send_json({"type": "tts", "state": "start"})
+            await send_json({"type": "tts", "state": "sentence_start", "text": text})
+            for pkt in pkts:
+                if ws.client_state != WebSocketState.CONNECTED:
+                    break
+                await ws.send_bytes(pkt)
+                await asyncio.sleep(0.06)
+            await send_json({"type": "tts", "state": "stop"})
 
         async def send_json(obj: dict):
             try:
@@ -549,16 +695,20 @@ def register_xiaozhi_routes(app: FastAPI):
             _SENTINEL = object()  # end-of-stream marker
             _fallback_sent = False  # 防止兜底语重复发送
 
-            def _put_blocking(item):
+            def _put_blocking(item, cancel_evt=cancel_evt):
                 # The consumer (pacing) is the bottleneck; block here so a long
-                # reply never overflows the queue. This only stretches the
-                # producer thread, never loses a sentence. Bail early if the
-                # owning loop shuts down (WS disconnect / barge-in) or the
-                # queue stays full for >50 iterations (~1s) instead of spinning
-                # forever on a dead/orphaned consumer.
-                _full_count = 0
+                # reply never overflows the queue and never DROPS a sentence:
+                # slots free up as each sentence finishes its paced send, so a
+                # steady-state full queue just means playback is slower than
+                # synthesis — normal for long replies. Give up only when this
+                # stream was cancelled (barge-in), the WS disconnected, or the
+                # owning loop shut down / a hard deadline hit (dead consumer).
+                deadline = time.monotonic() + 120
                 while True:
                     if not loop.is_running() or not ws.client_state == WebSocketState.CONNECTED:
+                        return
+                    if cancel_evt.is_set():
+                        log.info("[xiaozhi] _put_blocking: 本流已取消，停止投递")
                         return
                     try:
                         # asyncio.Queue 非线程安全：跨线程 put_nowait 后消费者
@@ -571,11 +721,10 @@ def register_xiaozhi_routes(app: FastAPI):
                     except RuntimeError:
                         return  # loop 正在关闭
                     except asyncio.QueueFull:
-                        _full_count += 1
-                        if _full_count >= 50:
-                            log.warning("[xiaozhi] _put_blocking 放弃: 队列持续满50次(~1s)")
+                        if time.monotonic() > deadline:
+                            log.warning("[xiaozhi] _put_blocking 超时(120s)：消费者疑似失联，放弃本句")
                             return
-                        time.sleep(0.02)
+                        time.sleep(0.05)
 
             def collect(cancel_evt=cancel_evt):
                 # cancel_evt 默认参数在 def 时绑定本流的事件对象，
@@ -595,7 +744,7 @@ def register_xiaozhi_routes(app: FastAPI):
                             if cancel_evt.is_set():
                                 log.info("[xiaozhi] collect(prebuilt): consumer 已取消，停止生成")
                                 break
-                            mp3 = _synth_mp3(s)
+                            mp3 = _synth_mp3(s, cancel_evt=cancel_evt)
                             if mp3 and len(mp3) > 100:
                                 pending_sentences.append(s)
                                 _put_blocking((s, mp3))
@@ -612,6 +761,7 @@ def register_xiaozhi_routes(app: FastAPI):
                         _brain_iter = iter(brain_stream_sentences(
                             text, session_id="xiaozhi-" + device_key,
                             interrupted_reply=interrupted_reply,
+                            cancel_event=cancel_evt,
                         ))
                     except Exception as e:
                         log.error("[xiaozhi] brain iter fail: %s", e)
@@ -619,7 +769,7 @@ def register_xiaozhi_routes(app: FastAPI):
                         if not _fallback_sent:
                             try:
                                 fallback = "抱歉，出了点问题，请再说一遍"
-                                fb_mp3 = _synth_mp3(fallback)
+                                fb_mp3 = _synth_mp3(fallback, cancel_evt=cancel_evt)
                                 if fb_mp3 and len(fb_mp3) > 100:
                                     _put_blocking((fallback, fb_mp3))
                                     _fallback_sent = True
@@ -639,7 +789,7 @@ def register_xiaozhi_routes(app: FastAPI):
                                     or s.startswith("__MUSIC__"):
                                 _put_blocking((s, None))
                                 continue
-                            mp3 = _synth_mp3(s)
+                            mp3 = _synth_mp3(s, cancel_evt=cancel_evt)
                             if mp3 and len(mp3) > 100:
                                 pending_sentences.append(s)
                                 _put_blocking((s, mp3))
@@ -651,7 +801,7 @@ def register_xiaozhi_routes(app: FastAPI):
                         if not _fallback_sent:
                             try:
                                 fallback = "抱歉，出了点问题，请再说一遍"
-                                fb_mp3 = _synth_mp3(fallback)
+                                fb_mp3 = _synth_mp3(fallback, cancel_evt=cancel_evt)
                                 if fb_mp3 and len(fb_mp3) > 100:
                                     _put_blocking((fallback, fb_mp3))
                                     _fallback_sent = True
@@ -667,7 +817,7 @@ def register_xiaozhi_routes(app: FastAPI):
                             if not _fallback_sent:
                                 try:
                                     fallback = "抱歉，反应慢了，请再说一遍"
-                                    fb_mp3 = _synth_mp3(fallback)
+                                    fb_mp3 = _synth_mp3(fallback, cancel_evt=cancel_evt)
                                     if fb_mp3 and len(fb_mp3) > 100:
                                         _put_blocking((fallback, fb_mp3))
                                         _fallback_sent = True
@@ -683,7 +833,7 @@ def register_xiaozhi_routes(app: FastAPI):
 
             producer = loop.run_in_executor(_brain_pool, collect)
 
-# Consume sentences one at a time. The first sentence triggers
+            # Consume sentences one at a time. The first sentence triggers
             # tts/start + playback right away; subsequent sentences are
             # synthesized and appended to the stream while the brain still
             # produces the rest. This is what makes the first-audio latency
@@ -760,6 +910,11 @@ def register_xiaozhi_routes(app: FastAPI):
                             rebuild_brain_pool()
                             break
                     if mp3 is _SENTINEL or s is _SENTINEL:
+                        if not started:
+                            # brain 正常结束但零句产出：播轻应答避免 beep 后纯沉默
+                            # （乱码 ASR 路径保持沉默——TTS 应答可能被设备麦克风
+                            #  回收造成反馈循环，故仅在"真说话但没答案"时用）
+                            await _play_canned_ack("嗯？")
                         break
                     if s == "__TTS_FAIL__":
                         await send_json({"type": "stt", "text": "抱歉，语音合成暂时不可用"})
@@ -784,6 +939,14 @@ def register_xiaozhi_routes(app: FastAPI):
                             log.warning("[xiaozhi] music fetch fail: %s", mx)
                             pkts = []
                         if not pkts:
+                            # 下载/转码失败：给用户一句解释而不是静默跳过
+                            try:
+                                fb_mp3 = await loop.run_in_executor(
+                                    None, _synth_mp3, "抱歉，音乐加载失败")
+                                if fb_mp3 and len(fb_mp3) > 100:
+                                    _put_blocking(("抱歉，音乐加载失败", fb_mp3))
+                            except Exception:
+                                pass
                             continue
                         bump_metric("music_plays")
                         label = f"♪ {label}"
@@ -829,10 +992,20 @@ def register_xiaozhi_routes(app: FastAPI):
                 # trailing buffer: 根据最后一批帧数动态计算，短回复不再等 800ms
                 _last_pkt_count = sizes if 'sizes' in dir() and sizes else 0
                 _trailing_wait = min(0.8, max(0.15, _last_pkt_count * 0.06 + 0.1))
-                _set_xiaozhi_streaming(False)
                 await asyncio.sleep(_trailing_wait)
                 if started:
                     await send_json({"type": "tts", "state": "stop"})
+                # tts stop 已发送，解除 streaming 标志，允许积压提醒 flush
+                _set_xiaozhi_streaming(False)
+                # streaming 已结束：若 pending 队列有积压的提醒 TTS，立即 flush
+                if ws.client_state == WebSocketState.CONNECTED:
+                    try:
+                        from app.state import flush_xiaozhi_pending, snapshot_xiaozhi_clients
+                        if session_id in snapshot_xiaozhi_clients():
+                            _track_task(asyncio.ensure_future(
+                                flush_xiaozhi_pending(session_id, ws, loop)))
+                    except Exception as _fl:
+                        log.debug("[xiaozhi] post-stream flush enqueue failed: %s", _fl)
                 # Reply done: re-open the listening window so the user can ask
                 # follow-ups without re-saying the wake word (iFLYOS-style
                 # continuous conversation). The window expires after the
@@ -858,74 +1031,81 @@ def register_xiaozhi_routes(app: FastAPI):
                 cancel_evt.set()  # consumer 异常退出，通知 collect 线程停止
             finally:
                 _set_xiaozhi_streaming(False)
+                # streaming 已结束：若 pending 队列有积压的提醒 TTS，立即 flush
+                if ws.client_state == WebSocketState.CONNECTED:
+                    try:
+                        from app.state import flush_xiaozhi_pending, snapshot_xiaozhi_clients
+                        if session_id in snapshot_xiaozhi_clients():
+                            _track_task(asyncio.ensure_future(
+                                flush_xiaozhi_pending(session_id, ws, loop)))
+                    except Exception as _fl:
+                        log.debug("[xiaozhi] post-stream flush enqueue failed: %s", _fl)
                 try:
                     await asyncio.wait_for(asyncio.shield(producer), timeout=2.0)
                 except asyncio.TimeoutError:
                     log.warning("[xiaozhi] producer未在2s内结束，放弃等待")
+                    cancel_evt.set()
+                    rebuild_brain_pool()
                 except Exception:
                     pass
 
         async def process_utterance(frames: list):
-            nonlocal stream_task
-            t0 = time.monotonic()
+            nonlocal stream_task, _processing_utterance
             if not frames:
                 log.info("[xiaozhi] empty utterance, ignored silently")
                 return
+            _processing_utterance = True  # 抑制 barge-in 误触发
             bump_metric("utterances_total")
             try:
-                wav = opus_decode_to_wav(frames, UPLINK_SAMPLE_RATE)
-            except Exception as e:
-                log.error("[xiaozhi] decode fail: %s", e)
-                return
-            t_decode = time.monotonic()
-            if not wav or likely_empty_audio(wav):
-                log.info("[xiaozhi] empty audio, ignored silently")
-                return
-
-            from voice_agent import asr, is_low_intent_asr, is_garbled_asr
-            from agent.intent import LOW_INTENT_ASR_REPLY, strip_wake_word
-            try:
-                asr_text = await asyncio.wait_for(
-                    asyncio.to_thread(asr, wav, "wav"), timeout=30)
-            except Exception as e:
-                log.error("[xiaozhi] ASR fail: %s", e)
+                wav, asr_text, asr_provider, asr_duration_ms = await asyncio.wait_for(
+                    asyncio.to_thread(_decode_check_asr, frames), timeout=30)
+            except asyncio.TimeoutError:
+                log.error("[xiaozhi] ASR pipeline timeout(>30s)")
                 bump_metric("asr_failures")
-                # Network/TTS hiccup — say so instead of leaving the user
-                # waiting in silence. (Dynamic hint, not cached speech.)
+                await cancel_stream()
+                stream_task = asyncio.create_task(
+                    _safe_stream("语音识别超时了，请稍后再试"))
+                _processing_utterance = False
+                return
+            except Exception as e:
+                log.error("[xiaozhi] decode/ASR fail: %s", e)
+                bump_metric("asr_failures")
                 await cancel_stream()
                 stream_task = asyncio.create_task(
                     _safe_stream("语音识别失败了，请再试一次"))
+                _processing_utterance = False
                 return
-            asr_text = (asr_text or "").strip()
-            # Wake words ("你好小智"/"小智"/"charlie") often ride the front of
-            # the ASR result; strip them so brain/intent see only the command.
-            if asr_text:
-                stripped = strip_wake_word(asr_text)
-                if stripped:
-                    asr_text = stripped
-                elif stripped == "" and asr_text:
-                    # ASR heard ONLY a wake word & nothing else — stay silent.
-                    log.info("[xiaozhi] ASR wake-only, ignored: %r", asr_text)
-                    await send_json({"type": "stt", "text": ""})
-                    return
-            t_asr = time.monotonic()
-            log.info("[xiaozhi] latency: 音频=%d帧 decode=%.0fms ASR=%.0fms | text=%s",
-                     len(frames),
-                     (t_decode - t0) * 1000,
-                     (t_asr - t_decode) * 1000,
-                     asr_text)
+            # _decode_check_asr returns (None, "", "", 0.0) for empty/silent audio
+            if wav is None:
+                _processing_utterance = False
+                return
+            from voice_agent import is_low_intent_asr, is_garbled_asr
+            from agent.intent import LOW_INTENT_ASR_REPLY, strip_wake_word
             try:
                 from app.audit_log import audit_log
                 audit_log("ws:asr", input_data=f"{len(frames)}frames",
                           output_data=asr_text, action="recognize",
                           session_id=f"xiaozhi-{device_key}",
-                          duration_ms=(t_asr - t_decode) * 1000)
+                          duration_ms=asr_duration_ms)
             except Exception:
                 pass
+            if os.getenv("ASR_DUMP_WAV", "0") == "1" and wav:
+                try:
+                    dump_dir = os.path.join(DATA_DIR, "asr_dump")
+                    os.makedirs(dump_dir, exist_ok=True)
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    safe_text = re.sub(r'[^\w\u4e00-\u9fff-]', '', (asr_text or ""))[:20]
+                    fname = f"{ts}_{asr_provider}_{safe_text}.wav"
+                    with open(os.path.join(dump_dir, fname), "wb") as f:
+                        f.write(wav)
+                except Exception as e:
+                    log.debug("[xiaozhi] ASR dump failed: %s", e)
             if not asr_text or is_garbled_asr(asr_text):
                 log.info("[xiaozhi] ASR filtered as garbled: %r", asr_text)
                 await send_json({"type": "stt", "text": ""})
+                _processing_utterance = False
                 return
+            _barge_times.clear()  # 有效语音：重置背景音风暴计数
             # pure filler (嗯/hmm/huh...) → light acknowledgment, no brain round-trip
             if is_low_intent_asr(asr_text):
                 log.info("[xiaozhi] ASR low-intent, ack only: %r", asr_text)
@@ -961,11 +1141,14 @@ def register_xiaozhi_routes(app: FastAPI):
 
         async def _safe_stream(text, interrupted_reply: str = "",
                                   prebuilt: Optional[list] = None):
+            nonlocal _processing_utterance
             try:
                 await stream_tts_reply(text, interrupted_reply=interrupted_reply,
                                        prebuilt=prebuilt)
             except Exception as e:
                 log.error("[xiaozhi] stream_tts_reply error: %s", e, exc_info=True)
+            finally:
+                _processing_utterance = False  # 恢复 barge-in 检测
 
         async def _play_wake_beep():
             """Play the short acknowledgement tone right when the KWS fires, so
@@ -992,10 +1175,6 @@ def register_xiaozhi_routes(app: FastAPI):
             await send_json({"type": "tts", "state": "stop"})
             log.info("[audio] wake beep played (%d pkts)", len(bkts))
 
-        if opuslib is None:
-            log.error("[xiaozhi] opuslib not available, closing connection")
-            await ws.close(code=1011)
-            return
         decoder = opuslib.Decoder(UPLINK_SAMPLE_RATE, 1)
         _load_silero_vad()  # 预加载 Silero VAD, 避免首帧推理延迟
         tail = deque(maxlen=HEAD_START_FRAMES)  # rolling pre-speech frames
@@ -1026,21 +1205,25 @@ def register_xiaozhi_routes(app: FastAPI):
             return max(SILENCE_RMS_DEFAULT * 0.5, noise_floor * SIG_RATIO)
 
         def reset_utterance():
-            nonlocal buf_frames, speech_count, silence_count, utterance_active, hot_frames
+            nonlocal buf_frames, speech_count, silence_count, utterance_active, hot_frames, noise_floor, resume_played, pending_sentences
             tail.clear()
             buf_frames = []
             speech_count = 0
             silence_count = 0
             utterance_active = False
             hot_frames = 0
+            noise_floor = 0.0   # reset adaptive baseline so a loud utterance doesn't poison the threshold
+            pending_sentences.clear()  # 重置当前语句的待发送句表
+            resume_played = 0
 
         try:
             while True:
                 try:
                     msg = await asyncio.wait_for(ws.receive(), timeout=120.0)
                     # 标记 ESP32 最近活跃（调度器据此判断是否推语音通知）
-                    import app.schedulers as _sc
-                    _sc._touch_esp32()
+                    if frame_count % 100 == 0:
+                        import app.schedulers as _sc
+                        _sc._touch_esp32()
                 except asyncio.TimeoutError:
                     # 120s 无数据：发 ping 探活，失败则关闭半开连接
                     log.info("[xiaozhi] 120s 无数据, 发送 ping 探活")
@@ -1085,7 +1268,7 @@ def register_xiaozhi_routes(app: FastAPI):
                     pcm = b""
                     try:
                         pcm = decoder.decode(pkt, FRAME_SAMPLES)
-                        rms = audioop.rms(pcm, 2)
+                        rms = _pcm_rms(pcm)
                     except Exception as dex:
                         rms = 0
                         if frame_count % 50 == 0:
@@ -1116,7 +1299,7 @@ def register_xiaozhi_routes(app: FastAPI):
                                 noise_floor = float(rms)
                             else:
                                 noise_floor = 0.92 * noise_floor + 0.08 * rms
-                        if _is_speech_vad(pcm, rms, thr):
+                        if await _is_speech_vad_async(pcm, rms, thr):
                             # Debounce: require a few consecutive hot frames so a
                             # single transient (own-TTS echo, door click, music)
                             # doesn't false-trigger a barge-in or start of speech.
@@ -1125,9 +1308,40 @@ def register_xiaozhi_routes(app: FastAPI):
                                 continue
                             # Barge-in: user started talking while we were still
                             # playing TTS — cut the audio so we can listen.
+                            # 仅在"brain 处理中且尚未开始播报"时抑制：残余设备音频
+                            # 帧会误取消一个还没开始播放的回复。播报开始后必须放行
+                            # barge-in（用户喊停是核心交互），自TTS回声误触发由
+                            # 设备AEC+下方风暴守卫（10s≥3次→goodbye）兜底。
+                            if _processing_utterance and not (stream_task and not stream_task.done()):
+                                hot_frames = 0
+                                continue
                             if stream_task and not stream_task.done():
                                 log.info("[xiaozhi] barge-in, cancelling current TTS")
                                 bump_metric("barges_total")
+                                _barge_times.append(time.monotonic())
+                                # 风暴守卫：10s 内 ≥3 次 barge-in 且期间无一次有效
+                                # ASR（有效语音会在 process_utterance 里清空计数）
+                                # → 判定为电视/音响等背景音循环，goodbye 退出，
+                                #   否则用户会经历"beep→沉默"的死循环（20:57 实测 44s）
+                                recent = [t for t in _barge_times
+                                          if time.monotonic() - t < 10.0]
+                                _barge_times[:] = recent
+                                if len(recent) >= 3:
+                                    log.warning(
+                                        "[xiaozhi] 10s 内连续 %d 次 barge-in 无有效语音，"
+                                        "判定背景音干扰，goodbye 退出", len(recent))
+                                    _barge_times.clear()
+                                    try:
+                                        await send_json({"type": "stt",
+                                                         "text": "背景音干扰较多，先退出聆听，需要时再叫我"})
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await send_json({"type": "goodbye"})
+                                        await ws.close()
+                                    except Exception:
+                                        pass
+                                    break
                                 await cancel_stream()
                                 await send_json({"type": "tts", "state": "stop"})
                             utterance_active = True
@@ -1145,13 +1359,13 @@ def register_xiaozhi_routes(app: FastAPI):
                     # utterance_active: collect everything until silence.
                     buf_frames.append(pkt)
                     thr = speech_threshold()
-                    if _is_speech_vad(pcm, rms, thr):
+                    if await _is_speech_vad_async(pcm, rms, thr):
                         speech_count += 1
                         silence_count = 0
                     else:
                         silence_count += 1
                     # VAD 可用时静音确认更短(0.48s vs RMS 1.2s), 砍尾静音延迟
-                    silence_limit = SILENCE_FRAMES_VAD if _silero_vad is not None else SILENCE_FRAMES
+                    silence_limit = SILENCE_FRAMES_VAD if (VAD_ENABLED and _load_silero_vad() is not None) else SILENCE_FRAMES
                     capped = len(buf_frames) >= MAX_UTTERANCE_FRAMES
                     # Background-noise guard: if a long time passes without ever
                     # reaching enough real speech, silently drop the buffer rather
@@ -1186,7 +1400,7 @@ def register_xiaozhi_routes(app: FastAPI):
                         # (user replies to our answer without re-waking) stays hot.
                         if _arm_win > 0:
                             armed_until = time.monotonic() + _arm_win
-                        asyncio.create_task(process_utterance(frames))
+                        _track_task(asyncio.create_task(process_utterance(frames)))
                     continue
 
                 text = msg.get("text")
@@ -1265,7 +1479,7 @@ def register_xiaozhi_routes(app: FastAPI):
                                 if _arm_win > 0:
                                     # Valid in-window utterance: keep the hot window.
                                     armed_until = time.monotonic() + _arm_win
-                                asyncio.create_task(process_utterance(frames))
+                                _track_task(asyncio.create_task(process_utterance(frames)))
 
                 elif mtype == "abort":
                     await cancel_stream()
@@ -1280,6 +1494,10 @@ def register_xiaozhi_routes(app: FastAPI):
             log.error("[xiaozhi] error: %s", e, exc_info=True)
         finally:
             bump_metric("ws_active", -1)
+            for t in list(_connection_tasks):
+                if not t.done():
+                    t.cancel()
+            _connection_tasks.clear()
             unregister_xiaozhi_client(session_id)
             try:
                 await send_json({"type": "tts", "state": "stop"})

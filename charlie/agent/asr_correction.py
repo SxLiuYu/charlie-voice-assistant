@@ -21,7 +21,7 @@ log = logging.getLogger("magic")
 # 语气词/填充词（可配置）
 _FILLER_WORDS = [w.strip() for w in os.getenv(
     "ASR_FILLER_WORDS",
-    "嗯,啊,呃,呢,吧,嘛,呀,哦,唉,哎,哈,呐,哟,诶"
+    "嗯,啊,呃,嘛,呀,哦,唉,哎,哈,呐,哟,诶"
 ).split(",") if w.strip()]
 
 # 唤醒词归一化映射（key=ASR可能误识别的词，value=标准唤醒词）
@@ -34,9 +34,11 @@ _ENABLED = os.getenv("ASR_CORRECTION_ENABLED", "1") == "1"
 _LLM_CORRECTION = os.getenv("ASR_LLM_CORRECTION", "0") == "1"
 
 # ===== 文件规则纠错（来自 gitee assistant-x-openclaw） =====
+# 词表是项目内静态资产（随代码分发），必须基于模块位置解析；
+# 不能用 DATA_DIR（外部数据目录）——否则词表静默丢失、纠错全部失效
 _CORRECTIONS_FILE = os.path.join(
-    os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "text_corrections.txt"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "text_corrections.txt"
 )
 _file_rules: List[Tuple[re.Pattern, str]] = []
 _file_rules_mtime = 0.0
@@ -170,7 +172,8 @@ def _llm_correction(text: str) -> str:
         corrected = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         if corrected and len(corrected) <= len(text) * 1.5:
             return corrected
-    except Exception:
+    except Exception as e:
+        log.debug(f"[agent.asr_correction] error at line 173: {e}")
         pass
     return text
 

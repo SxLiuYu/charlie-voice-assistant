@@ -153,11 +153,15 @@ class TestMcpProcessCleanup:
         assert "重启" in msg
 
     def test_restart_brain_sets_none(self):
-        """restart_brain后所有缓存大脑被清空"""
+        """restart_brain后旧缓存清空, 并预热默认大脑(健康检查ready恢复)"""
         import voice_agent
+        from unittest.mock import patch
         voice_agent._brains["test"] = "fake_brain"
-        voice_agent.restart_brain()
+        with patch("agent.llm._get_brain", return_value="warm_default_brain") as mock_warm:
+            voice_agent.restart_brain()
+        # 旧缓存被清; restart 预热默认大脑(mock下不写缓存, 验证预热被调用)
         assert voice_agent._brains == {}
+        mock_warm.assert_called_once()
 
     def test_record_failure_cleans_up_on_rebuild(self):
         """连续失败达阈值时清理旧大脑"""

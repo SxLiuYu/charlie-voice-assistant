@@ -4,6 +4,7 @@ Extracted from voice_server.py.
 """
 import os, sys, json, time, datetime, logging, asyncio, threading
 import base64 as _b64enc
+import hmac
 import queue as _queue
 import requests
 
@@ -34,9 +35,11 @@ def _get_conv_helpers():
     from app.routes.conversation import (
         _friendly_brain_error, _flush_tts_buffer, _empty_asr_events,
         _low_intent_asr_events, _synthesize_tts_event, _check_session_rate,
+        _flush_tts_buffer_stream,
     )
     return (_friendly_brain_error, _flush_tts_buffer, _empty_asr_events,
-            _low_intent_asr_events, _synthesize_tts_event, _check_session_rate)
+            _low_intent_asr_events, _synthesize_tts_event, _check_session_rate,
+            _flush_tts_buffer_stream)
 
 def _ws_cleanup_stale():
     now = time.time()
@@ -88,8 +91,9 @@ async def _ws_stream_and_send(ws, ws_id, *, text, asr_text="", session_id, inter
     except Exception as e:
         log.error(f"[ws] 流式任务异常 (id={ws_id}): {e}")
         try:
-            await ws.send_json({"type": "error", "message": str(e)[:60]})
-        except Exception:
+            await ws.send_json({"type": "error", "message": "服务暂时不可用，请稍后重试"})
+        except Exception as e:
+            log.debug(f"[app.routes.websocket] error at line 92: {e}")
             pass
     finally:
         with _ws_clients_lock:
@@ -140,7 +144,8 @@ async def _ws_broadcast_to_session(ws_id, event, exclude_self=True):
     for pinfo in peer_infos:
         try:
             await pinfo["ws"].send_json(event)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.routes.websocket] error at line 143: {e}")
             pass
 
 async def _ws_reverse_geocode(lat, lng):
@@ -192,8 +197,13 @@ def _ws_cleanup_after_disconnect(ws_id, close_connection=False):
 async def _ws_stream_brain(ws_id, text, session_id="default", interrupted_reply=""):
     from voice_agent import brain_stream_sentences
     from agent.tts_player import TTSParallelPlayer
+    from agent.asr_tts import TTS_PRIORITY
     (_friendly_brain_error, _flush_tts_buffer, _empty_asr_events,
-     _low_intent_asr_events, _synthesize_tts_event, _check_session_rate) = _get_conv_helpers()
+     _low_intent_asr_events, _synthesize_tts_event, _check_session_rate,
+     _flush_tts_buffer_stream) = _get_conv_helpers()
+
+    # Audio8 流式模式：TTS_PRIORITY[0] == "audio8" 时走逐块输出
+    audio8_stream_mode = bool(TTS_PRIORITY and TTS_PRIORITY[0] == "audio8")
 
     q = _queue.Queue()
 
@@ -207,7 +217,51 @@ async def _ws_stream_brain(ws_id, text, session_id="default", interrupted_reply=
             q.put(("done", None, None))
 
     threading.Thread(target=brain_worker, daemon=True).start()
-    # TTS 并行合成 + 顺序播放 (来自 gitee assistant-x-openclaw)
+
+    # ── Audio8 流式路径：逐句流式合成，首块 ~0.7s 即输出 ──
+    if audio8_stream_mode:
+        tts_buffer = ""
+        tts_failed = False
+        try:
+            while True:
+                with _ws_clients_lock:
+                    if _ws_clients.get(ws_id, {}).get("interrupt"):
+                        break
+                try:
+                    etype, sentence, full_reply = q.get_nowait()
+                except _queue.Empty:
+                    await asyncio.sleep(0.05)
+                    continue
+                if etype == "done":
+                    # 提交剩余 buffer 并流式输出
+                    if tts_buffer.strip() and not tts_failed:
+                        for wav_b64 in _flush_tts_buffer_stream(tts_buffer):
+                            yield {"type": "audio", "data": wav_b64}
+                    yield {"type": "done"}
+                    break
+                elif etype == "error":
+                    yield {"type": "error", "message": sentence}
+                    yield {"type": "done"}
+                    break
+                elif etype == "sentence":
+                    with _ws_clients_lock:
+                        if _ws_clients.get(ws_id, {}).get("interrupt"):
+                            break
+                    yield {"type": "text", "text": sentence}
+                    if sentence and len(sentence) >= 2 and not sentence.startswith('__MUSIC__') and sentence != '__MUSIC_STOP__':
+                        tts_buffer = (tts_buffer + "，" + sentence) if tts_buffer else sentence
+                        # 立即流式合成当前 buffer（首句即出声）
+                        if tts_buffer.strip():
+                            for wav_b64 in _flush_tts_buffer_stream(tts_buffer):
+                                yield {"type": "audio", "data": wav_b64}
+                            tts_buffer = ""
+        except Exception as e:
+            log.warning(f"[ws-stream] Audio8 流式异常: {e}")
+            yield {"type": "error", "message": _friendly_brain_error(e)}
+            yield {"type": "done"}
+        return
+
+    # ── 常规路径：并行合成 + 顺序播放（非 audio8 provider） ──
     player = TTSParallelPlayer(max_workers=2)
     tts_buffer = ""
     tts_failed = False
@@ -215,71 +269,36 @@ async def _ws_stream_brain(ws_id, text, session_id="default", interrupted_reply=
     total_wait = 0
     pending_seqs: list[int] = []  # seq numbers waiting to be played
 
-    while True:
-        with _ws_clients_lock:
-            if _ws_clients.get(ws_id, {}).get("interrupt"):
-                break
-        # Event-driven: await async result instead of polling
-        player_result = await player.async_get_next(timeout=0.1)
-        try:
-            item = q.get_nowait()
-            total_wait = 0
-        except _queue.Empty:
-            if total_wait >= 120:
-                yield {"type": "error", "message": "思考超时"}
-                yield {"type": "done"}
-                break
-            if not player_result:
-                await asyncio.sleep(0.1)
-                total_wait += 0.1
-            continue
-        etype, sentence, full_reply = item
-        if etype == "done":
-            if tts_buffer.strip() and not tts_failed:
-                seq = player.submit(tts_buffer, _flush_tts_buffer)
-                if seq >= 0:
-                    pending_seqs.append(seq)
-                # Drain remaining results
-                while pending_seqs:
-                    result = await player.async_get_next(timeout=1.0)
-                    if result is None:
-                        break
-                    _, txt, audio_b64, warning = result
-                    if warning:
-                        if not tts_failed:
-                            tts_failed = True
-                            yield warning
-                    elif audio_b64:
-                        yield {"type": "audio", "data": audio_b64}
-                    if result[0] in pending_seqs:
-                        pending_seqs.remove(result[0])
-            yield {"type": "done"}
-            break
-        elif etype == "error":
-            yield {"type": "error", "message": sentence}
-            yield {"type": "done"}
-            break
-        elif etype == "sentence":
+    try:
+        while True:
             with _ws_clients_lock:
                 if _ws_clients.get(ws_id, {}).get("interrupt"):
                     break
-            yield {"type": "text", "text": sentence}
-            if sentence and len(sentence) >= 2 and not sentence.startswith('__MUSIC__') and sentence != '__MUSIC_STOP__':
-                tts_buffer = (tts_buffer + "，" + sentence) if tts_buffer else sentence
-                if not first_audio_sent:
-                    if tts_failed:
-                        tts_buffer = ""
-                        first_audio_sent = True
-                        continue
-                    # 提交到并行 TTS 播放器
+            # Event-driven: await async result instead of polling
+            player_result = await player.async_get_next(timeout=0.1)
+            try:
+                item = q.get_nowait()
+                total_wait = 0
+            except _queue.Empty:
+                if total_wait >= 120:
+                    yield {"type": "error", "message": "思考超时"}
+                    yield {"type": "done"}
+                    break
+                if not player_result:
+                    await asyncio.sleep(0.1)
+                    total_wait += 0.1
+                continue
+            etype, sentence, full_reply = item
+            if etype == "done":
+                if tts_buffer.strip() and not tts_failed:
                     seq = player.submit(tts_buffer, _flush_tts_buffer)
                     if seq >= 0:
                         pending_seqs.append(seq)
-                    tts_buffer = ""
-                    first_audio_sent = True
-                    # 等待并播放第一个结果
-                    result = await player.async_get_next(timeout=1.0)
-                    if result:
+                    # Drain remaining results
+                    while pending_seqs:
+                        result = await player.async_get_next(timeout=1.0)
+                        if result is None:
+                            break
                         _, txt, audio_b64, warning = result
                         if warning:
                             if not tts_failed:
@@ -289,16 +308,54 @@ async def _ws_stream_brain(ws_id, text, session_id="default", interrupted_reply=
                             yield {"type": "audio", "data": audio_b64}
                         if result[0] in pending_seqs:
                             pending_seqs.remove(result[0])
-        if player_result:
-            seq, txt, audio_b64, warning = player_result
-            if warning:
-                if not tts_failed:
-                    tts_failed = True
-                    yield warning
-            elif audio_b64:
-                yield {"type": "audio", "data": audio_b64}
-            if seq in pending_seqs:
-                pending_seqs.remove(seq)
+                yield {"type": "done"}
+                break
+            elif etype == "error":
+                yield {"type": "error", "message": sentence}
+                yield {"type": "done"}
+                break
+            elif etype == "sentence":
+                with _ws_clients_lock:
+                    if _ws_clients.get(ws_id, {}).get("interrupt"):
+                        break
+                yield {"type": "text", "text": sentence}
+                if sentence and len(sentence) >= 2 and not sentence.startswith('__MUSIC__') and sentence != '__MUSIC_STOP__':
+                    tts_buffer = (tts_buffer + "，" + sentence) if tts_buffer else sentence
+                    if not first_audio_sent:
+                        if tts_failed:
+                            tts_buffer = ""
+                            first_audio_sent = True
+                            continue
+                        # 提交到并行 TTS 播放器
+                        seq = player.submit(tts_buffer, _flush_tts_buffer)
+                        if seq >= 0:
+                            pending_seqs.append(seq)
+                        tts_buffer = ""
+                        first_audio_sent = True
+                        # 等待并播放第一个结果
+                        result = await player.async_get_next(timeout=1.0)
+                        if result:
+                            _, txt, audio_b64, warning = result
+                            if warning:
+                                if not tts_failed:
+                                    tts_failed = True
+                                    yield warning
+                            elif audio_b64:
+                                yield {"type": "audio", "data": audio_b64}
+                            if result[0] in pending_seqs:
+                                pending_seqs.remove(result[0])
+            if player_result:
+                seq, txt, audio_b64, warning = player_result
+                if warning:
+                    if not tts_failed:
+                        tts_failed = True
+                        yield warning
+                elif audio_b64:
+                    yield {"type": "audio", "data": audio_b64}
+                if seq in pending_seqs:
+                    pending_seqs.remove(seq)
+    finally:
+        player.stop()
 
 
 @router.websocket("/ws")
@@ -310,7 +367,7 @@ async def websocket_endpoint(ws: WebSocket):
         ci = ws.client.host if ws.client else ""
         if ci not in ("127.0.0.1", "::1", ""):
             tk = ws.query_params.get("token", "")
-            if tk != AUTH_TOKEN:
+            if not hmac.compare_digest(tk or "", AUTH_TOKEN or ""):
                 await ws.close(code=4001, reason="未授权")
                 return
     ws_id = id(ws)
@@ -328,6 +385,14 @@ async def websocket_endpoint(ws: WebSocket):
                     _ws_clients[ws_id]["last_active"] = time.time()
             except asyncio.TimeoutError:
                 await ws.send_json({"type": "ping"})
+                # Wait briefly for pong; if none, close the half-open connection
+                try:
+                    await asyncio.wait_for(ws.receive_text(), timeout=10.0)
+                    with _ws_clients_lock:
+                        _ws_clients[ws_id]["last_active"] = time.time()
+                except (asyncio.TimeoutError, WebSocketDisconnect, Exception):
+                    log.info(f"[ws] ping 无响应, 关闭半开连接 (id={ws_id})")
+                    break
                 continue
             try:
                 data = json.loads(msg)
@@ -369,7 +434,8 @@ async def websocket_endpoint(ws: WebSocket):
                 try:
                     from voice_agent import update_user_state
                     update_user_state(location=(lat, lng))
-                except Exception:
+                except Exception as e:
+                    log.debug(f"[app.routes.websocket] error at line 372: {e}")
                     pass
                 addr = await _ws_reverse_geocode(lat, lng)
                 log.info(f"[ws] 位置上报 (id={ws_id}): {addr}")
@@ -385,7 +451,7 @@ async def websocket_endpoint(ws: WebSocket):
                     await ws.send_json({"type": "error", "message": f"输入过长(上限{MAX_TEXT_LENGTH}字)"})
                     continue
                 _ws_join_session(ws_id, session_id)
-                (_, _, _, _, _, _check_session_rate) = _get_conv_helpers()
+                (_, _, _, _, _, _check_session_rate, _) = _get_conv_helpers()
                 allowed, _, _ = _check_session_rate(session_id)
                 if not allowed:
                     await ws.send_json({"type": "error", "message": "请求过于频繁，请稍后再试"})
@@ -421,7 +487,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 ws_session_id = data.get("session_id", "default")
                 _ws_join_session(ws_id, ws_session_id)
-                (_, _, _, _, _, _check_session_rate) = _get_conv_helpers()
+                (_, _, _, _, _, _check_session_rate, _) = _get_conv_helpers()
                 allowed, _, _ = _check_session_rate(ws_session_id)
                 if not allowed:
                     await ws.send_json({"type": "error", "message": "请求过于频繁，请稍后再试"})
@@ -439,7 +505,7 @@ async def websocket_endpoint(ws: WebSocket):
                 wav = to_wav(raw, fmt)
                 if likely_empty_audio(wav):
                     log.info(f"[ws] 本地判定为长静音，短路ASR、大脑和TTS (id={ws_id})")
-                    (_, _, _empty_asr_events, _, _, _) = _get_conv_helpers()
+                    (_, _, _empty_asr_events, _, _, _, _) = _get_conv_helpers()
                     for event in _empty_asr_events(False):
                         await ws.send_json(event)
                     continue
@@ -451,20 +517,20 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 if not asr_text:
                     log.info(f"[ws] ASR为空，短路大脑和TTS (id={ws_id})")
-                    (_, _, _empty_asr_events, _, _, _) = _get_conv_helpers()
+                    (_, _, _empty_asr_events, _, _, _, _) = _get_conv_helpers()
                     for event in _empty_asr_events(False):
                         await ws.send_json(event)
                     continue
                 from voice_agent import is_garbled_asr as _is_garbled_asr
                 if is_low_intent_asr(asr_text):
                     log.info(f"[ws] ASR为低意图语气词，短路大脑和TTS (id={ws_id})")
-                    (_, _, _, _low_intent_asr_events, _, _) = _get_conv_helpers()
+                    (_, _, _, _low_intent_asr_events, _, _, _) = _get_conv_helpers()
                     for event in _low_intent_asr_events(asr_text, False):
                         await ws.send_json(event)
                     continue
                 if _is_garbled_asr(asr_text):
                     log.info(f"[ws] ASR为乱码/碎片，短路大脑和TTS (id={ws_id})")
-                    (_, _, _empty_asr_events, _, _, _) = _get_conv_helpers()
+                    (_, _, _empty_asr_events, _, _, _, _) = _get_conv_helpers()
                     for event in _empty_asr_events(False):
                         await ws.send_json(event)
                     continue
@@ -499,7 +565,8 @@ async def websocket_endpoint(ws: WebSocket):
                     else:
                         pcm = wav
                     aq.push(pcm)
-                except Exception:
+                except Exception as e:
+                    log.debug(f"[app.routes.websocket] error at line 502: {e}")
                     pass
                 continue
             await ws.send_json({"type": "error", "message": f"未知消息类型: {mtype}"})

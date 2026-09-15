@@ -8,6 +8,7 @@ v2 改进:
 - 待确认状态: 决策引擎推送确认请求后, brain() 检测用户回应并记录反馈
 """
 import os, json, datetime, time, threading, logging, re
+from pathlib import Path
 
 log = logging.getLogger("magic")
 
@@ -24,13 +25,114 @@ def _get_sleep_hours():
         return (sleep_hour, wake_hour)
     except (ValueError, IndexError):
         return (22, 7)
+
+def _get_goodnight_window():
+    """晚安建议窗口: sleep_time 起3小时内（排除 wake 前的深夜尾部——
+    06:59 推"已经很晚了"是典型错位：该时段该推早安而不是晚安）"""
+    from agent.preferences import get_preference
+    sleep_time = get_preference("sleep_time")
+    try:
+        sleep_hour = int(sleep_time.split(":")[0]) if sleep_time else 22
+    except (ValueError, IndexError):
+        sleep_hour = 22
+    return (sleep_hour, (sleep_hour + 3) % 24)
+
+
+def _get_evening_wind_down_hours():
+    """晚安提醒时间：sleep_time 前2小时到前1小时"""
+    sleep_hour, _ = _get_sleep_hours()
+    start = sleep_hour - 2
+    end = sleep_hour - 1
+    # 处理跨天（如 sleep_hour=1 → start=-1 → 23, end=0）
+    if start < 0:
+        start += 24
+    if end < 0:
+        end += 24
+    return (start, end)
 DECISIONS_FILE = os.path.join(DATA_DIR, "decision_history.json")
 FEEDBACK_FILE = os.path.join(DATA_DIR, "decision_feedback.json")
 PENDING_FILE = os.path.join(DATA_DIR, "pending_confirmation.json")
-_decision_lock = threading.Lock()
+_decision_lock = threading.RLock()
+
+# _atomic_save: 原子写（唯一 tmp + fsync + os.replace）
+def _atomic_save(path: str, data, mode: str = "w", **kw):
+    import uuid as _uuid
+    tmp = f"{path}.tmp.{_uuid.uuid4().hex}"
+    try:
+        with open(tmp, mode, encoding="utf-8" if "b" not in mode else None, **kw) as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 
 # 冷却时间: 每个决策每12小时最多触发一次（24h太长，会错过当天窗口）
 _COOLDOWN_HOURS = 12
+# 反馈阈值: 负面反馈率超过此值, 该规则将被跳过
+_NEGATIVE_FEEDBACK_THRESHOLD = 0.6
+# 确认等待窗口: 秒（5 分钟，给用户看飞书消息并回复的时间）
+_CONFIRMATION_WINDOW = 300
+
+
+def _load_decision_history() -> dict:
+    with _decision_lock:
+        try:
+            if os.path.exists(DECISIONS_FILE):
+                with open(DECISIONS_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            log.debug(f"[decision] op failed: {e}")
+        return {}
+
+
+def _save_decision_history(history: dict):
+    with _decision_lock:
+        try:
+            _atomic_save(DECISIONS_FILE, history)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            log.debug(f"[decision] op failed: {e}")
+
+
+def mark_triggered(rule_id: str) -> None:
+    """公开接口：标记规则已触发（原子 read-modify-write）"""
+    with _decision_lock:
+        history = {}
+        try:
+            if os.path.exists(DECISIONS_FILE):
+                with open(DECISIONS_FILE, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            log.debug(f"[decision] mark failed: {e}")
+        history[rule_id] = {
+            "last_trigger": time.time(),
+            "trigger_time": datetime.datetime.now().isoformat(),
+        }
+        try:
+            _atomic_save(DECISIONS_FILE, history)
+        except Exception as e:
+            log.debug(f"[decision] mark failed: {e}")
+
+
+def _mark_triggered(rule_id: str, history: dict):
+    """（遗留接口，已由 mark_triggered 内联）
+
+    兼容旧调用: execute_decision 中 _mark_triggered(rule["id"], history)
+    这里直接原子写，不重复获取锁（调用方已有锁或在 mark_triggered 中已处理）。
+    """
+    history[rule_id] = {
+        "last_trigger": time.time(),
+        "trigger_time": datetime.datetime.now().isoformat(),
+    }
+    try:
+        _atomic_save(DECISIONS_FILE, history)
+    except Exception as e:
+        log.debug(f"[decision] mark_triggered failed: {e}")
 # 反馈阈值: 负面反馈率超过此值, 该规则将被跳过
 _NEGATIVE_FEEDBACK_THRESHOLD = 0.6
 # 确认等待窗口: 秒（5 分钟，给用户看飞书消息并回复的时间）
@@ -43,7 +145,7 @@ _DECISION_RULES = [
         "priority": 90,
         "condition": {
             "states": ["home_resting", "home_sleeping"],
-            "hours": _get_sleep_hours,  # callable，evaluate 时动态求值
+            "hours": _get_goodnight_window,  # callable: sleep起3小时(排除wake前尾部)
             "check_desc": "深夜+休息状态",
         },
         "action": {"type": "protocol", "name": "goodnight", "text": "已经很晚了，要帮你执行晚安场景吗？"},
@@ -100,10 +202,10 @@ _DECISION_RULES = [
         "priority": 50,
         "condition": {
             "states": ["home_awake", "home_resting"],
-            "hours": (21, 22),
-            "check_desc": "晚间+在家",
+            "hours": _get_evening_wind_down_hours,
+            "check_desc": "睡前提醒（动态读取sleep_time偏好）",
         },
-        "action": {"type": "tts", "text": "已经晚上9点了，该准备休息了。"},
+        "action": {"type": "tts", "text": "时间不早了，该准备休息了。"},
         "confirm": False,
     },
     {
@@ -122,9 +224,9 @@ _DECISION_RULES = [
         "id": "sedentary_break",
         "priority": 35,
         "condition": {
-            "states": ["working"],
+            "states": ["home_awake", "home_resting"],
             "hours": (9, 21),
-            "check_desc": "工作状态持续90分钟，提醒休息",
+            "check_desc": "屏幕活跃持续90分钟，提醒休息",
             "extra_check": "sedentary_check",
         },
         "action": {"type": "tts", "text": "已经连续工作一个半小时了，站起来活动一下吧。"},
@@ -211,11 +313,9 @@ def _load_feedback() -> dict:
 
 
 def _save_feedback(feedback: dict):
-    """保存反馈数据。注意: 调用方必须已持有 _decision_lock"""
     global _feedback_cache
     try:
-        with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
-            json.dump(feedback, f, ensure_ascii=False, indent=2)
+        _atomic_save(FEEDBACK_FILE, feedback)
     except Exception as e:
         log.warning(f"[decision] 保存反馈失败: {e}")
     _feedback_cache = None  # 使缓存失效
@@ -290,10 +390,11 @@ def _load_pending(user_id: str | None = None) -> dict | None:
     return None
 
 
-def _save_pending(rule_id: str, text: str, user_id: str = ""):
+def _save_pending(rule_id: str, text: str, user_id: str = "", extra_data: dict | None = None):
     """保存待确认状态
 
     user_id: 触发此确认的用户标识 (飞书场景为 open_id, 格式 feishu_{sender_id} 中的 sender_id)
+    extra_data: 附加数据（如 code_edit 的 path/old_text/new_text）
     """
     data = {
         "rule_id": rule_id,
@@ -301,6 +402,8 @@ def _save_pending(rule_id: str, text: str, user_id: str = ""):
         "timestamp": time.time(),
         "user_id": user_id,
     }
+    if extra_data:
+        data["extra_data"] = extra_data
     try:
         with open(PENDING_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
@@ -308,12 +411,13 @@ def _save_pending(rule_id: str, text: str, user_id: str = ""):
         log.debug(f"[decision] op failed: {e}")
 
 
-def set_pending_confirmation(rule_id: str, text: str, user_id: str = ""):
+def set_pending_confirmation(rule_id: str, text: str, user_id: str = "", extra_data: dict | None = None):
     """设置待确认决策: 用户需要回应此决策
 
     user_id: 触发此确认的用户标识
+    extra_data: 附加数据（如 code_edit 的 path/old_text/new_text）
     """
-    _save_pending(rule_id, text, user_id=user_id)
+    _save_pending(rule_id, text, user_id=user_id, extra_data=extra_data)
     log.info(f"[decision] 待确认: {rule_id} -> {text[:50]} (user_id={user_id})")
 
 
@@ -332,6 +436,38 @@ def clear_pending_confirmation():
             os.remove(PENDING_FILE)
     except (OSError, json.JSONDecodeError, ValueError) as e:
         log.debug(f"[decision] op failed: {e}")
+
+
+# ===== confirm 询问每日上限（跨重启持久化，防止用户未回应时整夜重复询问） =====
+
+_CONFIRM_MAX_ASKS_PER_DAY = 2  # 同一 confirm 规则每天最多询问次数
+
+
+def get_confirm_ask_count(rule_id: str) -> int:
+    """读取 confirm 规则今天的已询问次数（按自然日计数，跨天自动归零）"""
+    history = _load_decision_history()
+    entry = history.get(f"_confirm_{rule_id}", {})
+    today = datetime.date.today().isoformat()
+    if entry.get("date") == today:
+        return int(entry.get("count", 0))
+    return 0
+
+
+def record_confirm_ask(rule_id: str):
+    """记录一次 confirm 询问，持久化到决策历史文件"""
+    # _load/_save 各自持锁，顺序调用避免重入
+    history = _load_decision_history()
+    key = f"_confirm_{rule_id}"
+    today = datetime.date.today().isoformat()
+    entry = history.get(key, {})
+    if entry.get("date") == today:
+        entry["count"] = int(entry.get("count", 0)) + 1
+    else:
+        entry = {"date": today, "count": 1}
+    entry["last_ask"] = time.time()
+    history[key] = entry
+    _save_decision_history(history)
+    log.info(f"[decision] confirm询问计数({rule_id}): 今日第{entry['count']}次")
 
 
 # ===== 决策历史 =====
@@ -365,32 +501,12 @@ def _check_cooldown(rule_id: str, history: dict) -> bool:
     return elapsed > cooldown or last == 0
 
 
-def _mark_triggered(rule_id: str, history: dict):
-    history[rule_id] = {
-        "last_trigger": time.time(),
-        "trigger_time": datetime.datetime.now().isoformat(),
-    }
-    _save_decision_history(history)
-
-
-def mark_triggered(rule_id: str) -> None:
-    """公开接口：标记规则已触发（写冷却历史）"""
-    history = _load_decision_history()
-    _mark_triggered(rule_id, history)
-
-
 def _calendar_check() -> str | None:
     """检查飞书日历中是否有即将开始的会议, 返回事件摘要或None"""
     try:
-        import os as _os, requests as _req
-        feishu_id = _os.getenv("FEISHU_APP_ID", "")
-        feishu_secret = _os.getenv("FEISHU_APP_SECRET", "")
-        if not feishu_id or not feishu_secret:
-            return None
-        # 获取 token
-        r = _req.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            json={"app_id": feishu_id, "app_secret": feishu_secret}, timeout=10)
-        token = r.json().get("tenant_access_token", "")
+        import requests as _req
+        from feishu_token import get_tenant_access_token
+        token = get_tenant_access_token()
         if not token:
             return None
         # 获取日历列表
@@ -458,15 +574,20 @@ def _deadline_check() -> str | None:
 
 # 天气预警去重
 _last_weather_alert = {"text": "", "ts": 0}
+_last_weather_check_ts = 0  # 上次检查时间戳（无论是否触发预警）
 
 
 def _weather_alert_check() -> str | None:
     """检查极端天气/空气质量预警"""
-    global _last_weather_alert
+    global _last_weather_alert, _last_weather_check_ts
     now = time.time()
     # 同一预警 6 小时内不重复
     if _last_weather_alert["ts"] and now - _last_weather_alert["ts"] < 21600:
         return None
+    # 检查冷却：即使无预警也限制查询频率，避免每次决策周期都调用天气 API
+    if _last_weather_check_ts and now - _last_weather_check_ts < 1800:  # 30 分钟
+        return None
+    _last_weather_check_ts = now
     try:
         from app.weather import get_weather_alerts
         alerts = get_weather_alerts()
@@ -495,7 +616,7 @@ _last_sedentary_alert = 0
 
 
 def _sedentary_check() -> str | None:
-    """检查是否持续工作超过90分钟"""
+    """检查是否持续工作超过90分钟（基于屏幕活跃时间，不依赖语音交互）"""
     global _last_sedentary_alert
     now = time.time()
     # 2小时内不重复
@@ -504,12 +625,23 @@ def _sedentary_check() -> str | None:
     try:
         from agent.state import get_user_state
         state = get_user_state()
-        if state.get("state") != "working":
+        # 不再要求 state == "working"：用户可能在工作但没和 Charlie 对话
+        # 只要屏幕活跃且未离家/睡眠即可
+        if state.get("state") in ("away", "home_sleeping"):
             return None
-        # last_voice_activity 距今的秒数
+        # 基于 last_screen_active 判断连续工作时长
+        last_screen = state.get("last_screen_active", 0)
+        if last_screen <= 0:
+            return None
+        screen_idle = now - last_screen
+        # 屏幕最近 5 分钟内活跃 = 正在使用电脑
+        if screen_idle > 300:
+            return None
+        # 检查持续工作时长：从 last_voice_activity 往前推算
+        # 用 last_voice_activity 作为"工作开始"的近似参考
         last_voice = state.get("last_voice_activity", now)
-        working_duration = now - last_voice
-        if working_duration >= 5400:  # 90分钟
+        work_span = now - last_voice
+        if work_span >= 5400:  # 90分钟未进行语音交互+屏幕仍活跃
             _last_sedentary_alert = now
             return "已经连续工作一个半小时了，站起来活动一下吧。"
     except Exception as e:
@@ -583,8 +715,9 @@ def _contextual_greeting_check() -> str | None:
         try:
             from app.weather import get_weather_text
             w = get_weather_text()
-            if w and ("雨" in w or "雪" in w):
-                parts.append(f"外面{w}，记得带伞")
+            if w:
+                # w 已经包含穿衣/带伞建议，直接用，不再额外追加
+                parts.append(f"外面{w}")
         except (OSError, TypeError) as e:
             log.debug(f"[decision] 天气检查跳过: {e}")
 
@@ -600,7 +733,11 @@ def _contextual_greeting_check() -> str | None:
             log.debug(f"[decision] 待办检查跳过: {e}")
 
         if parts:
-            return "，".join(parts) + "。"
+            msg = "，".join(parts)
+            # 如果末尾已经有句号，不再追加
+            if not msg.endswith("。"):
+                msg += "。"
+            return msg
 
         # 没有特殊上下文时返回 None，让 casual_checkin 走随机问候
         return None
@@ -786,6 +923,12 @@ def execute_decision(rule: dict, protocol_executor, confirmed: bool = False) -> 
     elif action_type == "reminder":
         log.info(f"[decision] 设置提醒: {action.get('text', '')}")
         return f"已设提醒: {action.get('text', '')}"
+    elif action_type == "code_edit":
+        try:
+            return _execute_code_edit_from_pending(rule)
+        except Exception as e:
+            log.warning(f"[decision] 代码修改执行失败: {e}")
+            return f"代码修改失败: {e}"
     return ""
 
 
@@ -891,6 +1034,11 @@ def check_feedback(text: str, user_id: str | None = None, session_id: str = "def
 
     rid = pending.get("rule_id", "")
     rule = next((r for r in _DECISION_RULES if r["id"] == rid), None)
+    
+    # code_edit 规则是动态创建的（不在 _DECISION_RULES 中），构造合成 rule
+    if not rule and rid.startswith("code_edit_"):
+        rule = {"id": rid, "action": {"type": "code_edit"}, "safe": True}
+    
     if not rule:
         clear_pending_confirmation()
         return None
@@ -933,24 +1081,58 @@ def check_feedback(text: str, user_id: str | None = None, session_id: str = "def
         return f"好的，已取消「{rule['action'].get('name', rid)}」。"
 
     if _POSITIVE_PATTERNS.match(head):
-        # 用户确认 → 执行协议
+        # 用户确认 → 执行决策
         record_feedback(rid, True)
-        clear_pending_confirmation()
         log.info(f"[decision] 用户确认: {rid} (text={text[:30]})")
         try:
+            # 延迟导入 magic_scenes 避免循环依赖
             from app import load_magic_module
-            _scene = load_magic_module("magic_scenes", "magic-scenes.py")
-            if not _scene:
-                return f"「{rule['action'].get('name', rid)}」场景模块不可用。"
-            result = execute_decision(rule, _scene.execute_protocol, confirmed=True)
+            _scenes = load_magic_module("magic_scenes", "magic-scenes.py")
+            protocol_executor = _scenes.execute_protocol if _scenes else None
+            result = execute_decision(rule, protocol_executor, confirmed=True)
             log.info(f"[decision] 执行结果: {result[:80] if result else '(空)'}")
+            clear_pending_confirmation()
             return result or f"「{rule['action'].get('name', rid)}」已执行。"
         except Exception as e:
             log.warning(f"[decision] 确认后执行失败: {e}")
-            return f"执行失败: {e}"
+            clear_pending_confirmation()
+            return f"执行失败，请稍后重试。"
 
     # 不匹配确认/拒绝 → 返回 None 交给正常对话
     return None
+
+
+def _execute_code_edit_from_pending(rule: dict) -> str:
+    """从 pending_confirmation 中读取 code_edit 参数并执行。"""
+    pending = get_pending_confirmation()
+    if not pending:
+        return "错误：未找到待执行的代码修改请求"
+    
+    extra = pending.get("extra_data", {})
+    path = extra.get("path", "")
+    old_text = extra.get("old_text", "")
+    new_text = extra.get("new_text", "")
+    
+    if not path or old_text == new_text:
+        return "错误：修改参数不完整"
+    
+    # 调用 magic-dev.edit_file 执行（它内部会做路径检查和写入）
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "magic_dev_exec",
+            str(Path(__file__).resolve().parent / "magic-dev.py")
+        )
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # 直接调用 edit_file 的底层写入逻辑（跳过 pending 确认，因为用户已确认）
+            result = mod._write_edit(path, old_text, new_text)
+            return result
+    except Exception as e:
+        log.warning(f"[decision] 调用 magic-dev 执行修改失败: {e}")
+    
+    return "错误：执行代码修改失败"
 
 
 if __name__ == "__main__":

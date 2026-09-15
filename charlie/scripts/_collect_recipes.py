@@ -1,7 +1,9 @@
 """Collect Chinese recipes from HowToCook and other sources."""
 import os, json, re, requests, time
 
-DATA_DIR = "/Users/sxliuyu/orca/projects/charlie/data/charlie/recipe-app/data"
+# Data directory resolved relative to the repo root; override with CHRLIE_DATA_DIR
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DATA_DIR = os.environ.get("CHRLIE_DATA_DIR") or os.path.join(_REPO_ROOT, "data", "charlie", "recipe-app", "data")
 OUTPUT_FILE = os.path.join(DATA_DIR, "recipes.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 

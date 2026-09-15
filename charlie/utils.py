@@ -37,6 +37,16 @@ def parse_time_str(s: str) -> str | None:
     # 相对时间(分钟/小时/天后) 和 绝对日期(明天/后天) 互斥, 不叠加
     has_relative = False
     has_absolute_date = False
+    # N秒后 / 半分钟后
+    ss = re.search(r"(\d+)\s*秒后", s)
+    if ss:
+        tg += datetime.timedelta(seconds=int(ss.group(1)))
+        ok = True
+        has_relative = True
+    elif "半分钟后" in s:
+        tg += datetime.timedelta(seconds=30)
+        ok = True
+        has_relative = True
     # N分钟后
     mm = re.search(r"(\d+)\s*分(?:钟)?后", s)
     if mm:
@@ -93,7 +103,8 @@ def cleanup_temp_files(pattern: str = "/tmp/*_reply.wav", extra_dirs: list[str] 
         try:
             os.unlink(f)
             removed += 1
-        except Exception:
+        except Exception as e:
+            log.debug(f"[utils] error at line 96: {e}")
             pass
     if removed > 0:
         log.info(f"[cleanup] 清理{removed}个临时文件")

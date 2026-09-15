@@ -66,7 +66,7 @@ def _patch_lite_deps(monkeypatch):
 
     monkeypatch.setattr(_llm_mod, "active_chat_endpoint", lambda: ("http://test", "key", "model"))
     monkeypatch.setattr(_llm_mod, "_get_history", lambda sid: [])
-    monkeypatch.setattr(_llm_mod, "_build_system_msg", lambda mcp: "system prompt")
+    monkeypatch.setattr(_llm_mod, "_build_system_msg", lambda mcp, session_id="default": "system prompt")
     monkeypatch.setattr(_llm_mod, "_build_wm_anaphor_prompt", lambda: None)
     # Sentence splitting: any sentence-ending punctuation
     monkeypatch.setattr(_llm_mod, "_SENTENCE_END", re.compile(r"[。！？\n]"))

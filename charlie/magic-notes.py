@@ -9,9 +9,39 @@ __mcp_meta__ = {
 
 from mcp.server.fastmcp import FastMCP
 import os
+import tempfile
 import logging
+import threading
+
 log = logging.getLogger("magic")
 mcp = FastMCP("magic-notes")
+
+_shopping_lock = threading.Lock()
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """原子写文本文件：tempfile.mkstemp + fsync + os.replace"""
+    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".notes_", suffix=".tmp", dir=target_dir)
+    f_wrapped = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f_wrapped = True
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if not f_wrapped:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 @mcp.tool()
@@ -37,8 +67,7 @@ def save_note(title: str = "", content: str = "") -> str:
 
         now = datetime.now()
         full = f"# {title}\n\n{content}\n\n_记录于 {now.strftime('%Y-%m-%d %H:%M')}_\n"
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(full)
+        _atomic_write_text(filepath, full)
         return f"已保存备忘录：{title} → {filename}"
     except Exception as e:
         return f"保存备忘录失败: {e}"
@@ -77,28 +106,27 @@ def add_shopping_item(item: str, quantity: str = "") -> str:
     例: add_shopping_item("牛奶", "2箱") → 购物清单添加牛奶2箱
         add_shopping_item("鸡蛋") → 购物清单添加鸡蛋
     """
-    try:
-        from datetime import datetime
-        shopping_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes", "shopping_list.md")
-        os.makedirs(os.path.dirname(shopping_file), exist_ok=True)
-        # 读取现有清单
-        existing = ""
-        if os.path.exists(shopping_file):
-            with open(shopping_file, 'r', encoding='utf-8') as f:
-                existing = f.read()
-        # 添加新条目
-        entry = f"- [ ] {item} {quantity}".strip()
-        if existing:
-            lines = existing.split('\n')
-            lines.append(entry)
-            with open(shopping_file, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(lines))
-        else:
-            with open(shopping_file, 'w', encoding='utf-8') as f:
-                f.write(f"# 购物清单\n\n{entry}\n")
-        return f"已添加到购物清单：{item} {quantity}"
-    except Exception as e:
-        return f"添加购物清单失败: {e}"
+    with _shopping_lock:
+        try:
+            from datetime import datetime
+            shopping_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes", "shopping_list.md")
+            os.makedirs(os.path.dirname(shopping_file), exist_ok=True)
+            # 读取现有清单
+            existing = ""
+            if os.path.exists(shopping_file):
+                with open(shopping_file, 'r', encoding='utf-8') as f:
+                    existing = f.read()
+            # 添加新条目
+            entry = f"- [ ] {item} {quantity}".strip()
+            if existing:
+                lines = existing.split('\n')
+                lines.append(entry)
+                _atomic_write_text(shopping_file, '\n'.join(lines))
+            else:
+                _atomic_write_text(shopping_file, f"# 购物清单\n\n{entry}\n")
+            return f"已添加到购物清单：{item} {quantity}"
+        except Exception as e:
+            return f"添加购物清单失败: {e}"
 
 
 @mcp.tool()
@@ -127,13 +155,13 @@ def clear_shopping_list() -> str:
 
     例: clear_shopping_list() → 清空购物清单
     """
-    try:
-        shopping_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes", "shopping_list.md")
-        with open(shopping_file, 'w', encoding='utf-8') as f:
-            f.write("# 购物清单\n\n")
-        return "购物清单已清空。"
-    except Exception as e:
-        return f"清空购物清单失败: {e}"
+    with _shopping_lock:
+        try:
+            shopping_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes", "shopping_list.md")
+            _atomic_write_text(shopping_file, "# 购物清单\n\n")
+            return "购物清单已清空。"
+        except Exception as e:
+            return f"清空购物清单失败: {e}"
 
 
 if __name__ == "__main__":

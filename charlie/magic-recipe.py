@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 import logging
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,8 +92,27 @@ def _load_history() -> dict:
 
 def _save_recipes(recipes: list):
     try:
-        with open(RECIPE_FILE, "w", encoding="utf-8") as f:
-            json.dump(recipes, f, ensure_ascii=False, indent=2)
+        target_dir = os.path.dirname(os.path.abspath(RECIPE_FILE)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".recipe_", suffix=".tmp", dir=target_dir)
+        f_wrapped = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f_wrapped = True
+                json.dump(recipes, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, RECIPE_FILE)
+        except Exception:
+            if not f_wrapped:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except OSError as e:
         log.warning(f"[recipe] 保存菜谱失败: {e}")
 

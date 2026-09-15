@@ -9,6 +9,7 @@ log = logging.getLogger("magic")
 
 # 按年缓存: {year: [holiday_dict, ...]}
 _cache: dict[int, list[dict]] = {}
+_CACHE_MAX = 20  # 最多缓存 20 年的假日数据
 # 默认国家码
 _DEFAULT_COUNTRY = "CN"
 
@@ -38,6 +39,8 @@ def get_holidays(year: int = None, country: str = _DEFAULT_COUNTRY) -> list[dict
         year = datetime.datetime.now().year
     cache_key = year
     if cache_key not in _cache:
+        if len(_cache) > _CACHE_MAX:
+            _cache.clear()
         _cache[cache_key] = _fetch_holidays(year, country)
     return _cache[cache_key]
 

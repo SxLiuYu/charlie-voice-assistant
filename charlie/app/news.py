@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import hashlib
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -25,6 +26,7 @@ SOURCES = {
 # 简单缓存
 _cache: dict[str, tuple[float, list[dict]]] = {}
 _CACHE_TTL = 300  # 5分钟
+_CACHE_MAX = 50  # 最多缓存 50 个 feed
 
 
 def fetch_feed(source: str) -> list[dict]:
@@ -46,7 +48,11 @@ def fetch_feed(source: str) -> list[dict]:
     try:
         import feedparser
         url = RSSHUB_BASE.rstrip("/") + SOURCES[source]
-        feed = feedparser.parse(url)
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            log.debug(f"[news] 源 {source} 返回非200: {resp.status_code}")
+            return []
+        feed = feedparser.parse(resp.text)
         items = []
         for entry in feed.entries[:15]:
             items.append({
@@ -57,6 +63,16 @@ def fetch_feed(source: str) -> list[dict]:
                 "source": source,
             })
         _cache[cache_key] = (time.time(), items)
+        # Evict expired entries when cache is full
+        if len(_cache) > _CACHE_MAX:
+            now = time.time()
+            expired = [k for k, (ts, _) in _cache.items() if now - ts > _CACHE_TTL]
+            for k in expired:
+                _cache.pop(k, None)
+            # If still over limit, drop oldest
+            if len(_cache) > _CACHE_MAX:
+                oldest = min(_cache, key=lambda k: _cache[k][0])
+                _cache.pop(oldest, None)
         return items
     except ImportError:
         log.warning("[news] feedparser 未安装，pip install feedparser")

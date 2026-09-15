@@ -14,6 +14,7 @@
 """
 import os
 import logging
+import threading
 from typing import Optional
 
 log = logging.getLogger("magic")
@@ -218,6 +219,21 @@ def active_chat_endpoint() -> tuple[str, str, str]:
     return "", "", ""
 
 
+def active_is_glm() -> bool:
+    """当前优先级链解析出的对话端点是否属于 GLM。
+
+    用于 429 处理分流：GLM 轮换模型 + 清 brain 缓存只对 GLM 端点有意义，
+    stepfun/agnes 等限流时走通用失败处理，不能误清全部 brains。
+    """
+    base, _, _ = active_chat_endpoint()
+    if not base:
+        return False
+    try:
+        return base.rstrip("/") == _get_provider_cfg("glm")["base"].rstrip("/")
+    except Exception:
+        return "bigmodel" in base
+
+
 # ======================================================================
 # resolve — 返回 llm_cfg dict（供 qwen_agent 使用）
 # ======================================================================
@@ -356,6 +372,7 @@ def get_glm_models() -> list[str]:
 
 GLM_MODELS: list[str] = get_glm_models()  # 模块级变量，兼容 import
 _glm_rotation_idx: int = 0
+_glm_rotate_lock = threading.Lock()
 
 def rotate_glm_model() -> str:
     """轮换 GLM 模型（429 限流时调用），返回新的模型名"""
@@ -363,12 +380,13 @@ def rotate_glm_model() -> str:
     models = get_glm_models()
     if not models:
         return GLM_MODEL  # fallback to default
-    _glm_rotation_idx = (_glm_rotation_idx + 1) % len(models)
-    new_model = models[_glm_rotation_idx]
-    GLM_MODEL = new_model
-    os.environ["GLM_MODEL"] = new_model  # 让 resolve() 的 _read_env 能读到
-    log.info(f"[llm] GLM 模型轮换到: {new_model}")
-    return new_model
+    with _glm_rotate_lock:
+        _glm_rotation_idx = (_glm_rotation_idx + 1) % len(models)
+        new_model = models[_glm_rotation_idx]
+        GLM_MODEL = new_model
+        os.environ["GLM_MODEL"] = new_model  # 让 resolve() 的 _read_env 能读到
+        log.info(f"[llm] GLM 模型轮换到: {new_model}")
+        return new_model
 
 
 def ollama_online() -> bool:

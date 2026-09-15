@@ -60,7 +60,8 @@ def _infer_user_state():
             presence_score = presence.get_presence_confidence()
             if presence_score > 0.5:
                 at_home = True
-    except Exception:
+    except Exception as e:
+        log.debug(f"[agent.state] error at line 63: {e}")
         pass
 
     if not has_location and presence_score == 0.0:

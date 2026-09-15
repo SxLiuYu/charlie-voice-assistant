@@ -2,7 +2,7 @@
 
 依赖 voice_agent(延迟import避免循环); 预热在子线程跑独立event loop, 首请求省~9秒.
 """
-import logging, asyncio, threading
+import logging, asyncio, threading, os
 log = logging.getLogger("magic")
 
 def _brain_is_warm():
@@ -60,7 +60,8 @@ def _warmup_brain():
                     try:
                         audio = _tts_baidu(reply_text)
                         _tts_cache[reply_text] = audio
-                    except Exception:
+                    except Exception as e:
+                        log.debug(f"[app.brain_health] error at line 63: {e}")
                         pass
                 log.info(f"[warmup] 常见回复TTS预合成完成 ({len(_tts_cache)}条)")
             except Exception as e:
@@ -76,6 +77,28 @@ def _warmup_brain():
                 log.info("[warmup] amap-maps 大脑预启动完成, 首次天气查询将更快")
             except Exception as e:
                 log.warning(f"[warmup] amap-maps预热失败(不影响使用): {e}")
+            # 6. 预热 Agnes 大脑(冷启动实例初始化 ~13s → 热后 ~1s，省首次 LLM 切换)
+            try:
+                agnes_key = os.getenv("AGNES_KEY", "")
+                if agnes_key:
+                    agnes_base = os.getenv("AGNES_BASE", "https://apihub.agnes-ai.com/v1")
+                    agnes_model = os.getenv("AGNES_MODEL", "agnes-2.0-flash")
+                    from voice_agent import _session
+                    r = _session.post(
+                        f"{agnes_base}/chat/completions",
+                        headers={"Authorization": f"Bearer {agnes_key}",
+                                 "Content-Type": "application/json"},
+                        json={"model": agnes_model,
+                              "messages": [{"role": "user", "content": "hi"}],
+                              "max_tokens": 1},
+                        timeout=15,
+                    )
+                    r.raise_for_status()
+                    log.info("[warmup] Agnes 大脑预热完成, 首次请求将更快")
+                else:
+                    log.info("[warmup] Agnes 未配置，跳过预热")
+            except Exception as e:
+                log.warning(f"[warmup] Agnes预热失败(不影响使用): {e}")
         except Exception as e:
             log.warning(f"[warmup] 预热失败(不影响使用): {e}")
     threading.Thread(target=_w, daemon=True).start()

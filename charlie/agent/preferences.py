@@ -160,7 +160,8 @@ def _commit_preferences(mutate: Callable[[dict], Any]) -> Any:
     try:
         from agent.system_msg import invalidate_system_msg_cache
         invalidate_system_msg_cache()
-    except Exception:
+    except Exception as e:
+        log.debug(f"[agent.preferences] error at line 163: {e}")
         pass
     return result
 

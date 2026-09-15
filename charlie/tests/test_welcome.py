@@ -28,6 +28,10 @@ class TestWelcome:
         r = client.get("/welcome")
         assert r.status_code == 200
         assert "text/html" in r.headers.get("content-type", "")
+        # Body must contain HTML features (title or "配置引导") and be non-trivial
+        body = r.text
+        assert "<title" in body or "配置引导" in body
+        assert len(body) > 500
 
     def test_welcome_status_returns_structure(self, client):
         """GET /api/welcome/status 返回 {has_env, demo_mode, ollama_online, missing_required}"""
@@ -35,6 +39,8 @@ class TestWelcome:
         assert r.status_code == 200
         data = r.json()
         assert "has_env" in data
+        assert isinstance(data["has_env"], bool)
         assert "demo_mode" in data
         assert "ollama_online" in data
         assert "missing_required" in data
+        assert isinstance(data["missing_required"], list)

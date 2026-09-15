@@ -2,7 +2,7 @@
 Charlie - pytest配置
 设置sys.path + 公共fixtures
 """
-import sys, os, tempfile, copy
+import sys, os, tempfile, copy, threading
 import pytest
 # 确保能导入项目模块
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -66,7 +66,7 @@ _STATE_SNAPSHOT_KEYS = [
     ("agent.llm_state", "brain_total_failures"),
     # 第五轮补充：会话/缓存/patch 安装状态（app.state 全部模块级 mutable）
     ("agent.cache", "_cache"),
-    ("agent.llm", "_last_wm_session_id"),
+    ("agent.llm", "_wm_local"),
     ("app.state", "_rate_buckets"),
     ("app.state", "_session_buckets"),
     ("app.state", "_sse_clients"),
@@ -83,7 +83,46 @@ _STATE_SNAPSHOT_KEYS = [
     ("agent.context", "_context_cache_ts"),
     # Round 11: 历史摘要跨测试隔离
     ("agent.history", "_context_summaries"),
+    # P0: 偏好/历史文件路径与锁（被 round2 _restore_user_state 局部快照，此处作为全局安全网）
+    ("agent.preferences", "PREFS_FILE"),
+    ("agent.preferences", "PREFS_LOCK_FILE"),
+    ("agent.history", "HISTORY_FILE"),
+    ("agent.history", "HISTORY_LOCK_FILE"),
+    # P0: 历史文件签名/缓存（dict，deepcopy+clear/update 正确处理）
+    ("agent.history", "_history_file_signatures"),
+    ("agent.history", "_history_file_caches"),
+    # P1: context 退避状态
+    ("agent.context", "_context_fail_count"),
+    ("agent.context", "_context_backoff_until"),
+    # Round 9: AMAP 配额熔断时间戳（跨测试泄漏会让后续 AMAP 测试被短路）
+    ("app.weather", "_amap_blocked_until"),
+    # Round 13: 天气缓存（跨测试泄漏会让 mock 失效，污染矛盾标注断言）
+    ("app.weather", "_weather_cache"),
+    # Round 9 reviewer 建议：域关键词集合为 |= 增量增长，防跨测试累积
+    ("agent.llm", "_ALL_DOMAIN_KEYWORDS"),
+    # Round 21: WM 按会话隔离的数据（dict 隔离）；thread-local 不可深拷贝，单独清理
+    ("agent.working_memory", "_session_data"),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _clean_weather_state_file():
+    """Ensure AMAP block state file does not leak between tests."""
+    try:
+        import app.weather as weather_mod
+        state_file = getattr(weather_mod, "_WEATHER_STATE_FILE", None)
+        if state_file and os.path.exists(state_file):
+            os.unlink(state_file)
+    except Exception:
+        pass
+    yield
+    try:
+        import app.weather as weather_mod
+        state_file = getattr(weather_mod, "_WEATHER_STATE_FILE", None)
+        if state_file and os.path.exists(state_file):
+            os.unlink(state_file)
+    except Exception:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +147,25 @@ def _snapshot_global_state():
             pass
 
     yield  # 测试运行
+
+    # P1: 清理 context 刷新线程（不可深拷贝），避免跨测试泄漏
+    try:
+        import agent.context as _ctx_mod
+        if getattr(_ctx_mod, "_context_refresh_thread", None) is not None:
+            _ctx_mod._context_refresh_thread.join(timeout=2.0)
+            _ctx_mod._context_refresh_thread = None
+        _ctx_mod._context_fail_count = 0
+        _ctx_mod._context_backoff_until = 0.0
+    except Exception:
+        pass
+
+    # Round 21: 清理 WM thread-local session（threading.local 不可深拷贝）
+    try:
+        import agent.working_memory as _wm_mod
+        if hasattr(_wm_mod, "_session_local"):
+            _wm_mod._session_local = threading.local()
+    except Exception:
+        pass
 
     # 恢复：只恢复快照里存在的属性，键缺失时不新增
     for (mod_path, attr_name), orig_val in snapshot.items():

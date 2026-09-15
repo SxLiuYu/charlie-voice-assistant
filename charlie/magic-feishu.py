@@ -14,7 +14,6 @@ import os, json, requests, time
 from mcp.server.fastmcp import FastMCP
 import logging
 log = logging.getLogger("magic")
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
 try:
     from dotenv import load_dotenv; load_dotenv()
 except ImportError:
@@ -25,26 +24,10 @@ mcp = FastMCP("magic-feishu")
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
-_token_cache = {"token": "", "at": 0}
-
-
 def _get_token() -> str:
-    """获取飞书 tenant_access_token"""
-    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
-        return ""
-    now = time.time()
-    if _token_cache["token"] and now - _token_cache["at"] < 7200:
-        return _token_cache["token"]
-    try:
-        r = requests.post(f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal",
-            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, timeout=10)
-        token = r.json().get("tenant_access_token", "")
-        if token:
-            _token_cache["token"] = token
-            _token_cache["at"] = now
-        return token
-    except Exception:
-        return ""
+    """获取飞书 tenant_access_token（使用全局共享缓存）"""
+    from feishu_token import get_tenant_access_token
+    return get_tenant_access_token()
 
 
 @mcp.tool()

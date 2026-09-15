@@ -25,7 +25,8 @@ def _read_mcp_meta(fpath: str) -> dict | None:
                 target = node.targets[0]
                 if isinstance(target, ast.Name) and target.id == '__mcp_meta__':
                     return ast.literal_eval(node.value)
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.mcp_registry] error at line 28: {e}")
         pass
     return None
 
@@ -42,17 +43,9 @@ def _discover_mcp_metas() -> list[dict]:
         if not meta.get("name"):
             continue
         result.append(meta)
-    # 2. 非前缀文件（白名单）
-    for fname in ["baize_skills_mcp.py", "mcp_ir_control.py"]:
-        fpath = os.path.join(PROJECT_DIR, fname)
-        if not os.path.exists(fpath):
-            continue
-        meta = _read_mcp_meta(fpath)
-        if not meta or meta.get("disabled"):
-            continue
-        if not meta.get("name"):
-            continue
-        result.append(meta)
+    # 2. 非前缀文件（白名单，mcp_ir_control.py 已删除）
+    for fname in ["baize_skills_mcp.py"]:
+        pass
     # 3. 别名（无独立文件）
     result.append({"name": "filesystem", "tier": "core", "required_env": [], "label": "文件系统"})
     result.append({"name": "amap-maps", "tier": "core", "required_env": [], "label": "高德地图/天气"})
@@ -86,7 +79,7 @@ def _build_all_mcp() -> dict:
         _add_mcp(name, os.path.basename(fpath))
 
     # 2. 非前缀文件（白名单）
-    for fname in ["baize_skills_mcp.py", "mcp_ir_control.py"]:
+    for fname in ["baize_skills_mcp.py"]:
         fpath = os.path.join(PROJECT_DIR, fname)
         if not os.path.exists(fpath):
             continue
@@ -103,6 +96,12 @@ def _build_all_mcp() -> dict:
         result["filesystem"] = result["magic-notes"].copy()
     if "magic-info" in result:
         result["amap-maps"] = result["magic-info"].copy()
+
+    # 4. 注入完整环境变量。MCP SDK stdio 默认只继承 HOME/PATH 等白名单，
+    # 技能子进程依赖 ASSISTANT_KID_DATA_DIR/AMAP_KEY/FEISHU_APP_ID 等 .env 变量，
+    # 缺失会导致提醒写入错误路径、技能拿不到 API key。子进程是本项目脚本，传全量环境。
+    for cfg in result.values():
+        cfg["env"] = dict(os.environ)
 
     return result
 

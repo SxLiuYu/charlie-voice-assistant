@@ -68,6 +68,16 @@ pkill_wait() {
 log "看门狗v2启动 - 检查间隔60s"
 if ! command -v screen &>/dev/null; then log "❌ screen未安装，请运行: brew install screen"; exit 1; fi
 
+# 每次拉起子进程前重读 .env（watchdog 长跑不重读会导致改配置后子进程仍用旧值）
+reload_env() {
+    if [ -f "$SCRIPT_DIR/.env" ]; then
+        set -a
+        # shellcheck disable=SC1091
+        . "$SCRIPT_DIR/.env"
+        set +a
+    fi
+}
+
 while true; do
     # 检查HTTP
     HTTP_OK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://localhost:$HTTP_PORT/api/status" 2>/dev/null)
@@ -79,6 +89,7 @@ while true; do
     if [ "$HTTP_OK" != "200" ]; then
         log "⚠️ HTTP服务异常($HTTP_OK)，重启中..."
         notify_feishu "Charlie HTTP服务异常($HTTP_OK)，已自动重启"
+        reload_env
         pkill_wait "voice_server.py" 5
         screen -dmS voice bash -c "cd '$SCRIPT_DIR' && exec '$SCRIPT_DIR/.venv/bin/python' voice_server.py > '$LOG' 2>&1"
         NEED_RESTART=1
@@ -93,6 +104,8 @@ while true; do
     fi
 
     # 检查 brain 连续失败（HTTP 服务正常但大脑死链时重启）
+    # watchdog 阈值 3 比代码内 _MAX_BRAIN_FAILURES=5 更激进，这是有意的分层防御：
+    # 代码内 5 次失败只清缓存自愈，watchdog 3 次直接重启进程作为外部兜底
     if [ "$HTTP_OK" == "200" ]; then
         XIAOZHI_STATUS=$(curl -s --max-time 5 "http://localhost:$HTTP_PORT/api/xiaozhi/status" 2>/dev/null || echo "")
         if [ -n "$XIAOZHI_STATUS" ]; then
@@ -100,6 +113,7 @@ while true; do
             if [ "$BRAIN_FAILURES" -ge 3 ]; then
                 log "⚠️ Brain连续失败${BRAIN_FAILURES}次，重启服务..."
                 notify_feishu "Charlie Brain连续${BRAIN_FAILURES}次失败，已重启"
+                reload_env
                 pkill_wait "voice_server.py" 5
                 screen -dmS voice bash -c "cd '$SCRIPT_DIR' && exec '$SCRIPT_DIR/.venv/bin/python' voice_server.py > '$LOG' 2>&1"
                 NEED_RESTART=1
@@ -144,12 +158,12 @@ while true; do
             log "⚠️ 内存过高(${MEM_PCT}%)，可能OOM风险"
         fi
         
-        # 日志轮转: 超过10MB截断
+        # 日志轮转: 超过5MB截断保留最后5000行
         for f in $LOG $HTTPS_LOG $WATCHDOG_LOG; do
             if [ -f "$f" ]; then
-                SIZE=$(stat -f%z "$f" 2>/dev/null || echo 0)
+                SIZE=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
                 if [ $SIZE -gt 5242880 ]; then
-                    log "日志轮转: $f ($(echo "scale=0; $SIZE/1048576" | bc 2>/dev/null || echo "?")MB > 10MB)"
+                    log "日志轮转: $f ($(echo "scale=0; $SIZE/1048576" | bc 2>/dev/null || echo "?")MB > 5MB)"
                     tail -5000 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
                 fi
             fi

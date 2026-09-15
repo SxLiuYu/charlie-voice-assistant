@@ -334,8 +334,8 @@ class TestIntentTimeout:
         """_classify_intent HTTP call uses timeout=(2, 5) not (2, 8)."""
         import agent.llm as _llm_mod
         source = inspect.getsource(_llm_mod._classify_intent)
-        assert "timeout=(2, 5)" in source, (
-            "Intent classification timeout should be (2,5); got source snippet: "
+        assert "timeout=(2, 10)" in source, (
+            "Intent classification timeout should be (2,10); got source snippet: "
             + source[:500]
         )
 
@@ -350,7 +350,7 @@ class TestIntentTimeout:
         ark_key = os.getenv("ARK_KEY", "")
         # In production (.env) both are empty; in tests conftest may set placeholder
         # The key check is: no production-configured key means fallback path is used.
-        assert "timeout=(2, 5)" in inspect.getsource(
+        assert "timeout=(2, 10)" in inspect.getsource(
             __import__("agent.llm", fromlist=["_classify_intent"])
         )
 

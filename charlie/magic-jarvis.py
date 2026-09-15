@@ -13,7 +13,6 @@ __mcp_meta__ = {
 
 from mcp.server.fastmcp import FastMCP
 import datetime
-import json
 import logging
 
 log = logging.getLogger("magic")
@@ -294,22 +293,16 @@ def suggest_action(context: str = "") -> str:
 
     # 待办提醒
     try:
-        import os
+        from app.reminders import _load_reminders
         now = datetime.datetime.now()
-        reminders_file = os.path.join(
-            os.environ.get("ASSISTANT_KID_DATA_DIR", ""),
-            "reminders.json"
-        )
-        if os.path.exists(reminders_file):
-            with open(reminders_file, "r", encoding="utf-8") as f:
-                reminders = json.load(f)
-            pending = [
-                r for r in reminders
-                if isinstance(r, dict) and not r.get("done")
-                and str(r.get("due", ""))[:10] == now.strftime("%Y-%m-%d")
-            ]
-            if pending:
-                suggestions.append(f"今日还有{len(pending)}项待办未完成，要查看吗？")
+        reminders = _load_reminders()
+        pending = [
+            r for r in reminders
+            if isinstance(r, dict) and not r.get("done")
+            and str(r.get("due", ""))[:10] == now.strftime("%Y-%m-%d")
+        ]
+        if pending:
+            suggestions.append(f"今日还有{len(pending)}项待办未完成，要查看吗？")
     except Exception:
         pass
 
@@ -351,10 +344,11 @@ def _get_weather_context() -> str:
         forecast = _forecast_for_date(casts, today)
         if not forecast:
             return ""
-        weather = " ".join(
+        # 昼夜天气同名时去重（AMAP 白天/夜间都是"晴"→"晴 晴"很怪）
+        weather = " ".join(dict.fromkeys(
             w for w in (forecast.get("dayweather", ""), forecast.get("nightweather", ""))
             if w
-        ).strip()
+        )).strip()
         temp = forecast.get("daytemp", "")
         if weather and temp:
             return f"今天{weather}，{temp}度"
@@ -528,6 +522,59 @@ def evening_report() -> str:
 
     parts.append("今日辛苦了，Sir。早点休息。")
     return "".join(parts)
+
+
+# ===== 视觉/语音克隆服务状态与声音管理（agent/agnes_vision + agent/cosyvoice_clone）=====
+
+@mcp.tool()
+def vision_status() -> str:
+    """检查视觉分析服务（Agnes vision）配置状态。
+
+    例: vision_status() → "Agnes vision 已配置: ..."
+    """
+    from agent.agnes_vision import vision_status as _status
+    return _status()
+
+
+@mcp.tool()
+def voice_status() -> str:
+    """检查语音克隆服务（CosyVoice）状态及已配置的克隆声音。
+
+    例: voice_status() → "CosyVoice 服务在线 ..."
+    """
+    from agent.cosyvoice_clone import voice_status as _status
+    return _status()
+
+
+@mcp.tool()
+def list_voice_profiles() -> str:
+    """列出所有已配置的语音克隆声音。
+
+    例: list_voice_profiles() → "共 2 个声音配置: ..."
+    """
+    from agent.cosyvoice_clone import list_voice_profiles as _list
+    return _list()
+
+
+@mcp.tool()
+def create_voice(name: str, audio_path: str, description: str = "") -> str:
+    """用参考音频创建语音克隆声音配置。audio_path 需为服务器上已存在的
+    音频文件路径（3-10秒 WAV/MP3，如用户经管理页上传的录音）。
+
+    例: create_voice("小明", "/tmp/reference.wav", "年轻男声")
+    """
+    from agent.cosyvoice_clone import create_voice as _create
+    return _create(name, audio_path, description)
+
+
+@mcp.tool()
+def delete_voice_profile(name: str) -> str:
+    """删除一个语音克隆声音配置。
+
+    例: delete_voice_profile("小明")
+    """
+    from agent.cosyvoice_clone import delete_voice_profile as _delete
+    return _delete(name)
 
 
 if __name__ == "__main__":

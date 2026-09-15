@@ -25,7 +25,8 @@ def _get_coords(city: str) -> tuple[float, float]:
         results = r.json().get("results")
         if results:
             return results[0]["latitude"], results[0]["longitude"]
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.environment] error at line 28: {e}")
         pass
     return 39.9, 116.4  # 默认北京
 

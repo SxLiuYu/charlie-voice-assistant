@@ -30,7 +30,8 @@ def _extract_city(text: str) -> str:
         loc = locate()
         if loc and loc.get("city"):
             return loc["city"]
-    except Exception:
+    except Exception as e:
+        log.debug(f"[agent.weather] error at line 33: {e}")
         pass
     return "北京"
 
@@ -44,7 +45,8 @@ def _city_to_adcode(city: str, amap_key: str) -> str | None:
             params={"address": city, "key": amap_key}, timeout=5,
         ).json()
         return geo.get("geocodes", [{}])[0].get("adcode")
-    except Exception:
+    except Exception as e:
+        log.debug(f"[agent.weather] error at line 47: {e}")
         return None
 
 

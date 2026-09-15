@@ -31,6 +31,9 @@ def add_reminder(text: str, time: str = "", repeat: str = "") -> str:
         due = parse_time_str(time) if time else None
     except Exception:
         due = None
+    # 时间解析失败时不创建（否则产生无due的僵尸提醒，永远不会触发）
+    if time and time.strip() and due is None:
+        return (f"没听懂时间“{time}”。请换个说法，例如：3分钟后、明天下午3点、每天早上8点。")
     repeat_clean = repeat if repeat in ("daily", "weekly", "weekdays") else ""
     if not repeat_clean and time:
         if "每天" in time or "每日" in time:
@@ -46,10 +49,80 @@ def add_reminder(text: str, time: str = "", repeat: str = "") -> str:
         time_clean = time
     due = parse_time_str(time_clean) if time_clean.strip() else None
 
+    # 过去时间检查：due 已过（>2分钟）不创建，避免被调度器过期逻辑吞掉
+    # （用户会先收到"已设置"再收到"过期未送达"，内容从未正常送达）
+    if due and not repeat_clean:
+        import datetime as _dtmod
+        try:
+            overdue = _dtmod.datetime.now() - _dtmod.datetime.fromisoformat(due)
+            if overdue > _dtmod.timedelta(minutes=2):
+                return (f"“{time_clean}”这个时间已经过了。"
+                        f"如果想现在提醒，请说“现在提醒我{text}”；或者换个未来的时间。")
+        except Exception:
+            pass
+
     item = append_reminder(text, time_clean, due, repeat=repeat_clean)
     repeat_desc = {"daily": "（每天重复）", "weekly": "（每周重复）", "weekdays": "（工作日重复）"}.get(repeat_clean, "")
     when = f"，时间{due.replace('T', ' ')}" if due else ""
     return f"已添加提醒：{text}{when}{repeat_desc}"
+
+
+@mcp.tool()
+def list_reminders() -> str:
+    """查询当前所有未完成的提醒。
+
+    返回每条提醒的编号(id)、内容、时间和重复规则。用户问"我有哪些提醒/提醒列表"时调用。
+    """
+    log.info("[reminder] list_reminders 被调用")
+    try:
+        from app.reminders import list_reminders as _list
+        items = _list(include_completed=False)
+        if not items:
+            return "当前没有未完成的提醒。"
+        lines = []
+        for r in items:
+            repeat_desc = {"daily": "（每天）", "weekly": "（每周）", "weekdays": "（工作日）"}.get(r.get("repeat", ""), "")
+            lines.append(f"id={r.get('id')}：{r.get('text','')}，时间{str(r.get('due','')).replace('T',' ')}{repeat_desc}")
+        return "共有%d条提醒：\n" % len(items) + "\n".join(lines)
+    except Exception as e:
+        return f"查询提醒失败: {e}"
+
+
+@mcp.tool()
+def delete_reminder(reminder_id: int = 0, text: str = "") -> str:
+    """删除（取消）一条提醒。优先用 reminder_id 精确删除；不知道 id 时传 text 用内容模糊匹配。
+
+    例: delete_reminder(reminder_id=1788576370) 或 delete_reminder(text="取快递")
+    """
+    log.info(f"[reminder] delete_reminder(id={reminder_id}, text={text})")
+    try:
+        from app.reminders import list_reminders as _list, _load_reminders, _write_locked_reminders
+        items = _list(include_completed=False)
+        if not items:
+            return "当前没有可删除的提醒。"
+        target = None
+        if reminder_id:
+            target = next((r for r in items if r.get("id") == reminder_id), None)
+        elif text:
+            matches = [r for r in items if text in str(r.get("text", ""))]
+            if not matches:
+                return f"没有找到内容包含“{text}”的提醒。"
+            if len(matches) > 1:
+                found = "；".join(f"id={r.get('id')}：{r.get('text','')}" for r in matches)
+                return f"找到{len(matches)}条匹配提醒，请确认后用 reminder_id 删除：{found}"
+            target = matches[0]
+        else:
+            return "需要提供 reminder_id 或 text 之一。"
+        reminders = _load_reminders()
+        for r in reminders:
+            if r.get("id") == target.get("id"):
+                r["done"] = True
+                r["delivery_state"] = "cancelled"
+                break
+        _write_locked_reminders(reminders)
+        return f"已删除提醒：{target.get('text','')}（id={target.get('id')}）"
+    except Exception as e:
+        return f"删除提醒失败: {e}"
 
 
 @mcp.tool()

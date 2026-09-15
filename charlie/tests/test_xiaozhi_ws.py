@@ -342,7 +342,7 @@ def test_one_wake_allows_multiple_followups(xiaozhi_server):
         except StopIteration:
             return ""
 
-    def fake_brain(text, session_id="default", interrupted_reply=""):
+    def fake_brain(text, session_id="default", interrupted_reply="", cancel_event=None):
         brain_calls.append(text)
         yield (f"回复{len(brain_calls)}", f"回复{len(brain_calls)}")
 
@@ -352,6 +352,8 @@ def test_one_wake_allows_multiple_followups(xiaozhi_server):
                return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
          patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
          patch("voice_agent.asr", side_effect=fake_asr), \
+         patch("voice_agent.asr_race",
+               side_effect=lambda wav, fmt="wav", **kw: (__import__("voice_agent").asr(wav, fmt), "test")), \
          patch("voice_agent.brain_stream_sentences", side_effect=fake_brain):
         with ws_connect(xiaozhi_server) as ws:
             _hello(ws)
@@ -392,7 +394,7 @@ def test_short_utterance_reaches_asr(xiaozhi_server):
         asr_calls.append(True)
         return "现在几点了"
 
-    def fake_brain(text, session_id="default", interrupted_reply=""):
+    def fake_brain(text, session_id="default", interrupted_reply="", cancel_event=None):
         yield ("现在09点28分。", "现在09点28分。")
 
     with patch("app.xiaozhi_ws._synth_wake_beep", return_value=b""), \
@@ -401,6 +403,8 @@ def test_short_utterance_reaches_asr(xiaozhi_server):
                return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
          patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
          patch("voice_agent.asr", side_effect=fake_asr), \
+         patch("voice_agent.asr_race",
+               side_effect=lambda wav, fmt="wav", **kw: (__import__("voice_agent").asr(wav, fmt), "test")), \
          patch("voice_agent.brain_stream_sentences", side_effect=fake_brain):
         with ws_connect(xiaozhi_server) as ws:
             _hello(ws)
@@ -460,7 +464,7 @@ def test_idle_after_arm_window_sends_goodbye(xiaozhi_server):
 
 def test_brain_error_sends_fallback(xiaozhi_server):
     """当 brain 抛异常时，客户端应收到的兜底语（不走死链超时）。"""
-    def raising_brain(text, session_id="default", interrupted_reply=""):
+    def raising_brain(text, session_id="default", interrupted_reply="", cancel_event=None):
         raise RuntimeError("brain boom")
 
     with patch("app.xiaozhi_ws._synth_wake_beep", return_value=b""), \
@@ -469,6 +473,8 @@ def test_brain_error_sends_fallback(xiaozhi_server):
                return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
          patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
          patch("voice_agent.asr", return_value="你好"), \
+         patch("voice_agent.asr_race",
+               side_effect=lambda wav, fmt="wav", **kw: (__import__("voice_agent").asr(wav, fmt), "test")), \
          patch("voice_agent.brain_stream_sentences", side_effect=raising_brain):
         with ws_connect(xiaozhi_server) as ws:
             _hello(ws)
@@ -489,7 +495,7 @@ def test_brain_deadlink_sends_slow_reply_fallback(xiaozhi_server):
     """brain 死链（永不产出）时，客户端应收到的兜底语且流程正常结束。"""
     _stop = threading.Event()
 
-    def blocking_brain(text, session_id="default", interrupted_reply=""):
+    def blocking_brain(text, session_id="default", interrupted_reply="", cancel_event=None):
         # 模拟 brain 死链：在首 yield 前永久阻塞，但可被 Event 取消
         _stop.wait(timeout=120)
         yield ("never", "never")
@@ -501,6 +507,8 @@ def test_brain_deadlink_sends_slow_reply_fallback(xiaozhi_server):
                    return_value=[b"\xf8\xff\xfe", b"\xf8\xff\xfe", b"\xf8\xff\xfe"]), \
              patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
              patch("voice_agent.asr", return_value="你好"), \
+             patch("voice_agent.asr_race",
+                   side_effect=lambda wav, fmt="wav", **kw: (__import__("voice_agent").asr(wav, fmt), "test")), \
              patch("voice_agent.brain_stream_sentences", side_effect=blocking_brain), \
              patch("app.xiaozhi_ws._FIRST_SENTENCE_TIMEOUT", 3.0):
             with ws_connect(xiaozhi_server) as ws:
@@ -551,3 +559,98 @@ def test_xiaozhi_ws_proxy_with_token_accepted(xiaozhi_server):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+# ======================================================================
+# Gap 1: barge-in _processing_utterance 守卫
+# ======================================================================
+
+def test_barge_in_suppressed_during_processing(xiaozhi_server):
+    """ASR+brain+TTS 进行中 (_processing_utterance=True) 时，
+    继续发音频帧不应触发第二次 brain 调用。"""
+    brain_calls = []
+
+    def slow_brain(text, session_id="default", interrupted_reply="", cancel_event=None):
+        brain_calls.append(text)
+        time.sleep(3.0)  # 保持 _processing_utterance=True
+        yield ("回复", "回复")
+
+    with patch("app.xiaozhi_ws._synth_wake_beep", return_value=b""), \
+         patch("app.xiaozhi_ws._synth_mp3", return_value=b"\x00" * 200), \
+         patch("app.xiaozhi_ws.mp3_to_opus_packets",
+               return_value=[b"\xf8\xff\xfe"] * 3), \
+         patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
+         patch("voice_agent.asr", return_value="你好"), \
+         patch("voice_agent.asr_race",
+               side_effect=lambda wav, fmt="wav", **kw: (__import__("voice_agent").asr(wav, fmt), "test")), \
+         patch("voice_agent.brain_stream_sentences", side_effect=slow_brain):
+        with ws_connect(xiaozhi_server) as ws:
+            _hello(ws)
+            ws.send(json.dumps({"type": "listen", "state": "detect",
+                                "text": "你好小智"}))
+            time.sleep(0.6)
+            ws.send(json.dumps({"type": "listen", "state": "start"}))
+            _send_utterance_burst(ws, tone_sec=1.0, silence_sec=2.2)
+
+            # 等待 ASR 响应，确认 process_utterance 已启动且 _processing_utterance=True
+            deadline = time.time() + 5.0
+            asr_seen = False
+            while time.time() < deadline:
+                msg = ws.recv(timeout=0.5)
+                if isinstance(msg, str):
+                    obj = json.loads(msg)
+                    if obj.get("type") == "stt" and obj.get("text") == "你好":
+                        asr_seen = True
+                        break
+            assert asr_seen, "ASR response not received"
+
+            # 在 brain 仍阻塞时继续发帧，应被 _processing_utterance 守卫抑制
+            for pkt in pcm_to_opus_packets(generate_tone_pcm(duration_sec=1.0, freq=600)):
+                ws.send(pkt)
+
+            # 等 slow brain 完成 + TTS 收尾
+            _drain_json(ws, 8.0)
+
+    assert len(brain_calls) == 1, (
+        f"brain called {len(brain_calls)}x during processing, expected 1")
+
+
+def test_barge_in_restored_after_processing(xiaozhi_server):
+    """_safe_stream 完成后 barge-in 检测恢复；
+    发送新语音帧应正常触发新一轮 utterance（标志已复位）。"""
+    brain_calls = []
+
+    def tracking_brain(text, session_id="default", interrupted_reply="", cancel_event=None):
+        brain_calls.append(text)
+        yield ("回复", "回复")
+
+    with patch("app.xiaozhi_ws._synth_wake_beep", return_value=b""), \
+         patch("app.xiaozhi_ws._synth_mp3", return_value=b"\x00" * 200), \
+         patch("app.xiaozhi_ws.mp3_to_opus_packets",
+               return_value=[b"\xf8\xff\xfe"] * 3), \
+         patch("app.xiaozhi_ws._load_silero_vad", return_value=None), \
+         patch("voice_agent.asr", return_value="你好"), \
+         patch("voice_agent.asr_race",
+               side_effect=lambda wav, fmt="wav", **kw: (__import__("voice_agent").asr(wav, fmt), "test")), \
+         patch("voice_agent.brain_stream_sentences", side_effect=tracking_brain):
+        with ws_connect(xiaozhi_server) as ws:
+            _hello(ws)
+            ws.send(json.dumps({"type": "listen", "state": "detect",
+                                "text": "你好小智"}))
+            time.sleep(0.6)
+            ws.send(json.dumps({"type": "listen", "state": "start"}))
+            _send_utterance_burst(ws, tone_sec=1.0, silence_sec=2.2)
+            msgs1 = _drain_json(ws, 12.0)
+            assert any(m.get("type") == "tts" and m.get("state") == "stop"
+                       for m in msgs1), "first TTS did not complete"
+
+            # 流程结束后再发新语音，barge-in 守卫已复位
+            ws.send(json.dumps({"type": "listen", "state": "start"}))
+            _send_utterance_burst(ws, tone_sec=1.0, silence_sec=2.2)
+            msgs2 = _drain_json(ws, 12.0)
+
+    assert len(brain_calls) == 2, (
+        f"brain called {len(brain_calls)}x after reset, expected 2")
+    starts = [m for m in msgs2
+              if m.get("type") == "tts" and m.get("state") == "start"]
+    assert starts, "second utterance did not produce TTS after flag reset"

@@ -173,10 +173,14 @@ cliLog(JSON.stringify({{ url: info.url, title: info.title, width: info.w, height
     try:
         with open(tmp_path, 'rb') as f:
             img_b64 = base64.b64encode(f.read()).decode()
-        os.unlink(tmp_path)
         return f"📸 截图完成：{result.get('title', '')}\n大小：{result.get('width', 0)}x{result.get('height', 0)}\nbase64:{img_b64[:50]}..."
     except Exception as e:
         return f"截图保存失败：{e}"
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 @mcp.tool()

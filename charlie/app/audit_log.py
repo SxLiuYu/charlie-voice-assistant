@@ -19,6 +19,7 @@ import sys
 import json
 import time
 import functools
+import tempfile
 import threading
 import logging
 from datetime import datetime
@@ -33,8 +34,43 @@ os.makedirs(_LOG_DIR, exist_ok=True)
 _USER_LOG_FILE = os.path.join(_LOG_DIR, "calls_user.log")
 _TEST_LOG_FILE = os.path.join(_LOG_DIR, "calls_test.log")
 _SYSTEM_LOG_FILE = os.path.join(_LOG_DIR, "calls_system.log")
+_MAX_LOG_BYTES = 10_000_000  # 10MB 上限，超出则截断
 
 _lock = threading.Lock()
+
+def _rotate_if_oversized(filepath: str, max_bytes: int) -> None:
+    """如果文件超过 max_bytes，截断保留最后 1MB（原子替换）"""
+    try:
+        size = os.path.getsize(filepath)
+        if size > max_bytes:
+            with open(filepath, "r", encoding="utf-8") as f:
+                f.seek(size - 1_000_000)
+                f.readline()  # 跳过可能被截断的头行
+                tail = f.read()
+            target_dir = os.path.dirname(os.path.abspath(filepath)) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix=".audit_rotate_", suffix=".tmp", dir=target_dir)
+            f_wrapped = False
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f_wrapped = True
+                    f.write(f"# TRUNCATED {datetime.now().isoformat()} (was {size} bytes)\n")
+                    f.write(tail)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, filepath)
+            except Exception:
+                if not f_wrapped:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+    except (FileNotFoundError, OSError):
+        pass
 
 # 线程局部: 记录当前调用上下文 (用于嵌套调用溯源)
 _local = threading.local()
@@ -142,11 +178,14 @@ def audit_log(feature: str, input_data=None, output_data=None, success=True,
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     try:
         with _lock:
+            # 文件超限时截断（保留最后 1MB）
+            _rotate_if_oversized(log_file, _MAX_LOG_BYTES)
             # 写到 LOG_DIR (测试时是 tempdir, 生产时是 logs/)
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(line)
             # 测试日志额外写一份到生产 logs/ 目录 (不被 conftest 清理)
             if src == "test" and prod_log_file != log_file:
+                _rotate_if_oversized(prod_log_file, _MAX_LOG_BYTES)
                 with open(prod_log_file, "a", encoding="utf-8") as f:
                     f.write(line)
     except Exception as e:

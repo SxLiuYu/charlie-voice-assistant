@@ -47,7 +47,8 @@ if os.name == "nt":
             return await _orig_csp(*args, **kwargs)
 
         _aio.create_subprocess_exec = _csp_no_window
-    except Exception:
+    except Exception as e:
+        log.debug(f"[charlie_main] error at line 50: {e}")
         pass
 
 
@@ -145,7 +146,6 @@ def _run_mcp_server(name: str):
         "magic-browser": "magic-browser.py",
         "baize-skills": "baize_skills_mcp.py",
         "filesystem": "magic-notes.py",  # 使用备忘录工具（文件读写）
-        "ac-control": "mcp_ir_control.py",
     }
     filename = mcp_files.get(name)
     if not filename:
@@ -203,7 +203,8 @@ def _run_server(first_path: str = "/"):
         try:
             import ctypes
             ctypes.windll.user32.MessageBoxW(0, f"Charlie 服务启动失败（端口 {port} 被占或依赖缺失），详情见 logs/app.log", "Charlie 启动失败", 0x10)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[charlie_main] error at line 206: {e}")
             pass
         sys.exit(1)
     url = f"http://127.0.0.1:{port}{first_path}"
@@ -245,9 +246,11 @@ def _cleanup_mcp_subprocesses():
                         child.wait(timeout=2)
                     except Exception:
                         child.kill()
-            except Exception:
+            except Exception as e:
+                log.debug(f"[charlie_main] error at line 248: {e}")
                 pass
-    except Exception:
+    except Exception as e:
+        log.debug(f"[charlie_main] error at line 250: {e}")
         pass
 
 if __name__ == "__main__":

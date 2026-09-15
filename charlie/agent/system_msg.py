@@ -1,11 +1,9 @@
 """系统提示词构建"""
 import os
-import datetime
 import logging
 import platform as _platform
 import time
 import threading
-from typing import Any
 
 log = logging.getLogger("magic")
 
@@ -95,8 +93,16 @@ _MCP_SYSTEM_PROMPTS = {
     "filesystem": (
         "可用工具：读写文件。"
     ),
+    "magic-dev": (
+        "可用工具：list_project_files(子目录)列出项目文件，read_file(路径)读取文件内容，"
+        "edit_file(路径, 原文, 新内容)精确替换文件片段。"
+        "代码修改前必须先 read_file 查看内容，edit_file 后会记录确认请求，"
+        "用户回复'确认'才真正写盘。禁止删除文件、禁止批量修改、禁止访问 .env/.git 等敏感路径。"
+    ),
     "ac-control": (
-        "AC空调控制：必须调用 ac_control 工具，禁止编造结果。"
+        "AC空调控制：通过语音快路径直接执行（识别关键词后自动调 Tuya 红外 API）。"
+        "如果用户问空调相关操作，直接回复执行结果或引导用户说'打开空调'/'关闭空调'/'调到26度制冷'等明确指令。"
+        "禁止告诉用户'没有权限'或'无法控制'，引导用语音指令重试。"
     ),
     "mimo-vision": (
         "你有视觉能力：可以截图或分析用户提供的图片。"
@@ -136,6 +142,9 @@ def _build_user_profile() -> str:
         _style = _adapt.get("response_style", "")
         if _style:
             parts.append(f"用户偏好风格：{_style}")
+        _max_s = _adapt.get("max_sentences")
+        if _max_s:
+            parts.append(f"回复不超过{_max_s}句")
         return "。".join(parts) + "。" if parts else ""
     except Exception:
         return ""
@@ -165,46 +174,52 @@ def append_channel_rules(system_msg: str, channel: str) -> str:
 def _replace_system_msg_for_channel(sys_msg: str, channel: str) -> str:
     """Replace base voice constraints with channel-specific rules in a system message.
 
-    feishu_text: swap the hardcoded 2-sentence / 40-char / no-markdown rule
-    with relaxed feishu-text rules (up to 200 chars, markdown allowed).
-    All other channels: return sys_msg unchanged.
+    voice:        replace <<<VOICE_RULE>>> with actual voice reply constraints.
+    feishu_text:  swap the hardcoded 2-sentence / 40-char / no-markdown rule
+                  with relaxed feishu-text rules (up to 200 chars, markdown allowed).
+    Other channels: return sys_msg unchanged.
     """
-    if channel != "feishu_text":
-        return sys_msg
-    _VOICE_RULE = (
-        "语音回复硬限制：最多2句、40字以内。"
-        "禁止列表/标题/markdown符号，只输出纯口语句子。"
-    )
-    _FEISHU_RULE = (
-        "飞书文本对话：回复可以适当详细（最多200字），"
-        "允许使用换行和列表组织信息。"
-    )
-    return sys_msg.replace(_VOICE_RULE, _FEISHU_RULE)
+    _VOICE_RULE = "<<<VOICE_RULE>>>"
+    if channel == "voice":
+        _VOICE_CONSTRAINT = (
+            "（语音回复：最多2句、40字以内，先给结论；禁止markdown、列表、emoji。"
+            "天气等结构化信息首句短答，细节等用户追问。）"
+        )
+        return sys_msg.replace(_VOICE_RULE, _VOICE_CONSTRAINT)
+    if channel == "feishu_text":
+        _FEISHU_RULE = (
+            "飞书文本对话：回复可以适当详细（最多200字），"
+            "允许使用换行和列表组织信息。"
+        )
+        return sys_msg.replace(_VOICE_RULE, _FEISHU_RULE)
+    return sys_msg
 
 
-def _build_system_msg(mcp_set: str = "none") -> str:
+def _build_system_msg(mcp_set: str = "none", session_id: str = "default") -> str:
+    """返回完整 system_msg：static 段走 TTL 缓存，dynamic 段每轮实时拼。调用方零改动。"""
     from agent.roles import get_current_role
+    # 缓存键只用 mcp_set + role（不含 session_id）：static 段与 session_id 无关
     cache_key = (mcp_set, get_current_role())
     now = time.time()
     with _SYSTEM_MSG_LOCK:
         cached = _SYSTEM_MSG_CACHE.get(cache_key)
         if cached and now - cached[0] < _SYSTEM_MSG_TTL:
-            return cached[1]
-    result = _build_system_msg_impl(mcp_set)
-    with _SYSTEM_MSG_LOCK:
-        # 构建期间角色可能已切换（impl 内部读取的是新角色的 prompt），
-        # 写回前校验，避免旧 key 存新角色内容导致 TTL 内 prompt 错配
-        current_role = get_current_role()
-        if current_role == cache_key[1]:
-            _SYSTEM_MSG_CACHE[cache_key] = (now, result)
-    return result
+            static_part = cached[1]
+        else:
+            static_part = None
+    if static_part is None:
+        static_part = _build_system_msg_static(mcp_set)
+        with _SYSTEM_MSG_LOCK:
+            current_role = get_current_role()
+            if current_role == cache_key[1]:
+                _SYSTEM_MSG_CACHE[cache_key] = (now, static_part)
+    dynamic_part = _build_system_msg_dynamic(session_id)
+    return static_part + dynamic_part
 
 
-def _build_system_msg_impl(mcp_set: str = "none") -> str:
-    from agent.preferences import list_preferences
-    from agent.history import _context_summaries
+def _build_system_msg_static(mcp_set: str = "none") -> str:
+    """构建 system_msg 的静态段：不依赖 session_id / 时间 / 偏好 / 记忆，可安全进 TTL 缓存。"""
     from agent.roles import get_current_role, get_role_system_prompt
-    now = datetime.datetime.now()
     # 设备描述按实际平台动态生成，避免在 Windows 上误称 Mac Mini
     _sys = _platform.system()
     _device = "Windows" if _sys == "Windows" else ("Mac" if _sys == "Darwin" else "本机")
@@ -249,6 +264,16 @@ def _build_system_msg_impl(mcp_set: str = "none") -> str:
             "4. 自主决策：基于已记住的偏好做决定，不需要每次确认。\n"
             "5. 角色切换：用户说'切换到查理'、'变成贾维斯'、'回到默认'时，调用 switch_role 工具切换角色。\n\n"
         )
+    elif current_role_id == "kid":
+        result += (
+            "【行为准则】\n"
+            "1. 用简单的语言回答，像跟小朋友说话一样，避免复杂术语。\n"
+            "2. 多用鼓励和赞美，比如'真棒'、'你好厉害'。\n"
+            "3. 回复要短小有趣，不超过2句话。\n"
+            "4. 不讨论恐怖、暴力或成人话题，遇到时说'我们换个好玩的聊聊吧'。\n"
+            "5. 偏好记忆：用户表达偏好时立即调用 set_pref 记住。\n"
+            "6. 角色切换：用户说'切换到查理'、'回到默认'时，调用 switch_role 工具切换角色。\n\n"
+        )
     else:
         result += (
             "【行为准则】\n"
@@ -263,8 +288,8 @@ def _build_system_msg_impl(mcp_set: str = "none") -> str:
     result += (
         "【通用回复规则】（所有角色适用，优先级从高到低）\n"
         "1. 直接说答案。禁止输出占用语，第一句就是答案。\n"
-        "2. 语音回复硬限制：最多2句、40字以内。禁止列表/标题/markdown符号，只输出纯口语句子。\n"
-        "2.1 禁止结尾追问（如'还有需要帮忙的吗'），答完即止。\n"
+        "<<<VOICE_RULE>>>\n"
+        "2. 禁止结尾追问（如'还有需要帮忙的吗'），答完即止。\n"
         "3. 能用工具就用工具，给真实数据，不编造。\n"
         "4. 做不到直接说'这个我做不了'。\n"
         "5. 报时间格式：'现在X点X分'，不加前缀。\n"
@@ -286,7 +311,8 @@ def _build_system_msg_impl(mcp_set: str = "none") -> str:
         try:
             from app.config import http_port as _hp
             _port = _hp()
-        except Exception:
+        except Exception as e:
+            log.debug(f"[agent.system_msg] error at line 294: {e}")
             pass
         result += (
             "\n\n⚠️ 当前运行在 Demo 模式（未配置 AGNES_KEY/SAGNES_KEY/STEPFUN_KEY/GLM_KEY/ARK_KEY）。"
@@ -296,23 +322,55 @@ def _build_system_msg_impl(mcp_set: str = "none") -> str:
         result += (
             "\n\n✅ AI 大脑已就绪，正在调用 LLM 推理。"
         )
+    # MCP 工具文档（static：与 mcp_set 绑定，进缓存）
+    tools_doc = _MCP_SYSTEM_PROMPTS.get(mcp_set, "")
+    if tools_doc:
+        result += f"\n{tools_doc}"
+    # persona prompt（static：当前角色 persona 不变时内容不变）
     try:
-        _uid_now = os.environ.get("CHARLIE_USER_ID", _current_user_id)
-        _summary = _context_summaries.get(_uid_now or "default", "")
-        if _summary:
-            result += f"\n历史对话摘要：{_summary}"
-    except Exception:
+        from agent.persona import get_persona_prompt, contextual_response_style
+        result += get_persona_prompt()
+        result += contextual_response_style()
+    except Exception as e:
+        log.debug(f"[agent.system_msg] error at line 342: {e}")
         pass
+    return result
+
+
+def _build_system_msg_dynamic(session_id: str = "default") -> str:
+    """构建 system_msg 的动态段：每轮实时拼，不进缓存。"""
+    parts: list[str] = []
+    # 1. 历史对话摘要（按 session_id 隔离，NB6）
     try:
+        from agent.history import _context_summaries
+        _summary = _context_summaries.get(session_id, "")
+        if _summary:
+            parts.append(f"\n历史对话摘要：{_summary}")
+    except Exception as e:
+        log.debug(f"[agent.system_msg] error at line 309: {e}")
+        pass
+    # 2. 用户偏好
+    try:
+        from agent.preferences import list_preferences
         _pref_items = list_preferences()
         if _pref_items:
             _pref_txt = "、".join(f"{k}={v}" for k, v in list(_pref_items.items())[:8])
-            result += f"\n用户偏好：{_pref_txt}"
+            parts.append(f"\n用户偏好：{_pref_txt}")
     except Exception as _e:
         log.debug(f"[pref] 偏好注入跳过: {_e}")
+    # 2b. 情感基调（每轮动态，不进缓存）
+    try:
+        from agent.persona import get_current_mood
+        _mood = get_current_mood()
+        if _mood and _mood != "neutral":
+            parts.append(f"\n当前情绪基调：{_mood}，回复语气与之匹配。")
+    except Exception:
+        pass
+    # 3. user profile
     _profile_parts = _build_user_profile()
     if _profile_parts:
-        result += "\n" + _profile_parts
+        parts.append("\n" + _profile_parts)
+    # 4. magic_memory 记忆注入
     try:
         from app import load_magic_module
         _mem = load_magic_module("magic_memory", "magic-memory.py")
@@ -324,31 +382,103 @@ def _build_system_msg_impl(mcp_set: str = "none") -> str:
                 _recent_msg = ""
             _memories_text = _mem.format_memories_for_prompt(_recent_msg, limit=2)
             if _memories_text:
-                result += "\n" + _memories_text
+                parts.append("\n" + _memories_text)
     except Exception as _e:
         log.debug(f"[memory] 记忆注入跳过: {_e}")
-    tools_doc = _MCP_SYSTEM_PROMPTS.get(mcp_set, "")
-    if tools_doc:
-        result += f"\n{tools_doc}"
+    # 4b. SQLite 长期记忆注入 (memory_store)
     try:
-        from agent.persona import get_persona_prompt, contextual_response_style
-        result += get_persona_prompt()
-        result += contextual_response_style()
+        from agent.history import get_recent_user_message as _grum2
+        _recent_msg2 = _grum2()
     except Exception:
-        pass
+        _recent_msg2 = ""
+    try:
+        from agent.memory_store import format_memories_for_prompt as _sqlite_mem
+        _sqlite_text = _sqlite_mem(_recent_msg2, limit=2)
+        if _sqlite_text:
+            parts.append("\n" + _sqlite_text)
+    except Exception as _e2:
+        log.debug(f"[memory_store] SQLite记忆注入跳过: {_e2}")
+    # 5. format_context_for_prompt（待办/日历等实时上下文）
     try:
         from agent.context import format_context_for_prompt
-        ctx_snippet = format_context_for_prompt()
+        ctx_snippet = format_context_for_prompt(session_id=session_id)
         if ctx_snippet:
-            result += "\n\n📌 上下文感知：\n" + ctx_snippet
-    except Exception:
+            parts.append("\n\n📌 上下文感知：\n" + ctx_snippet)
+    except Exception as e:
+        log.debug(f"[agent.system_msg] error at line 349: {e}")
         pass
-    try:
-        from agent.working_memory import get as get_working_memory
-        _wm = get_working_memory()
-        if _wm.get("turn_count", 0) > 2 and _wm.get("session_facts"):
-            _facts = "、".join(f"{k}={v}" for k, v in list(_wm["session_facts"].items())[:5])
-            result += f"\n\n🧠 工作记忆：{_facts}"
-    except Exception:
-        pass
+    # 注：working_memory session_facts 块已删除，由 _build_wm_anaphor_prompt() 每轮实时注入为唯一来源
+    return "".join(parts)
+
+
+def _build_lite_system_msg(mcp_set: str = "none", session_id: str = "default") -> str:
+    """构建 lite 通道专用 system_msg：仅含角色人格 + 核心回复规则，不含 MCP 工具文档。
+
+    目标长度 < 400 字符，减少前缀缓存抖动。
+    """
+    from agent.roles import get_current_role, get_role_system_prompt
+
+    _role_prompt = get_role_system_prompt()
+    if _role_prompt:
+        result = f"{_role_prompt}\n\n"
+    else:
+        result = (
+            "你是 Charlie，一个在本地运行的私人 AI 助理。\n"
+            "你不是仆人，你是搭档。说话像朋友——直接、偶尔幽默、不废话。\n"
+        )
+
+    current_role_id = get_current_role()
+    if current_role_id == "jarvis":
+        result += (
+            "【行为准则】\n"
+            "1. 汇报式回答：'Sir，[状况/结果]。[建议/下一步]。'\n"
+            "2. 英式管家用语：简洁正式，使用'Sir'。\n"
+            "3. 主动报告异常，不等用户问。\n"
+            "4. 简洁高密度，不卖萌。\n"
+            "5. 角色切换：用户说'切换到查理''回到默认'时调用 switch_role。\n\n"
+        )
+    elif current_role_id == "baize":
+        result += (
+            "【行为准则】\n"
+            "1. 博学智慧，适当引用典故但保持易懂。\n"
+            "2. 用比喻解释复杂概念。\n"
+            "3. 角色切换：用户说'切换到查理''变成贾维斯''回到默认'时调用 switch_role。\n\n"
+        )
+    elif current_role_id == "kid":
+        result += (
+            "【行为准则】\n"
+            "1. 用简单语言，像跟小朋友说话。\n"
+            "2. 多鼓励赞美，回复短小有趣（不超过2句）。\n"
+            "3. 不讨论恐怖/暴力/成人话题，遇到说'换个好玩的聊聊吧'。\n"
+            "4. 角色切换：用户说'切换到查理''回到默认'时调用 switch_role。\n\n"
+        )
+    else:
+        result += (
+            "【准则】\n"
+            "1. 直接说答案，第一句就是答案。\n"
+            "2. 信息密度高，不卖萌。\n"
+            "3. 用户说'切换角色'或'回到默认'时调用 switch_role。\n\n"
+        )
+
+    result += (
+        "【通用规则】\n"
+        "1. 第一句就是答案，禁止输出占用语，答完即止。\n"
+        "<<<VOICE_RULE>>>\n"
+        "2. 能用工具就用工具，给真实数据，不编造。\n"
+        "3. 做不到直接说'这个我做不了'。\n"
+        "4. 多轮对话记住上文，'那个''它''这个'指代上文。\n"
+        "5. 残缺语句结合上下文推断意图，尽量回应而非说'听不懂'。\n"
+    )
+    # 注：不含 MCP 工具文档、persona prompt、dynamic 段、demo banner
+    return result
+
+
+def _build_system_msg_impl(mcp_set: str = "none", session_id: str = "default") -> str:
+    """构建完整 system_msg = static 段（可缓存）+ dynamic 段（每轮实时拼）。"""
+    static_part = _build_system_msg_static(mcp_set)
+    dynamic_part = _build_system_msg_dynamic(session_id)
+    result = static_part + dynamic_part
+    # 通道规则替换（在完整结果上操作，保持原有行为）
+    # 注意：append_channel_rules / _replace_system_msg_for_channel 由调用方处理，
+    # 此处不耦合 channel 参数，保持 _build_system_msg_impl 签名不变。
     return result

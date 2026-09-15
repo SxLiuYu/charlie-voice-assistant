@@ -27,6 +27,9 @@ UDP_AUDIO_HEADER_SIZE = 16
 DOWNLINK_SAMPLE_RATE = 16000
 UPLINK_SAMPLE_RATE = 16000
 
+# abort 自动 clear 延迟（秒），可由环境变量快速调小以加速测试
+_ABORT_AUTO_CLEAR_DELAY = float(os.getenv("MQTT_ABORT_CLEAR_DELAY", "2.0"))
+
 # 端点检测参数（复用 xiaozhi_ws.py 的阈值）
 MIN_SPEECH_FRAMES = 12        # 最少语音帧数 (~0.7s)
 MAX_UTTERANCE_FRAMES = 600    # 最大语音时长 (~36s)
@@ -124,11 +127,66 @@ class MqttXiaozhiServer:
         self._client = None
         self._udp_sock: Optional[socket.socket] = None
         self._udp_port = 0
-        self._local_seq = 0
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # 兼容旧代码: 保留单设备 ID（用于日志）
         self._device_id: str = ""
+        self._opus_decoders: dict[str, "opuslib.Decoder"] = {}
+        self._utterance_state: dict[str, dict] = {}
+        self._opus_decoders_lock = threading.Lock()
+        # per-device abort flag（用于中断当前播放 / brain 流）
+        self._abort_flags: dict[str, threading.Event] = {}
+        self._abort_flags_lock = threading.Lock()
+        # per-device abort 世代：每次新活动（_handle_abort / _process_utterance）都会 +1，
+        # 使旧的 auto-clear 线程失效，避免旧 clearer 吞掉新一轮 abort。
+        self._abort_generations: dict[str, int] = {}
+        self._abort_generations_lock = threading.Lock()
+
+    def _get_opus_decoder(self, device_id: str) -> Optional["opuslib.Decoder"]:
+        """Get or create a cached Opus decoder for the given device."""
+        try:
+            import opuslib
+        except ImportError:
+            return None
+        with self._opus_decoders_lock:
+            if device_id not in self._opus_decoders:
+                self._opus_decoders[device_id] = opuslib.Decoder(UPLINK_SAMPLE_RATE, 1)
+            return self._opus_decoders[device_id]
+
+    def _get_abort_flag(self, device_id: str) -> threading.Event:
+        """获取或创建 per-device abort flag（惰性创建，线程安全）。"""
+        with self._abort_flags_lock:
+            if device_id not in self._abort_flags:
+                self._abort_flags[device_id] = threading.Event()
+            return self._abort_flags[device_id]
+
+    def _send_audio_packets(self, device_id: str, addr: tuple, aes_key: bytes, aes_nonce: bytes, opus_packets: list[bytes]) -> None:
+        """发送加密 Opus 包到设备。
+
+        seq 由 per-device 锁统一串行化：同设备的领号+发包全程持锁，
+        保证包到达顺序与号序一致（同设备不应并发播放；发送 0.06s/帧期间
+        阻塞同设备后续推送正是期望行为）。
+        """
+        with _sessions_lock:
+            session = _sessions.get(device_id)
+            if session is None or not opus_packets:
+                return
+            seq_lock = session.get("seq_lock")
+            cur_seq = session.get("seq", 0)
+            session["seq"] = (cur_seq + len(opus_packets)) & 0xFFFFFFFF
+            ts_base = int(time.time() * 1000) & 0xFFFFFFFF
+        lock = seq_lock if hasattr(seq_lock, "acquire") else threading.Lock()
+        with lock:
+            ts = ts_base
+            for i, pkt in enumerate(opus_packets):
+                seq = (cur_seq + i) & 0xFFFFFFFF
+                packet = _build_audio_packet(aes_key, aes_nonce, pkt, ts + i * 60, seq)
+                try:
+                    self._udp_sock.sendto(packet, addr)
+                except Exception as e:
+                    log.warning(f"[mqtt-server] [{device_id}] UDP 发送失败: {e}")
+                    break
+                time.sleep(0.06)
 
     @property
     def udp_port(self) -> int:
@@ -254,7 +312,17 @@ class MqttXiaozhiServer:
                 "aes_nonce": aes_nonce,
                 "addr": None,  # UDP 地址在收到第一个包时填充
                 "timestamp": time.time(),
+                "seq": 0,
+                "seq_lock": threading.Lock(),
             }
+        # 重置端点检测状态：设备重连（网络闪断后二次hello）时上一会话的
+        # utterance_active/buf 残留会让新会话的帧走"说话中"分支，端点永不触发
+        if device_id in self._utterance_state:
+            st = self._utterance_state[device_id]
+            st.update({"buf_frames": [], "speech_count": 0, "silence_count": 0,
+                       "utterance_active": False, "hot_frames": 0})
+            st["tail"].clear()
+            log.info(f"[mqtt-server] [{device_id}] 重连，端点检测状态已重置")
 
         # 获取 LAN IP
         lan_ip = os.getenv("ESP32_OTA_IP", "")
@@ -309,12 +377,30 @@ class MqttXiaozhiServer:
         """处理 goodbye → 清理 UDP 会话和设备映射"""
         with _sessions_lock:
             _sessions.pop(device_id, None)
+        with self._opus_decoders_lock:
+            self._opus_decoders.pop(device_id, None)
+        with self._abort_flags_lock:
+            self._abort_flags.pop(device_id, None)
+        with self._abort_generations_lock:
+            self._abort_generations.pop(device_id, None)
         self._unregister_device(device_id)
         log.info(f"[mqtt-server] [{device_id}] goodbye: {data.get('session_id', '')}")
 
     def _handle_abort(self, device_id: str):
-        """处理 abort → 中断当前播放"""
-        log.info(f"[mqtt-server] [{device_id}] 中断播放")
+        """处理 abort → 中断当前播放/brain 流（世代化 auto-clear）"""
+        abort_flag = self._get_abort_flag(device_id)
+        with self._abort_generations_lock:
+            self._abort_generations[device_id] = self._abort_generations.get(device_id, 0) + 1
+            gen = self._abort_generations[device_id]
+        abort_flag.set()
+        log.info(f"[mqtt-server] [{device_id}] 中断播放 (gen={gen})")
+        # 短延时后自动 clear，仅当世代未变时才 clear（避免旧 clearer 吞掉新一轮 abort）
+        def _auto_clear():
+            time.sleep(_ABORT_AUTO_CLEAR_DELAY)
+            with self._abort_generations_lock:
+                if self._abort_generations.get(device_id, 0) == gen:
+                    abort_flag.clear()
+        threading.Thread(target=_auto_clear, daemon=True).start()
 
     def _publish_to_device(self, device_id: str, text: str):
         """推 JSON 消息到指定设备的 down topic"""
@@ -364,17 +450,11 @@ class MqttXiaozhiServer:
                 "voice": "zh-CN",
             }))
 
-            # RTP-style relative timestamp (ms since epoch mod 2^32, wraps every ~49 days)
-            ts = int(time.time() * 1000) & 0xFFFFFFFF
-            def _send_audio(_aes_key=aes_key, _aes_nonce=aes_nonce, _addr=addr, _ts=ts, _packets=opus_packets, _did=device_id):
-                for i, pkt in enumerate(_packets):
-                    packet = _build_audio_packet(_aes_key, _aes_nonce, pkt, _ts + i * 60, i)
-                    try:
-                        self._udp_sock.sendto(packet, _addr)
-                    except Exception as e:
-                        log.warning(f"[mqtt-server] [{_did}] UDP 发送失败: {e}")
-                        break
-                    time.sleep(0.06)
+            def _send_audio(_aes_key=aes_key, _aes_nonce=aes_nonce, _addr=addr, _packets=opus_packets, _did=device_id):
+                try:
+                    self._send_audio_packets(_did, _addr, _aes_key, _aes_nonce, _packets)
+                except Exception as e:
+                    log.warning(f"[mqtt-server] [{_did}] UDP 发送异常: {e}")
                 self._publish_to_device(_did, json.dumps({"type": "tts", "state": "stop"}))
                 log.info(f"[mqtt-server] [{_did}] TTS 推送完成: {text[:30]} ({len(_packets)}帧)")
             threading.Thread(target=_send_audio, daemon=True).start()
@@ -421,7 +501,7 @@ class MqttXiaozhiServer:
         log.info(f"[mqtt-server] UDP 接收循环启动 (port={self._udp_port})")
 
         # 每个设备的端点检测状态: {device_id: {...}}
-        _utterance_state: dict[str, dict] = {}
+        # 端点检测状态使用 self._utterance_state（与 hello 线程共享，重连时可重置）
 
         while self._running:
             try:
@@ -453,14 +533,23 @@ class MqttXiaozhiServer:
                                 struct.pack_into("!I", n, 8, ts)
                                 struct.pack_into("!I", n, 12, seq)
                                 decrypted = _aes_ctr_crypt(sess["aes_key"], bytes(n), data[UDP_AUDIO_HEADER_SIZE:])
-                                # Opus 帧以 TOC byte 开头 (0xFC 常见)，验证解密成功
-                                if decrypted and (decrypted[0] & 0xFC) == 0xFC:
-                                    sess["addr"] = addr
-                                    device_id = did
-                                    with _addr_to_device_lock:
-                                        _addr_to_device[addr] = did
-                                    log.info(f"[mqtt-server] 自动匹配设备: {addr} → {did}")
-                                    break
+                                # 验证解密成功: 用 opus 解码器试解码（TOC byte 因编码配置而异，
+                                # 不能假设 0xFC——16k/60ms SILK/CELT 帧的实际 TOC 不同）
+                                if decrypted:
+                                    try:
+                                        import opuslib
+                                        opuslib.Decoder(UPLINK_SAMPLE_RATE, 1).decode(
+                                            decrypted, frame_size=UPLINK_SAMPLE_RATE * 60 // 1000)
+                                        ok = True
+                                    except Exception:
+                                        ok = False
+                                    if ok:
+                                        sess["addr"] = addr
+                                        device_id = did
+                                        with _addr_to_device_lock:
+                                            _addr_to_device[addr] = did
+                                        log.info(f"[mqtt-server] 自动匹配设备: {addr} → {did}")
+                                        break
                             except Exception:
                                 continue
                     if not device_id:
@@ -491,11 +580,19 @@ class MqttXiaozhiServer:
                     opus_frame = _aes_ctr_crypt(aes_key, bytes(nonce), encrypted)
 
                 # ── 端点检测（复用 xiaozhi_ws.py 的逻辑）──
-                from app.xiaozhi_codec import opus_decode_to_wav
-                pcm = opus_decode_to_wav([opus_frame], UPLINK_SAMPLE_RATE)
+                frame_size = UPLINK_SAMPLE_RATE * 60 // 1000
+                try:
+                    import opuslib
+                    decoder = self._get_opus_decoder(device_id)
+                    if decoder is None:
+                        raise RuntimeError("opuslib decoder unavailable")
+                    raw_pcm = decoder.decode(opus_frame, frame_size=frame_size)
+                except Exception as e:
+                    log.debug("[mqtt] opus decode failed: %s", e)
+                    continue
 
-                # RMS 能量
-                samples = array.array('h', pcm[:len(pcm) - len(pcm) % 2])
+                # RMS 能量（直接吃裸 PCM，不带 WAV 头）
+                samples = array.array('h', raw_pcm[:len(raw_pcm) - len(raw_pcm) % 2])
                 if samples:
                     rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
                 else:
@@ -507,7 +604,7 @@ class MqttXiaozhiServer:
                     from app.xiaozhi_ws import _is_speech_vad, _load_silero_vad
                     vad_model = _load_silero_vad()
                     if vad_model:
-                        vad_speech = _is_speech_vad(pcm, rms, 0.5)
+                        vad_speech = _is_speech_vad(raw_pcm, rms, 0.5)
                     else:
                         vad_speech = rms > 500
                 except Exception as e:
@@ -515,15 +612,20 @@ class MqttXiaozhiServer:
                     vad_speech = rms > 500
 
                 is_hot = vad_speech or rms > 500
+                self._diag_count = getattr(self, '_diag_count', 0) + 1
+                if self._diag_count % 10 == 0:
+                    log.info(f"[mqtt-diag] 帧#{self._diag_count} addr={addr} rms={rms} "
+                             f"vad={vad_speech} hot={is_hot} active={st['utterance_active']} "
+                             f"buf={len(st['buf_frames'])} data0={data[0]} len={len(data)}")
 
                 # 初始化该设备的 utterance 状态
-                if device_id not in _utterance_state:
-                    _utterance_state[device_id] = {
+                if device_id not in self._utterance_state:
+                    self._utterance_state[device_id] = {
                         "buf_frames": [], "speech_count": 0, "silence_count": 0,
                         "utterance_active": False, "hot_frames": 0,
                         "tail": deque(maxlen=12),
                     }
-                st = _utterance_state[device_id]
+                st = self._utterance_state[device_id]
 
                 if not st["utterance_active"]:
                     # 未开始说话：滚动缓冲 + 热帧计数
@@ -549,6 +651,9 @@ class MqttXiaozhiServer:
                     st["silence_count"] = 0
                 else:
                     st["silence_count"] += 1
+                if len(st["buf_frames"]) % 15 == 0:
+                    log.info(f"[mqtt-server] [{device_id}] 诊断: buf={len(st['buf_frames'])} "
+                             f"speech={st['speech_count']} silence={st['silence_count']}")
 
                 silence_limit = SILENCE_FRAMES_VAD
                 capped = len(st["buf_frames"]) >= MAX_UTTERANCE_FRAMES
@@ -583,16 +688,25 @@ class MqttXiaozhiServer:
                 log.debug(f"[mqtt-server] UDP 接收异常: {e}")
 
     def _process_utterance(self, frames: list[bytes], device_id: str):
-        """处理一段完整语音：Opus→WAV→ASR→LLM→TTS→MQTT/UDP 下行"""
+        """处理一段完整语音：Opus→WAV→ASR→LLM(流式)→TTS(逐句)→MQTT/UDP 下行"""
         try:
-            from app.xiaozhi_codec import opus_decode_to_wav
-            from voice_agent import asr, is_low_intent_asr, is_garbled_asr
+            from app.xiaozhi_codec import opus_decode_to_pcm, pcm_to_wav, mp3_to_opus_packets
+            from voice_agent import asr, is_low_intent_asr, is_garbled_asr, tts_to_mp3
             from agent.intent import LOW_INTENT_ASR_REPLY, strip_wake_word
 
-            # 1. 解码 Opus → WAV
-            wav = opus_decode_to_wav(frames, UPLINK_SAMPLE_RATE)
-            if not wav:
+            with _sessions_lock:
+                session = _sessions.get(device_id)
+            if not session:
                 return
+            addr = session.get("addr")
+            if not addr:
+                return
+
+            # 1. 解码 Opus → 裸 PCM，送 ASR 时再封装 WAV
+            raw_pcm = opus_decode_to_pcm(frames, UPLINK_SAMPLE_RATE)
+            if not raw_pcm:
+                return
+            wav = pcm_to_wav(raw_pcm, UPLINK_SAMPLE_RATE)
 
             # 2. ASR
             asr_text = asr(wav, "wav")
@@ -612,22 +726,90 @@ class MqttXiaozhiServer:
             log.info(f"[mqtt-server] [{device_id}] ASR: {asr_text}")
             self._publish_to_device(device_id, json.dumps({"type": "stt", "text": asr_text}, ensure_ascii=False))
 
-            # 3. LLM + TTS
+            # 3. LLM + TTS（流式分句）
             if is_low_intent_asr(asr_text):
                 self._push_text_tts(LOW_INTENT_ASR_REPLY, device_id)
                 return
 
-            # 调用 brain
             import voice_agent
-            reply_text, reply_fmt, audio_bytes = voice_agent.voice_loop(wav, "wav")
-            if audio_bytes:
-                self._push_audio_tts(asr_text, audio_bytes, device_id)
+            session_id = f"mqtt-{device_id}"
+            abort_flag = self._get_abort_flag(device_id)
+            # 新 utterance 启动：世代 +1 使旧 auto-clear 线程全部失效，再 clear flag
+            with self._abort_generations_lock:
+                self._abort_generations[device_id] = self._abort_generations.get(device_id, 0) + 1
+            abort_flag.clear()
+            any_pushed = False
+            tts_start_sent = False
+            tts_stop_sent = False
+
+            def _ensure_tts_stop():
+                nonlocal tts_stop_sent
+                # 从未发过 tts start（如 brain 启动失败/整段无产出）就不补孤立 stop，
+                # 兜底播报由 _push_text_tts 自带完整 start/sentence/stop 序列
+                if not tts_start_sent or tts_stop_sent:
+                    return
+                tts_stop_sent = True
+                try:
+                    self._publish_to_device(device_id, json.dumps({"type": "tts", "state": "stop"}))
+                except Exception as e:
+                    log.debug(f"[mqtt-server] [{device_id}] tts stop 发送失败: {e}")
+
+            try:
+                stream = voice_agent.brain_stream_sentences(
+                    asr_text, session_id=session_id, channel="voice", cancel_event=abort_flag
+                )
+            except Exception as e:
+                log.warning(f"[mqtt-server] [{device_id}] brain_stream_sentences 启动失败: {e}")
+                stream = iter([])
+
+            try:
+                for sentence, full_reply in stream:
+                    if abort_flag.is_set():
+                        log.info(f"[mqtt-server] [{device_id}] abort 中断流式输出")
+                        break
+                    if not sentence:
+                        continue
+                    try:
+                        mp3_data = tts_to_mp3(sentence)
+                    except Exception as e:
+                        log.warning(f"[mqtt-server] [{device_id}] 单句 TTS 失败，跳过: {e}")
+                        continue
+                    if not mp3_data:
+                        continue
+                    try:
+                        opus_packets = mp3_to_opus_packets(mp3_data, DOWNLINK_SAMPLE_RATE)
+                        if not opus_packets:
+                            continue
+                        if not tts_start_sent:
+                            self._publish_to_device(device_id, json.dumps({
+                                "type": "tts", "state": "start",
+                                "text": full_reply or sentence,
+                                "voice": "zh-CN",
+                            }))
+                            tts_start_sent = True
+                        self._publish_to_device(device_id, json.dumps({
+                            "type": "tts", "state": "sentence_start",
+                            "text": sentence,
+                        }))
+                        self._send_audio_packets(device_id, addr, session["aes_key"], session["aes_nonce"], opus_packets)
+                        any_pushed = True
+                    except Exception as e:
+                        log.warning(f"[mqtt-server] [{device_id}] 单句推送失败，跳过: {e}")
+                        continue
+            except Exception as e:
+                log.warning(f"[mqtt-server] [{device_id}] 流式输出异常: {e}")
+            finally:
+                _ensure_tts_stop()
+
+            if not any_pushed:
+                self._push_text_tts("语音处理失败了，请再试一次", device_id)
 
         except Exception as e:
             log.error(f"[mqtt-server] [{device_id}] 语音处理失败: {e}")
             try:
                 self._push_text_tts("语音处理失败了，请再试一次", device_id)
-            except Exception:
+            except Exception as e:
+                log.debug(f"[app.mqtt_server] error at line 630: {e}")
                 pass
 
     def _publish_stt(self, text: str, device_id: str):
@@ -641,14 +823,23 @@ class MqttXiaozhiServer:
             mp3 = tts_to_mp3(text)
             if mp3:
                 self._push_audio_tts(text, mp3, device_id)
+            else:
+                log.warning(f"[mqtt-server] [{device_id}] TTS 合成失败，下发文字提示")
+                self._publish_stt("语音合成暂时不可用，请稍后再试", device_id)
         except Exception as e:
             log.warning(f"[mqtt-server] [{device_id}] TTS 失败: {e}")
+            try:
+                self._publish_stt("语音合成暂时不可用，请稍后再试", device_id)
+            except Exception:
+                pass
 
     def _push_audio_tts(self, text: str, mp3_data: bytes, device_id: str):
         """推送 TTS 音频到指定 ESP32：MQTT 通知 + UDP Opus 帧"""
         try:
             from app.xiaozhi_codec import mp3_to_opus_packets
-            opus_packets = mp3_to_opus_packets(mp3_data)
+            # hello 协商的采样率是 DOWNLINK_SAMPLE_RATE(16k)，
+            # 编码必须一致，否则设备按 16k 解码 24k 流 → 变速变调
+            opus_packets = mp3_to_opus_packets(mp3_data, DOWNLINK_SAMPLE_RATE)
             if not opus_packets:
                 return
             # 只推给指定设备
@@ -679,16 +870,11 @@ class MqttXiaozhiServer:
             "voice": "zh-CN",
         }))
 
-        ts = int(time.time() * 1000) & 0xFFFFFFFF
         def _send_audio():
-            for i, pkt in enumerate(opus_packets):
-                packet = _build_audio_packet(aes_key, aes_nonce, pkt, ts + i * 60, i)
-                try:
-                    self._udp_sock.sendto(packet, addr)
-                except Exception as e:
-                    log.warning(f"[mqtt-server] [{device_id}] UDP 发送失败: {e}")
-                    break
-                time.sleep(0.06)
+            try:
+                self._send_audio_packets(device_id, addr, aes_key, aes_nonce, opus_packets)
+            except Exception as e:
+                log.warning(f"[mqtt-server] [{device_id}] UDP 发送异常: {e}")
             self._publish_to_device(device_id, json.dumps({"type": "tts", "state": "stop"}))
             log.info(f"[mqtt-server] [{device_id}] TTS 推送完成: {text[:30]} ({len(opus_packets)}帧)")
         threading.Thread(target=_send_audio, daemon=True).start()
@@ -738,7 +924,8 @@ def init_server(loop: asyncio.AbstractEventLoop) -> bool:
     if _server:
         try:
             _server.stop()
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.mqtt_server] error at line 741: {e}")
             pass
     _server = MqttXiaozhiServer()
     return _server.start(loop)
@@ -753,7 +940,8 @@ def push_tts_to_mqtt(text: str, mp3_data: bytes) -> bool:
         return False
     try:
         from app.xiaozhi_codec import mp3_to_opus_packets
-        packets = mp3_to_opus_packets(mp3_data)
+        # 与 hello 协商的 DOWNLINK_SAMPLE_RATE 保持一致（同 _push_audio_tts）
+        packets = mp3_to_opus_packets(mp3_data, DOWNLINK_SAMPLE_RATE)
         if not packets:
             log.warning("[mqtt-push] Opus 编码失败")
             return False

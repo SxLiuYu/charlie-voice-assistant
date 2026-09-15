@@ -98,7 +98,7 @@ class TestPlayReminderAudio:
         play_reminder_audio("吃药", reminder_id=42)
 
         mock_tts.assert_called_once_with("主人，提醒您：吃药")
-        mock_push.assert_called_once_with("主人，提醒您：吃药", b"x" * 500)
+        mock_push.assert_called_once_with("主人，提醒您：吃药", b"x" * 500, reminder_id=42)
         mock_complete.assert_called_once_with(42)
 
     @patch("app.reminders.release_failed_reminder")

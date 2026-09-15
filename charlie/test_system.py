@@ -176,7 +176,7 @@ def t_utils():
     t1 = parse_time_str("30分钟后")
     ok1 = t1 is not None and "T" in t1
     # 错误脱敏
-    e = sanitize_error("Error in /Users/sxliuyu/code.py key sk-abc123 ip 10.0.0.1")
+    e = sanitize_error("Error in /app.py key sk-abc123 ip 10.0.0.1")
     ok2 = "code.py" not in e and "sk-abc123" not in e and "10.0.0.1" not in e
     return ok1 and ok2, "parse_time=%s sanitize=%s" % ("Y" if ok1 else "N", "Y" if ok2 else "N")
 

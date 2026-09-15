@@ -1,7 +1,7 @@
 """个性化推荐主动推送 — "懂你, 推你想看的"
 
 基于 Charlie 记忆/偏好/自进化画像 → 提取用户兴趣 → 抖音热搜/新闻 → ARK LLM 智能筛选 → 推飞书。
-定时(每4h)推送3条"你可能感兴趣的热点", 结合用户兴趣画像给推荐理由。
+定时(默认1h，可通过环境变量 PERSONALIZED_PUSH_INTERVAL 调整)推送3条"你可能感兴趣的热点", 结合用户兴趣画像给推荐理由。
 
 数据源:
 - evolution_data.json (learned_preferences: 常用功能频次)
@@ -10,7 +10,7 @@
 - 抖音热搜 API (trending_list)
 - ARK LLM (兴趣×热点→推荐)
 """
-import os, json, time, logging, requests
+import os, json, time, logging, requests, datetime
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,13 +31,15 @@ _PUSHED_FILE = os.path.join(DATA_DIR, "pushed_hot_topics.json")
 
 
 def _load_pushed():
-    """从磁盘加载已推送记录"""
+    """从磁盘加载已推送记录，剔除过期条目并回写磁盘"""
     global _PUSHED_CACHE
     try:
         with open(_PUSHED_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         now = time.time()
         _PUSHED_CACHE = {k: v for k, v in data.items() if now - v < _PUSHED_TTL}
+        if len(_PUSHED_CACHE) < len(data):
+            _save_pushed()
     except Exception:
         _PUSHED_CACHE = {}
 
@@ -165,21 +167,27 @@ def recommend_with_llm(interests: str, hots: list) -> list:
         return hots[:3]
 
 
-def _push_feishu(text: str):
-    """发飞书消息(内联, 同 _push_feishu_async 的 _send 逻辑)"""
+def _push_feishu(text: str, rich_content: dict | None = None):
+    """发飞书消息(内联, 同 _push_feishu_async 的 _send 逻辑)
+
+    rich_content: 飞书 post 富文本结构，传入时使用 post 消息类型（链接可点击）。
+    """
     if not FEISHU_PUSH_OPEN_ID:
         return
     try:
-        r = requests.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-            json={"app_id": os.getenv("FEISHU_APP_ID", ""), "app_secret": os.getenv("FEISHU_APP_SECRET", "")},
-            timeout=10)
-        token = r.json().get("tenant_access_token", "")
+        from feishu_token import get_tenant_access_token
+        token = get_tenant_access_token()
         if not token:
             return
+        if rich_content:
+            payload = {"receive_id": FEISHU_PUSH_OPEN_ID, "msg_type": "post",
+                       "content": json.dumps(rich_content)}
+        else:
+            payload = {"receive_id": FEISHU_PUSH_OPEN_ID, "msg_type": "text",
+                       "content": json.dumps({"text": text})}
         requests.post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"receive_id": FEISHU_PUSH_OPEN_ID, "msg_type": "text",
-                  "content": json.dumps({"text": text})}, timeout=10)
+            json=payload, timeout=10)
         log.info(f"[push] 个性化推荐推送成功")
     except Exception as e:
         log.warning(f"[push] 个性化推荐推送失败: {e}")
@@ -205,23 +213,40 @@ def push_personalized_digest():
     # 标记已推送
     _mark_pushed(picks)
     import urllib.parse
-    lines = ["📊 今日热点精选"]
+    # 构建飞书 post 富文本（链接可点击）
+    content_rows = [[{"tag": "text", "text": "📊 今日热点精选"}]]
     for i, word in enumerate(picks, 1):
         url = f"https://www.douyin.com/search/{urllib.parse.quote(word)}"
-        lines.append(f"{i}. {word}\n   {url}")
-    text = "\n\n".join(lines)
-    _push_feishu(text)
+        content_rows.append([
+            {"tag": "text", "text": f"{i}. "},
+            {"tag": "a", "text": word, "href": url},
+        ])
+    rich = {"zh_cn": {"title": "今日热点精选", "content": content_rows}}
+    _push_feishu("", rich_content=rich)
+
+
+def _is_push_quiet_hours() -> bool:
+    """推送静音时段检查（默认 22:00-07:00）"""
+    start = int(os.getenv("PERSONALIZED_PUSH_QUIET_START", "22"))
+    end = int(os.getenv("PERSONALIZED_PUSH_QUIET_END", "7"))
+    hour = datetime.datetime.now().hour
+    if start <= end:
+        return start <= hour < end
+    return hour >= start or hour < end
 
 
 def personalized_push_loop():
-    """定时推送循环(每4h)"""
+    """定时推送循环(默认1h，可通过环境变量 PERSONALIZED_PUSH_INTERVAL 调整)"""
     interval = int(os.getenv("PERSONALIZED_PUSH_INTERVAL", str(3600)))  # 默认1h
     log.info(f"[push] 个性化推荐推送已启动(间隔{interval}s)")
-    # 首次延迟10min(等服务就绪)
-    time.sleep(600)
+    # 首次延迟min(60, interval)秒(等服务就绪，避免 watchdog 在长首延内重启)
+    time.sleep(min(60, interval))
     while True:
         try:
-            push_personalized_digest()
+            if not _is_push_quiet_hours():
+                push_personalized_digest()
+            else:
+                log.debug("[push] 静音时段，跳过推送")
         except Exception as e:
             log.warning(f"[push] 推送异常: {e}")
         time.sleep(interval)

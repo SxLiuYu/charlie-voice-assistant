@@ -31,6 +31,11 @@ PROACTIVE_LOCK_FILE = SUGGESTIONS_STATE_FILE + ".runner.lock"
 DECISION_LOCK_FILE = os.path.join(_get_data_dir(), "decision_engine.runner.lock")
 DELIVERY_RETRY_DELAYS = [60, 180, 600]
 DELIVERY_CLAIM_TIMEOUT = 900  # 秒；播报线程崩溃后允许重新申领
+EXPIRED_AFTER_HOURS = int(os.getenv("REMINDER_EXPIRED_AFTER_HOURS", "2"))  # 一次性提醒过期小时数
+# enqueued（ESP32 离线等重连）重试次数上限：5 分钟间隔 × 6 次 ≈ 30 分钟。
+# 超过后停止重新入队——飞书兜底已送达，设备端 pending 队列 TTL 也只有 5 分钟，
+# 继续重试只是浪费 TTS 配额并往调度日志灌重复推送（真实事故：起床提醒循环 64 次）。
+ENQUEUED_MAX_ATTEMPTS = int(os.getenv("REMINDER_ENQUEUED_MAX_ATTEMPTS", "6"))
 
 os.makedirs(_get_data_dir(), exist_ok=True)
 
@@ -251,12 +256,14 @@ def _save_reminders(data):
         try:
             from agent.context import invalidate_context_cache
             invalidate_context_cache()
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.reminders] error at line 254: {e}")
             pass
         try:
             from agent.system_msg import invalidate_system_msg_cache
             invalidate_system_msg_cache()
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.reminders] error at line 259: {e}")
             pass
 
 
@@ -294,7 +301,8 @@ def append_reminder(text: str, time_str: str = "", due: str | None = None, repea
                     if abs((dt.datetime.fromisoformat(ex_due) - due_dt).total_seconds()) <= 60:
                         log.info(f"[reminders] 跳过重复提醒: {text} (due={norm_due})")
                         return copy.deepcopy(existing)
-                except Exception:
+                except Exception as e:
+                    log.debug(f"[app.reminders] error at line 297: {e}")
                     pass
             elif not norm_due and not ex_due:
                 log.info(f"[reminders] 跳过重复提醒: {text}")
@@ -324,12 +332,14 @@ def append_reminder(text: str, time_str: str = "", due: str | None = None, repea
         try:
             from agent.context import invalidate_context_cache
             invalidate_context_cache()
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.reminders] error at line 327: {e}")
             pass
         try:
             from agent.system_msg import invalidate_system_msg_cache
             invalidate_system_msg_cache()
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.reminders] error at line 332: {e}")
             pass
         return copy.deepcopy(item)
 
@@ -409,6 +419,193 @@ def update_reminder_delivery_state(reminder_id: int, state: str):
         if changed:
             _write_locked_reminders(reminders)
 
+def mark_reminder_enqueued(reminder_id: int):
+    """标记提醒为 enqueued 状态（ESP32 离线等待推送），设置 retry_after=5分钟后重试。
+
+    调用方：push_tts_to_xiaozhi 返回 "enqueued" 时，由 play_reminder_audio 调用。
+    """
+    now = dt.datetime.now()
+    retry_after = now + dt.timedelta(minutes=5)
+    with _locked_reminders():
+        reminders = _read_locked_reminders()
+        changed = False
+        for reminder in reminders:
+            if reminder.get("id") != reminder_id:
+                continue
+            reminder["delivery_state"] = "enqueued"
+            reminder["retry_after"] = retry_after.isoformat()
+            reminder.pop("claim_started_at", None)
+            changed = True
+            # 循环提醒：飞书兜底已送达，立即滚动生成下一次，
+            # 避免 ESP32 长期离线时后续日程整段丢失（补播 direct 成功时不再重复生成）
+            if _generate_next_occurrence_locked(reminder, reminders, now):
+                changed = True
+            log.info(f"[reminders] 提醒{reminder_id}入队(enqueued)，{int((retry_after - now).total_seconds())}秒后可重试")
+            break
+        if changed:
+            _write_locked_reminders(reminders)
+
+def set_reminder_retry_after(reminder_id: int, retry_after: dt.datetime):
+    """设置提醒的重试时间（用于静音时段补播等场景）。"""
+    with _locked_reminders():
+        reminders = _read_locked_reminders()
+        changed = False
+        for reminder in reminders:
+            if reminder.get("id") != reminder_id:
+                continue
+            reminder["retry_after"] = retry_after.isoformat()
+            reminder.pop("claim_started_at", None)
+            changed = True
+            # 静音时段与 enqueued 同语义：飞书已兜底送达，循环提醒立即滚动
+            if _generate_next_occurrence_locked(reminder, reminders, dt.datetime.now()):
+                changed = True
+            log.info(f"[reminders] 提醒{reminder_id}设置retry_after={retry_after.isoformat()}")
+            break
+        if changed:
+            _write_locked_reminders(reminders)
+
+def _generate_next_occurrence_locked(reminder: dict, reminders: list, now: dt.datetime) -> bool:
+    """为循环提醒生成下一次到期条目（须在 _locked_reminders 锁内调用）。
+
+    已生成过（next_generated 标记）或非循环提醒返回 False。
+    标记防止重复：enqueued 时生成过一次后，补播 direct 成功不再生成。
+    """
+    if reminder.get("next_generated"):
+        return False
+    repeat = reminder.get("repeat", "")
+    due_str = reminder.get("due", "")
+    if not repeat or not due_str:
+        return False
+    try:
+        old_due = dt.datetime.fromisoformat(due_str)
+        if repeat == "daily":
+            next_due = old_due + dt.timedelta(days=1)
+            while next_due < now:
+                next_due += dt.timedelta(days=1)
+        elif repeat == "weekly":
+            next_due = old_due + dt.timedelta(weeks=1)
+            while next_due < now:
+                next_due += dt.timedelta(weeks=1)
+        elif repeat == "weekdays":
+            next_due = old_due + dt.timedelta(days=1)
+            # 1. 先跳过所有已过期的循环点（补触发过去的）
+            while next_due < now:
+                next_due += dt.timedelta(days=1)
+            # 2. 再跳过周末，但保留 >= now 的工作日
+            while next_due.weekday() >= 5:
+                next_due += dt.timedelta(days=1)
+        else:
+            return False
+        next_id = int(now.timestamp())
+        for r in reminders:
+            try:
+                next_id = max(next_id, int(r.get("id", 0)))
+            except (TypeError, ValueError):
+                continue
+        next_id += 1
+        reminders.append({
+            "id": next_id,
+            "text": reminder["text"],
+            "time": reminder.get("time", ""),
+            "due": next_due.isoformat(),
+            "done": False,
+            "repeat": repeat,
+        })
+        reminder["next_generated"] = True
+        log.info(f"[reminders] 循环提醒{reminder.get('id')}已生成下次: id={next_id} due={next_due.isoformat()}")
+        return True
+    except Exception as e:
+        log.warning(f"[reminders] 循环提醒{reminder.get('id')}生成下次失败: {e}")
+        return False
+
+
+def restore_after_restart():
+    """进程重启恢复：重置卡在中间状态的提醒，使其可被重新申领。
+
+    场景：
+    - 进程崩溃时提醒处于 "delivering" 状态（播报线程中断，claim_started_at 过期）
+    - 进程崩溃时提醒处于 "enqueued" 状态（retry_after 可能已过期）
+    恢复策略：
+    1. 过滤掉已过期的一性提醒（超过 EXPIRED_AFTER_HOURS）
+    2. 把 "delivering" 过一次申领超时的状态降级为 "pending" + 重试
+    3. 把 "enqueued" + retry_after 已过的状态降级为 "pending"
+    4. 把其他中间状态（无 delivery_state 但有 claim_started_at）降级为 "pending"
+    """
+    now = dt.datetime.now()
+    restored = 0
+    with _locked_reminders():
+        reminders = _read_locked_reminders()
+        changed = False
+        for r in reminders:
+            if r.get("done"):
+                continue
+            repeat = r.get("repeat", "")
+            due_str = r.get("due", "")
+            if not due_str:
+                continue
+
+            # 一次性过期提醒保持 expired（锚定 due，不用 retry_after——会被重试推后续命）
+            if not repeat:
+                try:
+                    due = dt.datetime.fromisoformat(due_str)
+                    if now - due > dt.timedelta(hours=EXPIRED_AFTER_HOURS):
+                        continue  # 已过期，保持当前状态
+                except (ValueError, TypeError):
+                    continue
+
+            delivery_state = r.get("delivery_state", "")
+            claim_started = r.get("claim_started_at", "")
+            retry_after_str = r.get("retry_after", "")
+            needs_restore = False
+            new_state = ""
+
+            if delivery_state == "delivering":
+                # delivering 状态：检查 claim 是否已超时（超过 DELIVERY_CLAIM_TIMEOUT）
+                try:
+                    claim_dt = dt.datetime.fromisoformat(claim_started)
+                except (ValueError, TypeError):
+                    claim_dt = now - dt.timedelta(seconds=DELIVERY_CLAIM_TIMEOUT + 1)
+                if now - claim_dt >= dt.timedelta(seconds=DELIVERY_CLAIM_TIMEOUT):
+                    needs_restore = True
+                    new_state = "retry"
+                    r["delivery_state"] = "retry"
+                    r.pop("claim_started_at")
+                    r["attempt_count"] = int(r.get("attempt_count", 1) or 1) + 1
+            elif delivery_state == "enqueued":
+                # enqueued 状态：检查 retry_after 是否已过
+                if retry_after_str:
+                    try:
+                        if now >= dt.datetime.fromisoformat(retry_after_str):
+                            needs_restore = True
+                            new_state = "pending"
+                            r["delivery_state"] = ""
+                            r.pop("retry_after")
+                    except (ValueError, TypeError):
+                        pass
+            elif delivery_state == "" and claim_started:
+                # 无 delivery_state 但有 claim_started_at（旧版格式残留）
+                try:
+                    claim_dt = dt.datetime.fromisoformat(claim_started)
+                    if now - claim_dt >= dt.timedelta(seconds=DELIVERY_CLAIM_TIMEOUT):
+                        needs_restore = True
+                        new_state = "retry"
+                        r["delivery_state"] = "retry"
+                        r.pop("claim_started_at")
+                except (ValueError, TypeError):
+                    pass
+
+            if needs_restore:
+                changed = True
+                restored += 1
+                log.info(f"[reminders] 重启恢复提醒{r.get('id')}: {delivery_state or 'pending'} → {new_state}")
+
+        if changed:
+            _write_locked_reminders(reminders)
+    if restored:
+        log.info(f"[reminders] 重启恢复完成，共恢复 {restored} 条提醒")
+    return restored
+
+
 def complete_reminder_delivery(reminder_id: int):
     """播报成功后标记完成；如果是循环提醒，生成下一次到期。"""
     now = dt.datetime.now()
@@ -426,50 +623,8 @@ def complete_reminder_delivery(reminder_id: int):
             reminder.pop("last_delivery_error", None)
             changed = True
 
-            # 循环提醒：生成下一次到期时间
-            repeat = reminder.get("repeat", "")
-            due_str = reminder.get("due", "")
-            if repeat and due_str:
-                try:
-                    old_due = dt.datetime.fromisoformat(due_str)
-                    if repeat == "daily":
-                        next_due = old_due + dt.timedelta(days=1)
-                        while next_due < now:
-                            next_due += dt.timedelta(days=1)
-                    elif repeat == "weekly":
-                        next_due = old_due + dt.timedelta(weeks=1)
-                        while next_due < now:
-                            next_due += dt.timedelta(weeks=1)
-                    elif repeat == "weekdays":
-                        next_due = old_due + dt.timedelta(days=1)
-                        # 1. 先跳过所有已过期的循环点（补触发过去的）
-                        while next_due < now:
-                            next_due += dt.timedelta(days=1)
-                        # 2. 再跳过周末，但保留 >= now 的工作日
-                        while next_due.weekday() >= 5:
-                            next_due += dt.timedelta(days=1)
-                    else:
-                        next_due = None
-                    if next_due:
-                        next_id = int(now.timestamp())
-                        for r in reminders:
-                            try:
-                                next_id = max(next_id, int(r.get("id", 0)))
-                            except (TypeError, ValueError):
-                                continue
-                        next_id += 1
-                        new_item = {
-                            "id": next_id,
-                            "text": reminder["text"],
-                            "time": reminder.get("time", ""),
-                            "due": next_due.isoformat(),
-                            "done": False,
-                            "repeat": repeat,
-                        }
-                        reminders.append(new_item)
-                        log.info(f"[reminders] 循环提醒{reminder_id}已生成下次: id={next_id} due={next_due.isoformat()}")
-                except Exception as e:
-                    log.warning(f"[reminders] 循环提醒{reminder_id}生成下次失败: {e}")
+            # 循环提醒：生成下一次到期时间（enqueued 时可能已生成过）
+            _generate_next_occurrence_locked(reminder, reminders, now)
             break
 
         if changed:
@@ -477,12 +632,14 @@ def complete_reminder_delivery(reminder_id: int):
             try:
                 from agent.context import invalidate_context_cache
                 invalidate_context_cache()
-            except Exception:
+            except Exception as e:
+                log.debug(f"[app.reminders] error at line 480: {e}")
                 pass
             try:
                 from agent.system_msg import invalidate_system_msg_cache
                 invalidate_system_msg_cache()
-            except Exception:
+            except Exception as e:
+                log.debug(f"[app.reminders] error at line 485: {e}")
                 pass
 
 
@@ -497,6 +654,59 @@ def claim_due_reminders(now=None):
         for reminder in reminders:
             if reminder.get("done"):
                 continue
+
+            # 一次性提醒过期太久（超过 EXPIRED_AFTER_HOURS）直接标记 expired，不再播报。
+            # 移到状态检查之前，避免 delivering/enqueued 状态绕过过期判定（claim 续命死循环）。
+            # 过期锚定 due 而非 retry_after：重试会不断推后 retry_after，
+            # 以它为基准等于给提醒无限续命（真实事故：起床提醒 5 分钟一次循环 64 次）。
+            repeat = reminder.get("repeat", "")
+            due_str = reminder.get("due", "")
+            if not repeat and due_str:
+                try:
+                    due = dt.datetime.fromisoformat(due_str)
+                    if now - due > dt.timedelta(hours=EXPIRED_AFTER_HOURS):
+                        old_delivery_state = reminder.get("delivery_state")
+                        reminder["done"] = True
+                        reminder["delivery_state"] = "expired"
+                        reminder["completed_at"] = now.isoformat()
+                        reminder.pop("retry_after", None)
+                        reminder.pop("last_delivery_error", None)
+                        changed = True
+                        log.info(f"[reminders] 一次性提醒{reminder.get('id')}过期{int((now - due).total_seconds() / 3600)}小时，标记expired")
+                        # 未成功送达的提醒过期时推送飞书通知，避免用户无感知
+                        if old_delivery_state in ("retry", None, "", "pending", "enqueued"):
+                            try:
+                                from app.notifications import push_feishu_async
+                                push_feishu_async(f"⏰ 提醒已过期未送达：{reminder.get('text', '')}")
+                            except Exception as e:
+                                log.debug(f"[app.reminders] push_feishu_async failed: {e}")
+                        continue
+                except Exception:
+                    pass
+
+            # enqueued 状态：retry_after 未到则跳过，避免 5 分钟内重复申领；
+            # 超过 ENQUEUED_MAX_ATTEMPTS 后停止重投（飞书兜底已送达，
+            # 设备 pending 队列 TTL 5 分钟，继续入队只是重复 TTS + 推送轰炸）
+            if reminder.get("delivery_state") == "enqueued":
+                attempts = int(reminder.get("attempt_count", 0) or 0)
+                if attempts >= ENQUEUED_MAX_ATTEMPTS:
+                    reminder["done"] = True
+                    reminder["delivery_state"] = "expired_enqueued"
+                    reminder["completed_at"] = now.isoformat()
+                    reminder.pop("retry_after", None)
+                    changed = True
+                    log.info(f"[reminders] 提醒{reminder.get('id')}入队重试{attempts}次达上限"
+                             f"（设备持续离线），标记expired_enqueued停止重投")
+                    continue
+                retry_after = reminder.get("retry_after")
+                if retry_after:
+                    try:
+                        if now < dt.datetime.fromisoformat(retry_after):
+                            continue
+                    except Exception:
+                        pass
+
+            # delivering 状态：检查 claim 是否超时
             if reminder.get("delivery_state") == "delivering":
                 claim_started = reminder.get("claim_started_at")
                 try:
@@ -506,6 +716,8 @@ def claim_due_reminders(now=None):
                 if now - claim_started < dt.timedelta(seconds=DELIVERY_CLAIM_TIMEOUT):
                     continue
                 # 播报线程可能已崩溃；超过申领超时后允许重新申领同一条提醒。
+
+            # 通用 retry_after 检查（非 enqueued 状态）
             retry_after = reminder.get("retry_after")
             if retry_after:
                 try:
@@ -513,15 +725,15 @@ def claim_due_reminders(now=None):
                         continue
                 except Exception:
                     pass
-            due_str = reminder.get("due", "")
+
             if not due_str:
                 continue
             try:
                 due = dt.datetime.fromisoformat(due_str)
             except Exception:
                 continue
+
             if now >= due:
-                # 只有非 delivering 状态才申领；delivering 且超时的会在上面 fall-through 到这里
                 reminder["delivery_state"] = "delivering"
                 reminder["claim_started_at"] = now.isoformat()
                 reminder["attempt_count"] = int(reminder.get("attempt_count", 0) or 0) + 1

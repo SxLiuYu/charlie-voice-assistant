@@ -1,5 +1,5 @@
 """飞书双向对话 — 接收飞书消息并路由到 brain 处理"""
-import os, json, logging, asyncio
+import os, json, logging, asyncio, hmac
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -34,7 +34,7 @@ async def feishu_webhook(request: Request):
 
     if FEISHU_VERIFICATION_TOKEN:
         body_token = body.get("token", "")
-        if body_token != FEISHU_VERIFICATION_TOKEN:
+        if not hmac.compare_digest(body_token or "", FEISHU_VERIFICATION_TOKEN or ""):
             raise HTTPException(status_code=403, detail="Invalid verification token")
     else:
         # 未配置 verification_token 时拒绝处理消息事件（fail-closed）
@@ -96,7 +96,7 @@ async def _handle_feishu_message(text: str, sender_id: str, chat_id: str):
             session_id = f"feishu_{sender_id}"
             try:
                 from agent.llm import brain_stream_sentences
-                gen = await asyncio.to_thread(lambda: list(brain_stream_sentences(text, session_id=session_id)))
+                gen = await asyncio.to_thread(lambda: list(brain_stream_sentences(text, session_id=session_id, channel="feishu_text")))
                 for sentence, _ in gen:
                     reply += sentence
             except Exception as e:

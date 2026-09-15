@@ -57,8 +57,13 @@ def _bing_scrape(query: str, max_results: int = 8) -> list:
             results.append({'title': title, 'url': url, 'snippet': snippet})
     return results
 
-def _wigolo_search(query: str, timeout: int = 15) -> list:
-    """使用wigolo CLI搜索(带超时)"""
+_wigolo_available: bool | None = None
+
+def _wigolo_search(query: str, timeout: int = 8) -> list:
+    """使用wigolo CLI搜索(带超时)。首次调用探测可用性，不可用后永久跳过。"""
+    global _wigolo_available
+    if _wigolo_available is False:
+        return []
     import subprocess
     try:
         r = subprocess.run(
@@ -66,6 +71,7 @@ def _wigolo_search(query: str, timeout: int = 15) -> list:
             capture_output=True, text=True, timeout=timeout
         )
         if r.returncode == 0 and r.stdout.strip():
+            _wigolo_available = True
             # wigolo returns JSON results
             import json as _j
             try:
@@ -76,12 +82,15 @@ def _wigolo_search(query: str, timeout: int = 15) -> list:
                 log.debug(f"[baize] wigolo非JSON输出: {e}")
                 # Non-JSON output, return as text
                 return [{"title": "wigolo", "url": "", "snippet": r.stdout[:500]}]
+        else:
+            _wigolo_available = False
+            log.warning(f"[baize] wigolo不可用(returncode={r.returncode})，后续跳过")
     except subprocess.TimeoutExpired:
-        log.warning("[baize] wigolo搜索超时")
-        pass
+        _wigolo_available = False
+        log.warning(f"[baize] wigolo搜索超时({timeout}s)，后续跳过")
     except Exception as e:
-        log.warning(f"[baize] wigolo搜索异常: {e}")
-        pass
+        _wigolo_available = False
+        log.warning(f"[baize] wigolo搜索异常: {e}，后续跳过")
     return []
 
 @mcp.tool()
@@ -170,32 +179,4 @@ def deep_research(topic: str) -> str:
     try:
         return web_search_free(topic + " 深度分析 2024")
     except Exception as e:
-        return f"深度研究「{topic}」失败: {e}" 
-    if not all_results:
-        return f"深度研究「{topic}」未找到足够信息"
-
-    docs = []
-    seen = set()
-    for r in all_results:
-        title = r.get('title', '')
-        if title in seen:
-            continue
-        seen.add(title)
-        snippet = r.get('snippet', '')
-        docs.append(f"[{len(docs)+1}] {title}\n{snippet}")
-
-    try:
-        reply = aliyun_chat([
-            {"role": "system", "content": f"你是研究助手。用户想深入了解「{topic}」。"
-             "从以下多源搜索结果中综合分析，给出结构化报告："
-             "1. 核心要点（3-5条）"
-             "2. 关键数据/事实"
-             "3. 不同观点/争议"
-             "4. 总结建议"
-             "用简洁中文，附来源编号。不要编造未在结果中出现的内容。"},
-            {"role": "user", "content": "\n\n".join(docs)[:12000]}
-        ], temperature=0.3)
-        return f"📊 深度研究：{topic}\n\n{reply}"
-    except Exception as e:
-        # 阿里云失败时返回搜索结果摘要
-        return f"📊 深度研究：{topic}（搜索结果摘要）\n\n" + "\n\n".join(docs[:8])
+        return f"深度研究「{topic}」失败: {e}"

@@ -15,7 +15,7 @@ from app.http_helpers import (
 from app.state import (
     register_sse_client, unregister_sse_client, sse_client_count,
 )
-from app.notifications import drain_notifications
+from app.notifications import drain_notifications, _get_lan_ip
 from app.auth import _sanitize_text, AUTH_TOKEN
 from app.config import http_port, https_port
 from app.reminders import (
@@ -32,17 +32,6 @@ class ReminderRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=200)
     time: str = Field(default="")
     repeat: str = Field(default="")
-
-def _get_lan_ip() -> str | None:
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip if not ip.startswith("127.") else None
-    except Exception:
-        return None
 
 @router.get("/api/reminders")
 async def list_reminders(request: Request):
@@ -154,7 +143,8 @@ async def xiaozhi_ota(request: Request):
         host = _get_lan_ip() or "127.0.0.1"
     ws_url = f"ws://{host}:{http_port()}/ws/xiaozhi"
     if AUTH_TOKEN:
-        ws_url = f"{ws_url}?token={AUTH_TOKEN}"
+        # OTA 端点公开可达，不返回真实 AUTH_TOKEN；设备连接 WS 时自行携带预置 token
+        ws_url = f"{ws_url}?token=device"
     ota_response = {
         "websocket": {"url": ws_url, "version": 1},
         "server_time": {"timestamp": int(datetime.datetime.now().timestamp()), "timezone_offset": 480},
@@ -162,8 +152,6 @@ async def xiaozhi_ota(request: Request):
     mqtt_broker = os.getenv("MQTT_BROKER", "")
     if mqtt_broker and os.getenv("MQTT_ENABLE_OTA", "0") == "1":
         mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
-        mqtt_user = os.getenv("MQTT_USER", "")
-        mqtt_pass = os.getenv("MQTT_PASSWORD", "")
         device_id = os.getenv("MQTT_DEVICE_ID", "esp32-default")
         ota_response["mqtt"] = {
             "endpoint": f"{mqtt_broker}:{mqtt_port}",
@@ -172,9 +160,5 @@ async def xiaozhi_ota(request: Request):
             "subscribe_topic": f"charlie/esp32/{device_id}/down",
             "keepalive": 60,
         }
-        if mqtt_user:
-            ota_response["mqtt"]["username"] = mqtt_user
-        if mqtt_pass:
-            ota_response["mqtt"]["password"] = mqtt_pass
         log.info(f"[xiaozhi] OTA 返回 MQTT 配置: {mqtt_broker}:{mqtt_port} (device={device_id})")
     return JSONResponse(ota_response)

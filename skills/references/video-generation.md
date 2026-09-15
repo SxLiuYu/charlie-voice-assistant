@@ -77,7 +77,7 @@ Hermes 内置的 `text_to_speech` 工具使用 Edge TTS 引擎，音色自然、
 ```
 // 在 Hermes 工具中调用
 text_to_speech(text="需要朗读的文案")
-// 返回 mp3 文件路径，如 /Users/sxliuyu/.hermes/cache/audio/tts_20260804_064919.mp3
+// 返回 mp3 文件路径，如 <home>/.hermes/cache/audio/tts_20260804_064919.mp3
 ```
 - **优势**：音色自然（优于本地 Qwen3-TTS-0.6B）、无需额外配置、调用简单
 - **语速**：偏快，130-150字中文文案约生成16.9秒音频

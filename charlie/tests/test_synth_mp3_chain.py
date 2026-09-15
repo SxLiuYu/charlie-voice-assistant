@@ -100,10 +100,10 @@ class TestSynthMp3Chain:
 
 
 class TestLiteMaxTokens:
-    """回归守护：_LITE_MAX_TOKENS 必须保持 200。"""
+    """回归守护：_LITE_MAX_TOKENS 必须保持 300（Round 10 提速改造）。"""
 
-    def test_lite_max_tokens_is_200(self):
-        assert _llm_mod._LITE_MAX_TOKENS == 200
+    def test_lite_max_tokens_is_300(self):
+        assert _llm_mod._LITE_MAX_TOKENS == 300
 
 
 class TestSocialReplyHandler:

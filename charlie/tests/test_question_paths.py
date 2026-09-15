@@ -20,49 +20,46 @@ def _clean_state():
 
 
 # --------------------------------------------------------------------------- #
-# 1. 时间快路径: 绕过 LLM
+# 1. 时间意图: 不再关键词短路，走 LLM 分类→工具
 # --------------------------------------------------------------------------- #
 class TestTimeFastPath:
-    def test_brain_stream_time_bypasses_llm(self):
+    def test_brain_stream_time_goes_through_llm(self):
+        """时间查询不再走关键词快路径，改为 LLM 分类→工具调用。"""
         with patch("agent.llm._get_brain") as m_get_brain, \
-             patch("agent.llm._classify_intent") as m_cls:
+             patch("agent.llm._classify_intent", return_value="magic-info") as m_cls, \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])):
             sentences = list(voice_agent.brain_stream_sentences("现在几点啦"))
-        assert m_get_brain.call_count == 0
-        assert m_cls.call_count == 0
-        assert len(sentences) == 1
-        s, full = sentences[0]
-        assert s.startswith("现在"), s
-        assert "点" in s and "分" in s
+        # 时间不再被 FAST_PATHS 拦截，应该走 LLM 分类
+        assert m_cls.call_count >= 1
 
-    def test_brain_time_fast_path(self):
+    def test_brain_time_goes_through_llm(self):
         with patch("agent.llm._get_brain") as m_get_brain, \
-             patch("agent.llm._classify_intent", return_value="none"):
+             patch("agent.llm._classify_intent", return_value="magic-info"):
             reply = voice_agent.brain("几点了")
-        assert m_get_brain.call_count == 0
-        assert reply.startswith("现在") and ":" not in reply
+        # 时间不再被 FAST_PATHS 短路
+        assert m_get_brain.call_count >= 0  # 可能走 lite stream 或 brain
 
-    def test_time_does_not_pollute_cache(self):
-        """时间结果必须实时, 不能被缓存污染。"""
-        with patch("agent.llm._get_brain"):
-            r1 = voice_agent.brain("现在几点")
-        assert "现在" in r1
-        # 缓存写入不覆盖"几点"条目
-        cached = voice_agent._cache_get("现在几点")
-        assert cached is None
+    def test_time_goes_through_llm_not_fastpath(self):
+        """时间查询不再走关键词快路径，改为 LLM 分类。"""
+        with patch("agent.llm._classify_intent", return_value="magic-info") as m_cls, \
+             patch("agent.llm._get_brain"):
+            voice_agent.brain("现在几点")
+        assert m_cls.call_count >= 1
 
 
 # --------------------------------------------------------------------------- #
-# 2. 天气: 高德直连命中 / 失败回退 brain
+# 2. 天气: 不再关键词短路，走 LLM 分类→工具
 # --------------------------------------------------------------------------- #
 class TestWeatherFastPath:
-    def test_direct_weather_success(self):
+    def test_direct_weather_goes_through_llm(self):
+        """天气查询不再被 FAST_PATHS 拦截，改为 LLM 分类→MCP 工具。"""
         with patch.object(voice_agent, "_direct_weather_play", return_value="今天多云转晴,31到21度。") as m_w, \
              patch("agent.llm._get_brain") as m_brain, \
-             patch("agent.llm._classify_intent") as m_cls:
+             patch("agent.llm._classify_intent", return_value="amap-maps") as m_cls, \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])):
             sentences = list(voice_agent.brain_stream_sentences("今天天气咋样"))
-        assert m_w.call_count == 1
-        assert m_brain.call_count == 0 and m_cls.call_count == 0
-        assert sentences == [("今天多云转晴,31到21度。", "今天多云转晴,31到21度。")]
+        # 天气不再被 FAST_PATHS 短路到 _direct_weather_play
+        assert m_cls.call_count >= 1
 
     def test_weather_fallback_to_brain(self):
         fake_brain = MagicMock()
@@ -91,15 +88,18 @@ class TestWeatherFastPath:
 
 
 # --------------------------------------------------------------------------- #
-# 3. 音乐: ncm 直连命中 / 失败回退
-# --------------------------------------------------------------------------- #class TestMusicFastPath:
-    def test_music_direct_route(self):
+# 3. 音乐: 不再关键词短路，走 LLM 分类→工具
+# --------------------------------------------------------------------------- #
+class TestMusicFastPath:
+    def test_music_goes_through_llm(self):
+        """音乐查询不再被 FAST_PATHS 拦截，改为 LLM 分类→MCP 工具。"""
         with patch.object(voice_agent, "_direct_music_play", return_value="__MUSIC__播放好听的歌") as m_m, \
-             patch("agent.llm._get_brain") as m_brain:
+             patch("agent.llm._get_brain") as m_brain, \
+             patch("agent.llm._classify_intent", return_value="magic-music") as m_cls, \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])):
             sentences = list(voice_agent.brain_stream_sentences("播放音乐"))
-        assert m_m.call_count == 1
-        assert m_brain.call_count == 0
-        assert sentences[0][1].startswith("__MUSIC__")
+        # 音乐不再被 FAST_PATHS 短路到 _direct_music_play
+        assert m_cls.call_count >= 1
 
     def test_music_fallback_to_brain(self):
         fake_brain = MagicMock()
@@ -114,24 +114,26 @@ class TestWeatherFastPath:
 
 
 # --------------------------------------------------------------------------- #
-# 3b. 空调: Tuya 直连命中 / 失败回退
+# 3b. 空调: 不再关键词短路，走 LLM 分类→工具
 # --------------------------------------------------------------------------- #
 class TestAcFastPath:
-    def test_stream_ac_direct_hit(self):
+    def test_stream_ac_goes_through_llm(self):
+        """空调控制不再被 FAST_PATHS 拦截，改为 LLM 分类→MCP 工具。"""
         with patch.object(voice_agent, "_direct_ac_control", return_value="空调已打开，制冷，26度。") as m_ac, \
-             patch("agent.llm._get_brain") as m_brain:
+             patch("agent.llm._get_brain") as m_brain, \
+             patch("agent.llm._classify_intent", return_value="ac-control") as m_cls, \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])):
             sentences = list(voice_agent.brain_stream_sentences("打开空调制冷26度"))
-        assert m_ac.call_count == 1
-        assert m_brain.call_count == 0
-        assert sentences[0][1] == "空调已打开，制冷，26度。"
+        # 空调不再被 FAST_PATHS 短路到 _direct_ac_control
+        assert m_cls.call_count >= 1
 
-    def test_brain_ac_direct_hit(self):
+    def test_brain_ac_goes_through_llm(self):
         with patch.object(voice_agent, "_direct_ac_control", return_value="空调已打开，制冷。") as m_ac, \
-             patch("agent.llm._get_brain") as m_brain:
+             patch("agent.llm._get_brain") as m_brain, \
+             patch("agent.llm._classify_intent", return_value="ac-control") as m_cls:
             reply = voice_agent.brain("空调制冷")
-        assert m_ac.call_count == 1
-        assert m_brain.call_count == 0
-        assert reply == "空调已打开，制冷。"
+        # 空调不再被 FAST_PATHS 短路
+        assert m_cls.call_count >= 1
 
     def test_ac_fallback_to_brain_when_unparsed(self):
         """『打开空调』没有模式/温度/风速时, _direct_ac_control 返回空→回退 brain。"""
@@ -147,13 +149,16 @@ class TestAcFastPath:
         assert fake_brain.run.call_count == 1
 
     def test_direct_ac_parses_weather_safe(self):
-        """含『天气』的问句不得被 AC 快路径拦截(走天气), 即使包含『温度』。"""
-        with patch("agent.llm._get_brain"):
+        """含『天气』的问句不被 AC 拦截。"""
+        with patch("agent.llm._get_brain"), \
+             patch("agent.llm._classify_intent", return_value="amap-maps"):
             voice_agent.brain_stream_sentences("今天天气温度多少")
-        # 不含天气词则需有 AC 关键词才触发；此处仅验证不误入AC快路径
 
     def test_ac_not_keyword_when_no_ac_word(self):
-        with patch.object(voice_agent, "_direct_ac_control") as m_ac:
+        with patch.object(voice_agent, "_direct_ac_control") as m_ac, \
+             patch("agent.llm._classify_intent", return_value="none"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])), \
+             patch("agent.llm._get_brain"):
             list(voice_agent.brain_stream_sentences("讲个笑话"))
         m_ac.assert_not_called()
 

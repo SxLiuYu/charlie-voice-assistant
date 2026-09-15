@@ -4,15 +4,7 @@
 管道模式: stdin/stdout 直传, 省临时文件 I/O (~300ms+).
 """
 import io, os, subprocess, tempfile, wave
-import warnings
 
-with warnings.catch_warnings():
-    warnings.filterwarnings(
-        "ignore",
-        message=r"'audioop' is deprecated",
-        category=DeprecationWarning,
-    )
-    import audioop
 
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB 音频上限
 EMPTY_AUDIO_MIN_SECONDS = 3.0
@@ -20,6 +12,15 @@ EMPTY_AUDIO_FRAME_MS = 20
 EMPTY_AUDIO_RMS_THRESHOLD = 120
 EMPTY_AUDIO_MIN_ACTIVE_SECONDS = 0.25
 EMPTY_AUDIO_MIN_ACTIVE_RATIO = 0.08
+
+
+def _pcm_rms(data: bytes) -> float:
+    """16-bit PCM 均方根能量 (audioop.rms 替代，避免 Python 3.13 弃用)。"""
+    if len(data) < 2:
+        return 0.0
+    n = len(data) // 2
+    samples = __import__("struct").unpack(f"<{n}h", data[: n * 2])
+    return (sum(s * s for s in samples) / n) ** 0.5
 
 
 def likely_empty_audio(data: bytes) -> bool:
@@ -49,8 +50,8 @@ def likely_empty_audio(data: bytes) -> bool:
                 chunk = wav.readframes(chunk_frames)
                 if not chunk:
                     break
-                rms = audioop.rms(chunk, sample_width)
-                if rms >= EMPTY_AUDIO_RMS_THRESHOLD:
+                rms_val = _pcm_rms(chunk)
+                if rms_val >= EMPTY_AUDIO_RMS_THRESHOLD:
                     active_frames += len(chunk) // bytes_per_frame
 
             active_seconds = active_frames / float(sample_rate)

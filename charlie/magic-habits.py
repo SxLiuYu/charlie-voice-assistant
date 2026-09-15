@@ -14,19 +14,32 @@ __mcp_meta__ = {
 import os
 import json
 import logging
+import tempfile
 from datetime import datetime, timedelta
+import threading
 
 log = logging.getLogger("magic")
 
 DATA_DIR = os.getenv("ASSISTANT_KID_DATA_DIR",
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
-HABITS_FILE = os.path.join(DATA_DIR, "habits.json")
+
+
+def _get_habits_file():
+    uid = os.environ.get("CHARLIE_USER_ID", "default")
+    if uid == "default":
+        return os.path.join(DATA_DIR, "habits.json")
+    return os.path.join(DATA_DIR, f"habits_{uid}.json")
+
+
+HABITS_FILE = _get_habits_file()
+_habits_lock = threading.Lock()
 
 
 def _load_habits() -> dict:
     try:
-        if os.path.exists(HABITS_FILE):
-            with open(HABITS_FILE, 'r', encoding='utf-8') as f:
+        path = _get_habits_file()
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except Exception:
         pass
@@ -34,11 +47,29 @@ def _load_habits() -> dict:
 
 
 def _save_habits(habits: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = HABITS_FILE + ".tmp"
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(habits, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, HABITS_FILE)
+    path = _get_habits_file()
+    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".habits_", suffix=".tmp", dir=target_dir)
+    f_wrapped = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f_wrapped = True
+            json.dump(habits, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if not f_wrapped:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _today() -> str:
@@ -78,18 +109,19 @@ try:
 
         例: log_habit("喝水") → 记录今天已喝水
         """
-        habits = _load_habits()
-        today = _today()
-        if habit not in habits:
-            habits[habit] = {"logs": [], "created": today}
-        if today not in habits[habit]["logs"]:
-            habits[habit]["logs"].append(today)
-            _save_habits(habits)
-            streak = _streak(habits[habit]["logs"])
-            return f"已记录{habit}，连续{streak}天，继续保持！"
-        else:
-            streak = _streak(habits[habit]["logs"])
-            return f"今天已经记录过{habit}了（连续{streak}天）"
+        with _habits_lock:
+            habits = _load_habits()
+            today = _today()
+            if habit not in habits:
+                habits[habit] = {"logs": [], "created": today}
+            if today not in habits[habit]["logs"]:
+                habits[habit]["logs"].append(today)
+                _save_habits(habits)
+                streak = _streak(habits[habit]["logs"])
+                return f"已记录{habit}，连续{streak}天，继续保持！"
+            else:
+                streak = _streak(habits[habit]["logs"])
+                return f"今天已经记录过{habit}了（连续{streak}天）"
 
     @mcp.tool()
     def habit_streak(habit: str = "") -> str:

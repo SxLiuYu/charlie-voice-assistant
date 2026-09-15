@@ -171,14 +171,16 @@ async def lifespan(app):
         try:
             from agent.asr_tts import _load_sense_voice
             _load_sense_voice()
-        except Exception:
+        except Exception as e:
+            log.debug(f"[voice_server] error at line 174: {e}")
             pass
         if os.getenv("FEISHU_PUSH_OPEN_ID"):
             try:
                 import threading as _th
                 from personalized_push import personalized_push_loop
                 _th.Thread(target=personalized_push_loop, daemon=True).start()
-            except Exception:
+            except Exception as e:
+                log.debug(f"[voice_server] error at line 181: {e}")
                 pass
         # 飞书 WebSocket 长连接（双向对话，无需公网回调地址/事件订阅配置）
         try:
@@ -191,12 +193,14 @@ async def lifespan(app):
     try:
         from voice_agent import _save_history
         _save_history()
-    except Exception:
+    except Exception as e:
+        log.debug(f"[voice_server] error at line 194: {e}")
         pass
     _io_pool.shutdown(wait=False, cancel_futures=True)
     try:
         _brain_pool.shutdown(wait=False, cancel_futures=True)
-    except Exception:
+    except Exception as e:
+        log.debug(f"[voice_server] error at line 199: {e}")
         pass
     # MCPManager 是单例，其 clients/processes 全局共享。
     # 运行期 brain 淘汰不再杀进程（_cleanup_brain_processes 已改为 no-op）；
@@ -204,7 +208,8 @@ async def lifespan(app):
     try:
         from qwen_agent.tools.mcp_manager import MCPManager
         MCPManager().shutdown()
-    except Exception:
+    except Exception as e:
+        log.debug(f"[voice_server] error at line 207: {e}")
         pass
 
 app = FastAPI(title="Charlie语音服务", lifespan=lifespan)
@@ -216,8 +221,12 @@ app.include_router(websocket_router)
 app.include_router(manage_router)
 from app.routes import wardrobe_photo as _wardrobe_photo_mod
 from app.routes.feishu import router as feishu_router
+from app.routes.camera import router as camera_router
+from app.routes.aligenie import router as aligenie_router
 app.include_router(feishu_router)
 app.include_router(_wardrobe_photo_mod.router)
+app.include_router(camera_router)
+app.include_router(aligenie_router)
 
 # ===== 全局异常处理 =====
 @app.exception_handler(Exception)
@@ -251,13 +260,17 @@ app.add_middleware(DynamicCORSMiddleware,
 #   /ws/xiaozhi          → ESP32 WebSocket，handler 内用 hmac.compare_digest 校验 query token
 #   /api/feishu/webhook  → 飞书事件回调，handler 内用 FEISHU_VERIFICATION_TOKEN 校验
 _DEVICE_OPEN_PATHS = frozenset(("/xiaozhi/ota", "/ws/xiaozhi", "/api/feishu/webhook"))
+_DEVICE_OPEN_PREFIXES = ("/aligenie",)  # /aligenie 及 /aligenie/{cert}.txt 均豁免
+
+def _is_device_open(path: str) -> bool:
+    return path in _DEVICE_OPEN_PATHS or any(path.startswith(p) for p in _DEVICE_OPEN_PREFIXES)
 
 @app.middleware("http")
 async def request_logger(request: Request, call_next):
     rid = str(uuid.uuid4())[:8]
     start = time.time()
     log.debug(f"[{rid}] {request.method} {request.url.path}")
-    if request.url.path not in _DEVICE_OPEN_PATHS and not _check_auth(request):
+    if not _is_device_open(request.url.path) and not _check_auth(request):
         return JSONResponse({"error": "未授权"}, status_code=401)
     ip = _client_ip(request)
     path = request.url.path

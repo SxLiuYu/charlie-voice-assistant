@@ -156,12 +156,32 @@ class TestTTSPriority:
             finally:
                 asr_tts._TTS_PROVIDERS.pop("vosk", None)
 
-    def test_tts_unavailable_error_stops_fallthrough(self):
+    def test_tts_unavailable_error_fallthrough(self):
+        """When a provider raises TTSUnavailableError (cooldown/rate-limited),
+        the chain should continue to the next provider for resilience."""
         from agent import asr_tts
         from agent.asr_tts import TTSUnavailableError
         fake_bd = MagicMock(side_effect=TTSUnavailableError("cooldown"))
-        fake_sf = MagicMock(side_effect=AssertionError("should not be called"))
+        fake_sf = MagicMock(return_value=b"audio_ok")
         fake_fn = MagicMock(side_effect=AssertionError("should not be called"))
+        with patch.dict(asr_tts._TTS_PROVIDERS, {
+            "baidu": fake_bd,
+            "stepfun": fake_sf,
+            "finna": fake_fn,
+        }):
+            result = asr_tts.tts("你好")
+            assert result == b"audio_ok"
+            fake_bd.assert_called()
+            fake_sf.assert_called()
+            fake_fn.assert_not_called()
+
+    def test_tts_all_providers_unavailable_raises(self):
+        """When all providers raise TTSUnavailableError, the chain raises."""
+        from agent import asr_tts
+        from agent.asr_tts import TTSUnavailableError
+        fake_bd = MagicMock(side_effect=TTSUnavailableError("cooldown"))
+        fake_sf = MagicMock(side_effect=TTSUnavailableError("rate_limited"))
+        fake_fn = MagicMock(side_effect=TTSUnavailableError("circuit_open"))
         with patch.dict(asr_tts._TTS_PROVIDERS, {
             "baidu": fake_bd,
             "stepfun": fake_sf,
@@ -169,8 +189,6 @@ class TestTTSPriority:
         }):
             with pytest.raises(TTSUnavailableError):
                 asr_tts.tts("你好")
-            fake_sf.assert_not_called()
-            fake_fn.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,9 +200,13 @@ class TestProviderRegistry:
         from agent.asr_tts import _ASR_PROVIDERS
         assert set(_ASR_PROVIDERS.keys()) == {"sensevoice", "baidu", "stepfun", "vosk"}
 
-    def test_tts_providers_has_three(self):
+    def test_tts_providers_has_four(self):
         from agent.asr_tts import _TTS_PROVIDERS
-        assert set(_TTS_PROVIDERS.keys()) == {"baidu", "finna", "stepfun"}
+        # 6 个 provider：audio8(本地克隆) / cosyvoice(克隆，惰性加载占位 None)
+        assert set(_TTS_PROVIDERS.keys()) == {
+            "baidu", "finna", "stepfun", "edge", "audio8", "cosyvoice"}
+        # cosyvoice 注册前是占位 None，由 tts() 分发循环惰性加载
+        assert _TTS_PROVIDERS["cosyvoice"] is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

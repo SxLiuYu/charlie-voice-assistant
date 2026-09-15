@@ -101,15 +101,14 @@ def system_status() -> str:
         import psutil
         psutil.cpu_percent(interval=None)
     except ImportError:
-        psutil = None
-    _psutil = psutil if psutil is not None else __import__("psutil")
-    vm = _psutil.virtual_memory()
-    cpu_pct = _psutil.cpu_percent(interval=None)
-    disk = _psutil.disk_usage('/')
-    boot = _psutil.boot_time()
+        return "系统状态不可用：psutil 未安装"
+    vm = psutil.virtual_memory()
+    cpu_pct = psutil.cpu_percent(interval=None)
+    disk = psutil.disk_usage('/')
+    boot = psutil.boot_time()
     up = int(_t.time() - boot)
     return (f"设备:{socket.gethostname()} | {platform.system()} {platform.release()}\n"
-        f"CPU使用率:{cpu_pct}% | {_psutil.cpu_count()}核 | 内存:{(vm.total-vm.available)//1073741824:.1f}/{vm.total//1073741824:.1f}GB({vm.percent}%)\n"
+        f"CPU使用率:{cpu_pct}% | {psutil.cpu_count()}核 | 内存:{(vm.total-vm.available)//1073741824:.1f}/{vm.total//1073741824:.1f}GB({vm.percent}%)\n"
         f"磁盘:{disk.used//1073741824:.0f}/{disk.total//1073741824:.0f}GB({disk.percent}%) | 运行:{up//86400}天{up%86400//3600}时{up%3600//60}分")
 
 

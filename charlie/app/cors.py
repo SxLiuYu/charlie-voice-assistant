@@ -41,7 +41,8 @@ def get_lan_ip() -> str | None:
         ip = s.getsockname()[0]
         s.close()
         return ip if not ip.startswith("127.") else None
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.cors] error at line 44: {e}")
         return None
 
 _CORS_ORIGIN_TTL_SECONDS = 2.0

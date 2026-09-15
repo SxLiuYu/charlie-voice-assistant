@@ -18,12 +18,12 @@ mcp = FastMCP("magic-music")
 
 @mcp.tool()
 def search_music(keyword: str, limit: int = 5) -> str:
-    log.debug(f"[music] search_music(query={query})")
     """搜索网易云音乐歌曲。keyword=歌名或歌手名, limit=返回条数(默认5)
 
     例: search_music("周杰伦 晴天") → 搜索周杰伦的晴天
         search_music("邓紫棋") → 搜索邓紫棋的歌曲
     """
+    log.debug(f"[music] search_music(keyword={keyword})")
     try:
         r = subprocess.run([NCM_BIN, "search", "song", keyword, "--limit", str(limit), "--json"],
                           capture_output=True, text=True, timeout=15)
@@ -44,12 +44,12 @@ def search_music(keyword: str, limit: int = 5) -> str:
 
 @mcp.tool()
 def play_music(keyword: str = "", song_id: int = 0) -> str:
-    log.info(f"[music] play_music(query={query})")
     """播放音乐。keyword=歌名或歌手名(搜索后播放第一首), song_id=歌曲ID(直接播放)
 
     例: play_music("周杰伦 晴天") → 搜索并播放周杰伦的晴天
         play_music(song_id=186016) → 直接播放指定歌曲
     """
+    log.info(f"[music] play_music(keyword={keyword}, song_id={song_id})")
     import os as _os
     try:
         if not song_id and keyword:

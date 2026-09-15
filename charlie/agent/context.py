@@ -24,13 +24,13 @@ _context_backoff_until = 0.0     # 退避截止时间戳
 _CONTEXT_FAIL_BACKOFF = 300      # 连续失败3次后，5分钟内不再尝试刷新
 
 
-def _refresh_context_cache() -> None:
+def _refresh_context_cache(session_id: str = "default") -> None:
     """后台线程：刷新上下文缓存（含天气网络请求）。"""
     global _context_cache, _context_cache_ts
     global _context_fail_count, _context_backoff_until
     try:
         ctx: dict[str, Any] = {}
-        # 1. 时间
+        # 1. 时间（纯内存，保持独立吞错）
         try:
             now = datetime.datetime.now()
             ctx["time"] = {
@@ -43,46 +43,48 @@ def _refresh_context_cache() -> None:
         except Exception:
             ctx["time"] = {}
 
-        # 2. 位置
+        # 2. 位置（网络字段，异常冒泡到外层触发退避）
         try:
             from app.geo import locate_text
             loc = locate_text()
             ctx["location"] = loc if loc else ""
         except Exception:
             ctx["location"] = ""
+            raise
 
-        # 3. 天气（可能阻塞，放在后台线程中）
+        # 3. 天气（网络字段，异常冒泡到外层触发退避）
         try:
             from agent.weather import direct_weather_play
             weather = direct_weather_play("")
             ctx["weather"] = weather if weather else ""
         except Exception:
             ctx["weather"] = ""
+            raise
 
-        # 4. 设备状态
+        # 4. 设备状态（纯内存/本地，保持吞错）
         try:
             from agent.device_control import direct_ac_control
             ctx["device"] = {"ac": "unknown"}
         except Exception:
             ctx["device"] = {}
 
-        # 5. 最近对话摘要
+        # 5. 最近对话摘要（按 session_id 取，保持吞错）
         try:
             from agent.history import _get_history
-            hist = _get_history()
+            hist = _get_history(session_id)
             recent = [m.get("content", "") for m in hist[-6:] if isinstance(m, dict)]
             ctx["recent_conversation"] = recent
         except Exception:
             ctx["recent_conversation"] = []
 
-        # 6. 用户状态
+        # 6. 用户状态（纯内存，保持吞错）
         try:
             from agent.state import get_user_state
             ctx["user_state"] = get_user_state()
         except Exception:
             ctx["user_state"] = {}
 
-        # 7. 待办事项（通过 app.reminders 加载，复用锁和畸形过滤）
+        # 7. 待办事项（本地 I/O，保持吞错）
         try:
             from app.reminders import _load_reminders
             now = datetime.datetime.now()
@@ -102,15 +104,24 @@ def _refresh_context_cache() -> None:
         _context_fail_count = 0
         _context_backoff_until = 0.0
     except Exception:
-        # 刷新失败退避：连续失败3次后 5 分钟内不再发起网络刷新，
-        # 避免天气 API 持续不可用时每次构建 system msg 都空转线程
+        # 网络字段失败时递增退避计数，连续 3 次进入退避期
         _context_fail_count += 1
         if _context_fail_count >= 3:
             _context_backoff_until = time.time() + _CONTEXT_FAIL_BACKOFF
             log.warning("[context] 刷新连续失败%d次, 退避%d秒", _context_fail_count, _CONTEXT_FAIL_BACKOFF)
 
 
-def get_context() -> dict[str, Any]:
+def _override_recent(ctx: dict[str, Any], session_id: str) -> None:
+    """用当前 session 的最近对话覆盖缓存中的 recent_conversation，防止跨 session 泄露。"""
+    try:
+        from agent.history import _get_history
+        _hist = _get_history(session_id)
+        ctx["recent_conversation"] = [m.get("content", "") for m in _hist[-6:] if isinstance(m, dict)]
+    except Exception:
+        pass
+
+
+def get_context(session_id: str = "default") -> dict[str, Any]:
     """聚合所有上下文信息，返回结构化字典。
 
     每个字段失败时返回空值/默认值，不影响其他字段。
@@ -121,7 +132,9 @@ def get_context() -> dict[str, Any]:
     # TTL 缓存：60 秒内重复调用直接返回，避免每次构建 system message 都发网络请求
     with _context_cache_lock:
         if _context_cache and time.time() - _context_cache_ts < _context_ttl:
-            return dict(_context_cache)
+            result = dict(_context_cache)
+            _override_recent(result, session_id)
+            return result
         # stale-while-revalidate: 缓存过期但有旧值时，后台刷新并返回旧值
         stale_ctx = dict(_context_cache) if _context_cache else None
     # 后台线程刷新完整缓存（含天气）；退避期内跳过（天气 API 持续不可用时避免空转）
@@ -129,12 +142,14 @@ def get_context() -> dict[str, Any]:
         with _context_refresh_lock:
             if _context_refresh_thread is None or not _context_refresh_thread.is_alive():
                 _context_refresh_thread = threading.Thread(
-                    target=_refresh_context_cache, daemon=True
+                    target=_refresh_context_cache, args=(session_id,), daemon=True
                 )
                 _context_refresh_thread.start()
     # 有旧缓存则返回旧值（stale-while-revalidate），无缓存才构建不含天气的临时上下文
     if stale_ctx:
-        return stale_ctx
+        result = stale_ctx
+        _override_recent(result, session_id)
+        return result
     ctx: dict[str, Any] = {}
     # 1. 时间
     try:
@@ -162,7 +177,7 @@ def get_context() -> dict[str, Any]:
     # 5. 最近对话摘要
     try:
         from agent.history import _get_history
-        hist = _get_history()
+        hist = _get_history(session_id)
         recent = [m.get("content", "") for m in hist[-6:] if isinstance(m, dict)]
         ctx["recent_conversation"] = recent
     except Exception:
@@ -197,10 +212,10 @@ def invalidate_context_cache() -> None:
         _context_cache_ts = 0.0
 
 
-def format_context_for_prompt(ctx: Optional[dict[str, Any]] = None) -> str:
+def format_context_for_prompt(ctx: Optional[dict[str, Any]] = None, session_id: str = "default") -> str:
     """将上下文格式化为系统 prompt 片段。"""
     if ctx is None:
-        ctx = get_context()
+        ctx = get_context(session_id=session_id)
     parts: list[str] = []
 
     # 时间

@@ -79,7 +79,31 @@ _LOW_INTENT_ENGLISH_RE = re.compile(
 )
 
 _GARBLED_FILLER_CHARS = set('的了呢吗啊哦呃呀吧哼哈嘿哟哎嗯呜喵喂嗨')
-_VALID_ROOT_CHARS = set('在打开关几现点今明后天气温度电视空调提醒日程搜索文件读写取消停止继续对好好的播放音乐随机首歌听唱暂停换下一首上一首你怎么这那说是不笨傻叫叫做要不用没有没有我他她它们什么为什么哪谁哪里笨呐')
+# 有效根字符：大幅扩展，覆盖日常用语高频字，避免误杀正常 ASR 结果。
+# 旧白名单仅~80字，导致"出门""回家""吃饭"等常见词被误判为乱码。
+_VALID_ROOT_CHARS = set(
+    '在打开关几现点今明后天气温度电视空调提醒日程搜索文件读写取消停止继续对好的播放音乐随机首歌听唱暂停换下一首上一首你怎么这那说是不笨傻叫叫做要不用没有没有我他她它们什么为什么哪谁哪里笨呐'
+    # 动作类
+    '出门回家吃饭喝买看听走跑坐站来去给拿放找打电话问告诉说讲话聊'
+    # 时间类
+    '早晚午夜分秒钟日周月年时节候现在刚才之后前'
+    # 生活类
+    '衣服穿搭配鞋帽包饭菜单味道好吃饱饿渴睡醒起'
+    # 人物类
+    '爸妈姐弟爷爷奶奶外公婆姑娘儿子女男孩子朋友老'
+    # 场所类
+    '家学校公司店医院公园路街上楼下里外门前后'
+    # 状态类
+    '冷热凉暖干湿亮暗大小多少高低快慢远近'
+    # 常用动词/副词
+    '帮想要能可以会得须应必须该须就还又再也都很非特别非常已经正在将要被把让叫令'
+    # 常用名词
+    '事东西地方话问题答案意思原因结果办法方式'
+    # 数字和量词
+    '一二三四五六七八九十百千万亿个只条本张件种次场岁'
+    # 英文常见
+    'abcdefghijklmnopqrstuvwxyz'
+)
 _VALID_SHORT_TEXTS = {
     '你好', '谢谢', '好的', '谢谢', '再见', '可以', '不行', '没有',
     '几点了', '几点啦', '在吗', '在听吗', '打开空调', '关闭空调',
@@ -115,14 +139,25 @@ def is_garbled_asr(text: str) -> bool:
     length = len(stripped)
     if stripped in _VALID_SHORT_TEXTS or stripped.rstrip('。？!') in _VALID_SHORT_TEXTS:
         return False
+    # 全填充词：短文本纯语气词 → 乱码
     if length <= 8 and all(c in _GARBLED_FILLER_CHARS for c in stripped):
         return True
+    # 极短文本（≤2字）且不含任何有效根字符 → 可能是 ASR 噪声
     if length <= 2 and not any(c in _VALID_ROOT_CHARS for c in stripped):
         return True
-    if length >= 10 and not any(c in _VALID_ROOT_CHARS for c in stripped):
-        return True
-    if 5 <= length <= 12:
+    # 中等长度（3~9字）：填充词占比 ≥60% → 乱码
+    if 3 <= length <= 9:
         filler_count = sum(1 for c in stripped if c in _GARBLED_FILLER_CHARS)
         if filler_count >= length * 0.6:
+            return True
+    # 长文本（≥10字）：放宽判定，减少误杀
+    if length >= 10:
+        filler_count = sum(1 for c in stripped if c in _GARBLED_FILLER_CHARS)
+        valid_count = sum(1 for c in stripped if c in _VALID_ROOT_CHARS)
+        # 全填充词 → 乱码（不论长度）
+        if filler_count == length:
+            return True
+        # 有效字符为0且填充词占比低（生僻符号组合）→ 乱码
+        if valid_count == 0 and filler_count < length * 0.3:
             return True
     return False

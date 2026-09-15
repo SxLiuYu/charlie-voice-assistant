@@ -35,9 +35,52 @@ def _get_memory_file():
         return os.path.join(DATA_DIR, "episodic_memories.json")
     return os.path.join(DATA_DIR, f"episodic_memories_{uid}.json")
 MEMORY_FILE = _get_memory_file()  # 初始路径, 切换用户时重新计算
-_memory_lock = threading.Lock()
+_memory_lock = threading.RLock()
+
 
 MAX_MEMORIES = 200  # 最多保留200条记忆, 超出自动清理最旧的
+
+
+def _do_load_memories() -> list:
+    """Raw 读记忆 (无锁)。外部读者应使用 _load_memories() (已加锁)。"""
+    if not os.path.exists(_get_memory_file()):
+        return []
+    try:
+        with open(_get_memory_file(), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception as e:
+        log.debug(f"[memory] _do_load skipped: {e}")
+    return []
+
+
+def _do_save_memories(memories: list) -> None:
+    """Raw 写记忆 (无锁)。外部读者应使用 _save_memories() (已加锁)。"""
+    if len(memories) > MAX_MEMORIES:
+        memories = memories[-MAX_MEMORIES:]
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = _get_memory_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(memories, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _get_memory_file())
+    except Exception:
+        pass
+
+
+def _load_memories() -> list:
+    """加载所有记忆 (线程内读快照，加锁)。"""
+    with _memory_lock:
+        return _do_load_memories()
+
+
+def _save_memories(memories: list):
+    """保存记忆, 超出上限自动截断; 用 tmp+os.replace 防止写中断损坏文件。"""
+    with _memory_lock:
+        _do_save_memories(memories)
 
 
 # ===== 语义化记忆检索: 字符级 Bigram 余弦相似度 =====
@@ -70,6 +113,12 @@ def _cosine_similarity(vec1: dict, vec2: dict) -> float:
 # ===== 关键事件提取规则 =====
 # 通过关键词识别对话中是否包含值得记忆的信息
 _EVENT_PATTERNS = [
+    # 个人事实(最优先): 短事实陈述是长期记忆的核心价值
+    {"tags": ["fact", "personal"], "patterns": [
+        r"我叫.{1,8}", r"我的[名猫狗车房妹妹哥哥弟弟爸妈妈爷奶]", r"我家[里在]",
+        r"我养", r"我有[一两三只个辆]", r"我住", r"我的生日", r"我最喜欢",
+        r"我不[吃喝]", r"我的口味", r"我的习惯", r"我常用", r"我在用",
+    ], "summary_template": "用户 personal fact: {text}"},
     # 截止日期/重要时间
     {"tags": ["deadline", "time"], "patterns": [
         r"截止", r"到期", r"明天.{0,4}要", r"下周.{0,4}要",
@@ -103,32 +152,6 @@ _EVENT_PATTERNS = [
 ]
 
 
-def _load_memories() -> list:
-    log.debug("[memory] 加载记忆")
-    """加载所有记忆"""
-    with _memory_lock:
-        try:
-            if os.path.exists(_get_memory_file()):
-                with open(_get_memory_file(), 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception as e:
-            log.warning(f"[memory] 读记忆失败: {e}")
-        return []
-
-
-def _save_memories(memories: list):
-    log.info(f"[memory] 保存记忆 {len(memories)} 条")
-    """保存记忆, 超出上限自动截断"""
-    with _memory_lock:
-        if len(memories) > MAX_MEMORIES:
-            memories = memories[-MAX_MEMORIES:]
-        try:
-            with open(_get_memory_file(), 'w', encoding='utf-8') as f:
-                json.dump(memories, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
 
 
 def _extract_events(user_text: str, assistant_reply: str) -> list:
@@ -137,10 +160,16 @@ def _extract_events(user_text: str, assistant_reply: str) -> list:
     text = user_text.strip()
     if len(text) < 4:
         return events
-    # 跳过闲聊/问候(不值得记忆)
-    _SKIP_KEYWORDS = {"你好", "在吗", "谢谢", "再见", "好的", "嗯", "几点了",
-                      "今天天气", "几点啦", "在不在", "你好啊"}
-    if any(kw in text for kw in _SKIP_KEYWORDS) or len(text) <= 3:
+    # 疑问句是查询不是事实，不入记忆——否则查询自匹配霸榜，挤掉真正的事实记忆
+    _QUESTION_HINTS = ("吗", "呢", "什么", "多少", "谁", "哪", "怎么")
+    if any(text.endswith(w) or text.endswith(w + "？") or text.endswith(w + "?") for w in ("吗", "呢")) \
+            or any(w in text for w in ("什么", "多少", "谁", "哪", "怎么")):
+        return events
+    # 跳过纯闲聊/问候(不值得记忆)——仅当整句是问候语时才跳过
+    _SKIP_EXACT = {"你好", "你好啊", "在吗", "在不在", "谢谢", "再见",
+                   "好的", "好", "嗯", "几点了", "几点啦", "今天天气",
+                   "今天天气怎么样", "你好呀"}
+    if text.strip() in _SKIP_EXACT:
         return events
     for rule in _EVENT_PATTERNS:
         matched = False
@@ -160,7 +189,7 @@ def _extract_events(user_text: str, assistant_reply: str) -> list:
             })
             break  # 每条对话只提取一个事件
     # Fallback: 未匹配任何 pattern 但文本足够长的通用陈述，作为 general 记忆存储
-    if not events and len(text) >= 15:
+    if not events and len(text) >= 8:
         # 质量过滤：跳过 ASR 乱码（重复双字词过多或标点密度异常）
         skip = False
         for i in range(len(text) - 1):
@@ -189,11 +218,12 @@ def remember_conversation(user_text: str, assistant_reply: str) -> int:
     events = _extract_events(user_text, assistant_reply)
     if not events:
         return 0
-    memories = _load_memories()
     new_events = []
     for event in events:
         is_dup = False
-        for mem in memories:
+        with _memory_lock:
+            mems = _do_load_memories()
+        for mem in mems:
             sim = _cosine_similarity(
                 event.get("bigrams", {}),
                 mem.get("bigrams", {}),
@@ -205,8 +235,23 @@ def remember_conversation(user_text: str, assistant_reply: str) -> int:
             new_events.append(event)
     if not new_events:
         return 0
-    memories.extend(new_events)
-    _save_memories(memories)
+    with _memory_lock:
+        memories = _do_load_memories()
+        memories.extend(new_events)
+        _do_save_memories(memories)
+    # 双写: 同时持久化到 SQLite (memory_store)
+    try:
+        from agent.memory_store import remember_to_store, extract_and_store_facts
+        for ev in new_events:
+            remember_to_store(
+                ev.get("user_text", ""),
+                ev.get("summary", ""),
+                tags=ev.get("tags", []),
+                category=ev.get("tags", ["general"])[0] if ev.get("tags") else "general",
+            )
+        extract_and_store_facts(user_text)
+    except Exception as e:
+        log.debug(f"[memory] SQLite双写跳过: {e}")
     return len(new_events)
 
 
@@ -243,7 +288,8 @@ def get_relevant_memories(query: str, limit: int = 3) -> list:
         query_words = set(query)
         common = mem_words & query_words - set("，。！？、,.!? \n\t")
         if common:
-            score += len(common) * 0.05
+            # 单字实体（猫/香菜/数字名）是区分记忆的关键信号，权重需高于通用字噪声
+            score += len(common) * 0.3
         # 4. 时间衰减: 平滑衰减
         age_hours = (time.time() - mem.get("timestamp", 0)) / 3600
         if age_hours < 24:
@@ -268,48 +314,49 @@ def find_memory(query: str) -> dict | None:
 
 def correct_memory(query: str, correction: str) -> bool:
     """修正与查询匹配的记忆, 返回是否成功"""
-    memories = _load_memories()
-    found = False
-    for mem in memories:
-        if query in mem.get("user_text", "") or query in mem.get("summary", ""):
-            mem["user_text"] = correction
-            mem["summary"] = f"用户修正: {correction[:80]}"
-            mem["bigrams"] = _text_to_bigrams(correction[:200])
-            mem["timestamp"] = time.time()
-            mem["datetime"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            found = True
-            break
-    if found:
-        _save_memories(memories)
+    with _memory_lock:
+        memories = _do_load_memories()
+        found = False
+        for mem in memories:
+            if query in mem.get("user_text", "") or query in mem.get("summary", ""):
+                mem["user_text"] = correction
+                mem["summary"] = f"用户修正: {correction[:80]}"
+                mem["bigrams"] = _text_to_bigrams(correction[:200])
+                mem["timestamp"] = time.time()
+                mem["datetime"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                found = True
+                break
+        if found:
+            _do_save_memories(memories)
     return found
 
 
 def dedup_memories() -> int:
     """合并内容相似的重复记忆, 返回删除数"""
-    memories = _load_memories()
-    if len(memories) < 2:
-        return 0
-    kept = []
-    removed = 0
-    for mem in memories:
-        duplicate = False
-        for existing in kept:
-            sim = _cosine_similarity(
-                mem.get("bigrams", {}),
-                existing.get("bigrams", {})
-            )
-            if sim > 0.7 and mem.get("tags") == existing.get("tags"):
-                duplicate = True
-                # 合并时间戳: 保留较新的一条
-                if mem.get("timestamp", 0) > existing.get("timestamp", 0):
-                    kept.remove(existing)
-                    kept.append(mem)
-                removed += 1
-                break
-        if not duplicate:
-            kept.append(mem)
-    if removed > 0:
-        _save_memories(kept)
+    with _memory_lock:
+        memories = _do_load_memories()
+        if len(memories) < 2:
+            return 0
+        kept = []
+        removed = 0
+        for mem in memories:
+            duplicate = False
+            for existing in kept:
+                sim = _cosine_similarity(
+                    mem.get("bigrams", {}),
+                    existing.get("bigrams", {})
+                )
+                if sim > 0.7 and mem.get("tags") == existing.get("tags"):
+                    duplicate = True
+                    if mem.get("timestamp", 0) > existing.get("timestamp", 0):
+                        kept.remove(existing)
+                        kept.append(mem)
+                    removed += 1
+                    break
+            if not duplicate:
+                kept.append(mem)
+        if removed > 0:
+            _do_save_memories(kept)
     return removed
 
 
@@ -415,10 +462,11 @@ def forget(query: str) -> str:
 
     例: forget("项目") → 删除所有与项目相关的记忆
     """
-    memories = _load_memories()
-    before = len(memories)
-    remaining = [m for m in memories if query not in m.get("user_text", "") and query not in m.get("summary", "")]
-    _save_memories(remaining)
+    with _memory_lock:
+        memories = _do_load_memories()
+        before = len(memories)
+        remaining = [m for m in memories if query not in m.get("user_text", "") and query not in m.get("summary", "")]
+        _do_save_memories(remaining)
     deleted = before - len(remaining)
     return f"已删除{deleted}条记忆。" if deleted > 0 else "没有找到匹配的记忆。"
 
@@ -472,7 +520,6 @@ def get_working_memory() -> dict:
 # 语义记忆：从 episodic 中提取的语义知识（用户偏好/习惯/关系）
 _SEMANTIC_FILE = None
 _semantic_lock = threading.Lock()
-_semantic_cache = {}
 
 
 def _get_semantic_file() -> str:

@@ -7,6 +7,8 @@ import os, re
 from fastapi import Request
 
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+# 独立的设备令牌：ESP32 固件预置 token=device，避免固件与管理面 AUTH_TOKEN 耦合
+XIAOZHI_DEVICE_TOKEN = os.getenv("XIAOZHI_DEVICE_TOKEN", "device")
 TRUST_PROXY_HEADERS = os.getenv("ASSISTANT_KID_TRUST_PROXY_HEADERS", "").lower() in ("1", "true", "yes")
 LOCAL_HOSTS = frozenset(("127.0.0.1", "localhost", "::1", "", "testclient"))
 

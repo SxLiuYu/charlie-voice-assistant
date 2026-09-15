@@ -8,6 +8,7 @@ import logging, requests
 log = logging.getLogger("magic")
 _cache: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 3600  # 1小时
+_CACHE_MAX = 50  # 最多缓存 50 种货币
 
 
 def get_rates(base: str = "USD") -> dict:
@@ -23,6 +24,8 @@ def get_rates(base: str = "USD") -> dict:
         rates = data.get("rates", {})
         if rates:
             _cache[base] = (now, rates)
+            if len(_cache) > _CACHE_MAX:
+                _cache.clear()
             return rates
     except Exception as e:
         log.debug(f"[exchange] 获取汇率失败: {e}")

@@ -4,6 +4,8 @@ import json
 import time
 import copy
 import logging
+import tempfile
+import threading
 
 log = logging.getLogger("magic")
 
@@ -11,7 +13,18 @@ DATA_DIR = os.environ.get(
     "ASSISTANT_KID_DATA_DIR",
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 )
-PERSONA_FILE = os.path.join(DATA_DIR, "persona_state.json")
+
+
+def _get_current_uid() -> str:
+    return os.environ.get("CHARLIE_USER_ID", "default")
+
+
+def _persona_file() -> str:
+    uid = _get_current_uid()
+    if uid == "default":
+        return os.path.join(DATA_DIR, "persona_state.json")
+    return os.path.join(DATA_DIR, f"persona_state_{uid}.json")
+
 
 # 默认人设状态（合并旧 schema + 新 schema，保持向后兼容）
 _DEFAULT = {
@@ -28,30 +41,59 @@ _DEFAULT = {
     "user_humor_preference": 0.3,
 }
 
-_state = None
+_STATE_LOCK = threading.RLock()
+_states: dict[str, dict] = {}
 
 
-def _load():
-    global _state
-    if _state is not None:
-        return _state
-    try:
-        with open(PERSONA_FILE, encoding="utf-8") as f:
-            _state = json.load(f)
-    except Exception:
-        _state = copy.deepcopy(_DEFAULT)
-    # 迁移：旧文件缺少新字段时补默认值
-    for k, v in _DEFAULT.items():
-        _state.setdefault(k, v)
-    return _state
+def _load(uid: str = None) -> dict:
+    if uid is None:
+        uid = _get_current_uid()
+    with _STATE_LOCK:
+        if uid in _states:
+            return _states[uid]
+        state = None
+        try:
+            with open(_persona_file(), encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = copy.deepcopy(_DEFAULT)
+        # 迁移：旧文件缺少新字段时补默认值
+        for k, v in _DEFAULT.items():
+            state.setdefault(k, v)
+        _states[uid] = state
+        return state
 
 
-def _save():
-    try:
-        with open(PERSONA_FILE, "w", encoding="utf-8") as f:
-            json.dump(_state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.debug(f"[persona] 保存失败: {e}")
+def _save(uid: str = None) -> None:
+    if uid is None:
+        uid = _get_current_uid()
+    with _STATE_LOCK:
+        state = _states.get(uid)
+        if state is None:
+            return
+        # tempfile + os.replace 原子替换：并发/中途崩溃都不会留下半写文件
+        payload = json.dumps(state, ensure_ascii=False, indent=2)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(_persona_file()) or ".",
+            prefix=".persona_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp_path, _persona_file())
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
+def reset() -> None:
+    """重置当前用户的人设状态到默认值。"""
+    uid = _get_current_uid()
+    with _STATE_LOCK:
+        _states[uid] = copy.deepcopy(_DEFAULT)
+        _save(uid)
 
 
 # 情绪检测关键词
@@ -85,29 +127,60 @@ def detect_emotion(text: str) -> str:
 
 def update(text: str):
     """根据用户输入更新人设状态"""
+    with _STATE_LOCK:
+        state = _load()
+        emotion = detect_emotion(text)
+        state["interaction_count"] += 1
+        recent = state.get("recent_emotions", [])
+        recent.append({"emotion": emotion, "ts": time.time()})
+        state["recent_emotions"] = recent[-10:]
+
+        # 根据近期情绪调整 mood（优先级: positive > negative，允许情绪切换）
+        recent_emotions = [r["emotion"] for r in state["recent_emotions"][-5:]]
+        if recent_emotions.count("happy") >= 2 or recent_emotions.count("excited") >= 1:
+            state["mood"] = "playful"
+            state["humor_level"] = 0.5
+        elif recent_emotions.count("tired") >= 2:
+            state["mood"] = "caring"
+            state["humor_level"] = 0.2
+        elif recent_emotions.count("frustrated") >= 2 or recent_emotions.count("angry") >= 1:
+            state["mood"] = "serious"
+            state["humor_level"] = 0.1
+        else:
+            state["mood"] = "neutral"
+            state["humor_level"] = 0.3
+
+        _save()
+
+
+_EMOTION_TO_TTS = {
+    "happy": "happy",
+    "excited": "happy",
+    "sad": "sad",
+    "tired": "sad",
+    "angry": "serious",
+    "frustrated": "serious",
+    "neutral": "",
+}
+
+
+def get_current_emotion() -> str:
+    """返回最近一次检测到的用户情绪，映射为 TTS 情感标签。
+
+    返回值: happy / sad / serious / "" (空=默认中性)
+    """
     state = _load()
-    emotion = detect_emotion(text)
-    state["interaction_count"] += 1
     recent = state.get("recent_emotions", [])
-    recent.append({"emotion": emotion, "ts": time.time()})
-    state["recent_emotions"] = recent[-10:]
+    if not recent:
+        return ""
+    raw = recent[-1].get("emotion", "neutral")
+    return _EMOTION_TO_TTS.get(raw, "")
 
-    # 根据近期情绪调整 mood（优先级: positive > negative，允许情绪切换）
-    recent_emotions = [r["emotion"] for r in state["recent_emotions"][-5:]]
-    if recent_emotions.count("happy") >= 2 or recent_emotions.count("excited") >= 1:
-        state["mood"] = "playful"
-        state["humor_level"] = 0.5
-    elif recent_emotions.count("tired") >= 2:
-        state["mood"] = "caring"
-        state["humor_level"] = 0.2
-    elif recent_emotions.count("frustrated") >= 2 or recent_emotions.count("angry") >= 1:
-        state["mood"] = "serious"
-        state["humor_level"] = 0.1
-    else:
-        state["mood"] = "neutral"
-        state["humor_level"] = 0.3
 
-    _save()
+def get_current_mood() -> str:
+    """返回当前 mood（playful/caring/serious/neutral）"""
+    state = _load()
+    return state.get("mood", "neutral")
 
 
 def get_persona_prompt() -> str:
@@ -149,38 +222,40 @@ def set_relationship_level(level: str) -> None:
     """设置关系等级（stranger/acquaintance/friend/family）"""
     if level not in ("stranger", "acquaintance", "friend", "family"):
         level = "acquaintance"
-    state = _load()
-    state["relationship_level"] = level
-    _save()
+    with _STATE_LOCK:
+        state = _load()
+        state["relationship_level"] = level
+        _save()
 
 
 def update_relationship_from_interaction(text: str) -> None:
     """根据用户输入更新关系亲密度"""
-    state = _load()
-    state["interaction_count"] = state.get("interaction_count", 0) + 1
-    count = state["interaction_count"]
+    with _STATE_LOCK:
+        state = _load()
+        state["interaction_count"] = state.get("interaction_count", 0) + 1
+        count = state["interaction_count"]
 
-    # 亲密信号
-    intimate_signals = ["兄弟", "老铁", "buddy", "亲爱的", "宝贝", "家人", "咱"]
-    if any(s in text for s in intimate_signals) and count > 10:
-        state["relationship_level"] = "family"
-    elif count > 100:
-        state["relationship_level"] = "friend"
-    elif count > 20:
-        state["relationship_level"] = "acquaintance"
-    else:
-        state["relationship_level"] = "stranger"
+        # 亲密信号
+        intimate_signals = ["兄弟", "老铁", "buddy", "亲爱的", "宝贝", "家人", "咱"]
+        if any(s in text for s in intimate_signals) and count > 10:
+            state["relationship_level"] = "family"
+        elif count > 100:
+            state["relationship_level"] = "friend"
+        elif count > 20:
+            state["relationship_level"] = "acquaintance"
+        else:
+            state["relationship_level"] = "stranger"
 
-    # 语气偏好
-    formal_signals = ["您好", "请", "谢谢", "麻烦您", "请问"]
-    if any(s in text for s in formal_signals):
-        state["tone_profile"] = "formal"
-    elif "哈哈哈" in text or text.count("哈") >= 2:
-        state["tone_profile"] = "humorous"
-    else:
-        state["tone_profile"] = "casual"
+        # 语气偏好
+        formal_signals = ["您好", "请", "谢谢", "麻烦您", "请问"]
+        if any(s in text for s in formal_signals):
+            state["tone_profile"] = "formal"
+        elif "哈哈哈" in text or text.count("哈") >= 2:
+            state["tone_profile"] = "humorous"
+        else:
+            state["tone_profile"] = "casual"
 
-    _save()
+        _save()
 
 
 def contextual_response_style(level: str = "") -> str:

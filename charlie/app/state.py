@@ -302,25 +302,93 @@ _xiaozhi_pending: list[dict] = []  # [{"text": str, "mp3": bytes, "ts": float}]
 _PENDING_TTL = 300  # 5分钟内的待推项才补发（给MQTT wake + ESP32建连留余量）
 
 
-def register_xiaozhi_client(client_id: str, ws, loop) -> None:
+async def _do_flush_xiaozhi_pending(pending: list, ws, loop) -> int:
+    """Internal: flush a list of pending items to a connected WS.
+
+    Returns the number of items successfully sent.
+    """
+    import json as _json
+    sent = 0
+    try:
+        from app.xiaozhi_codec import mp3_to_opus_packets
+        for item in pending:
+            try:
+                packets = await loop.run_in_executor(None, mp3_to_opus_packets, item["mp3"])
+                await ws.send_text(_json.dumps({"type": "tts", "state": "start"}))
+                await ws.send_text(_json.dumps({"type": "tts", "state": "sentence_start", "text": item["text"]}))
+                for pkt in packets:
+                    await ws.send_bytes(pkt)
+                    await asyncio.sleep(0.06)
+                await ws.send_text(_json.dumps({"type": "tts", "state": "stop"}))
+                log.info(f"[xiaozhi] 补发推送: {item['text'][:30]}")
+                reminder_id = item.get("reminder_id")
+                if reminder_id is not None:
+                    try:
+                        from app.reminders import complete_reminder_delivery
+                        complete_reminder_delivery(reminder_id)
+                    except Exception as e:
+                        log.warning(f"[xiaozhi] 补发后标记提醒完成失败({reminder_id}): {e}")
+                sent += 1
+            except Exception as e:
+                log.warning(f"[xiaozhi] 补发失败: {e}")
+    except Exception as e:
+        log.warning(f"[xiaozhi] 补发初始化失败: {e}")
+    return sent
+
+
+async def flush_xiaozhi_pending(session_id: str, ws, loop) -> int:
+    """Flush all pending xiaozhi pushes for *session_id* to *ws*.
+
+    Snapshots the pending queue under lock (TTL-filtered), clears it, then
+    dispatches a background task that sends each item and marks any associated
+    reminder as delivered on success.
+
+    Returns the number of items handed off to the background task.
+    """
+    with _xiaozhi_lock:
+        now = time.time()
+        pending = [p for p in _xiaozhi_pending if now - p["ts"] < _PENDING_TTL]
+        # Remove only the TTL-valid items we are about to flush; expired ones
+        # are left to be cleaned on the next enqueue or flush call.
+        _xiaozhi_pending[:] = [p for p in _xiaozhi_pending if now - p["ts"] >= _PENDING_TTL]
+    if not pending:
+        return 0
+    log.info("[xiaozhi] flush_xiaozhi_pending: %d items for %s", len(pending), session_id)
+
+    async def _flush():
+        await _do_flush_xiaozhi_pending(pending, ws, loop)
+
+    try:
+        loop.create_task(_flush())
+    except Exception as e:
+        log.warning(f"[xiaozhi] 启动补发任务失败: {e}")
+    return len(pending)
+
+
+def register_xiaozhi_client(client_id: str, ws, loop) -> list:
     """注册 xiaozhi ESP32 WebSocket 连接，并 flush 待推送队列"""
     with _xiaozhi_lock:
         _xiaozhi_clients[client_id] = {"ws": ws, "loop": loop}
         pending = list(_xiaozhi_pending)
         _xiaozhi_pending.clear()
     log.info(f"[xiaozhi] 客户端已注册: {client_id} (总计: {len(_xiaozhi_clients)}, 待推送: {len(pending)})")
-    # 返回 pending 给调用方 flush（避免在锁内做异步操作）
-    return pending
+    # 在注册后直接 flush 补发，并在成功后标记提醒完成
+    if pending:
+        try:
+            loop.create_task(_do_flush_xiaozhi_pending(pending, ws, loop))
+        except Exception as e:
+            log.warning(f"[xiaozhi] 启动补发任务失败: {e}")
+    return []
 
 
-def enqueue_xiaozhi_pending(text: str, mp3: bytes) -> int:
+def enqueue_xiaozhi_pending(text: str, mp3: bytes, reminder_id=None) -> int:
     """ESP32未连接时，将推送暂存队列。返回队列长度。"""
     import time
     with _xiaozhi_lock:
         now = time.time()
         # 清理过期项
         _xiaozhi_pending[:] = [p for p in _xiaozhi_pending if now - p["ts"] < _PENDING_TTL]
-        _xiaozhi_pending.append({"text": text, "mp3": mp3, "ts": now})
+        _xiaozhi_pending.append({"text": text, "mp3": mp3, "ts": now, "reminder_id": reminder_id})
         return len(_xiaozhi_pending)
 
 
@@ -412,5 +480,5 @@ def refresh_continuous_mode(session_id: str) -> bool:
 
 
 def _ws_client_count() -> int:
-    """当前活跃WebSocket连接数"""
-    return len(_ws_clients)
+    """当前活跃WebSocket连接数（含 /ws 和 /ws/xiaozhi 两类连接）"""
+    return len(_ws_clients) + xiaozhi_client_count()

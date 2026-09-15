@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 import os, json, requests, datetime, re
 import logging
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -104,8 +105,27 @@ def load_wardrobe() -> list:
 
 def save_wardrobe(items: list):
     try:
-        with open(WARDROBE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
+        target_dir = os.path.dirname(os.path.abspath(WARDROBE_FILE)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".wardrobe_", suffix=".tmp", dir=target_dir)
+        f_wrapped = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f_wrapped = True
+                json.dump(items, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, WARDROBE_FILE)
+        except Exception:
+            if not f_wrapped:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         log.info(f"[wardrobe] 保存衣橱 {len(items)} 件衣物")
     except Exception as e:
         log.error(f"[wardrobe] 写衣橱失败: {e}")
@@ -132,7 +152,7 @@ def get_weather(city: str) -> dict:
                         log.debug(f"[wardrobe] 高德天气成功: {city} {live.get('weather')} {live.get('temperature')}度")
                         return {
                             "city": live.get("city", city),
-                            "temp": int(live.get("temperature", 20)),
+                            "temp": int(float(live.get("temperature", 20) or 20)),
                             "weather": live.get("weather", "晴"),
                             "humidity": live.get("humidity", "50"),
                             "wind": live.get("winddirection", "") + live.get("windpower", "") + "级",
@@ -251,6 +271,7 @@ def _get_default_city() -> str:
     # 2. 环境变量
     return os.getenv("DEFAULT_CITY", "北京")
 
+@mcp.tool()
 def outfit_recommend(city: str = "", occasion: str = "日常") -> str:
     """穿搭推荐: 根据今天天气和场合推荐3套搭配。
 

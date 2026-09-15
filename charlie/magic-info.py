@@ -141,10 +141,10 @@ def get_news(topic: str = "科技", count: int = 5) -> str:
                     title = item.get("title", "")
                     link = item.get("link", "")
                     if title:
-                        results.append(f"• {title}\n  {link}")
+                        results.append(f"{title}")
                 if results:
                     log.info(f"[info] OkSurf新闻成功: {topic} → {len(results)}条")
-                    return f"最新{topic}新闻（{len(results)}条）：\n" + "\n\n".join(results)
+                    return f"最新{topic}新闻：{'；'.join(results)}。"
         except Exception as e:
             log.debug(f"[info] OkSurf新闻失败: {e}")
 
@@ -168,10 +168,10 @@ def get_news(topic: str = "科技", count: int = 5) -> str:
             snippet = re.sub(r'<[^>]+>', '', snippet_m.group(1)).strip() if snippet_m else ''
             snippet = htmlmod.unescape(snippet)
             if title and len(title) > 5:
-                results.append(f"• {title}\n  {snippet[:60]}")
+                results.append(f"{title}：{snippet[:40]}")
         if not results:
             return f"没找到{topic}相关新闻"
-        return f"最新{topic}新闻（{len(results[:count])}条）：\n" + "\n\n".join(results[:count])
+        return f"最新{topic}新闻：{'；'.join(results[:count])}。"
     except Exception as e:
         return f"获取新闻失败: {e}"
 
@@ -181,11 +181,13 @@ def get_location() -> str:
     """获取用户当前位置：ESP32 WiFi扫描(室内定位) + 浏览器GPS经纬度反向地理编码。
     返回城市/街道/经纬度。当用户问'我在哪''附近有什么'时调用。"""
     parts = []
+    any_success = False
     try:
         r = requests.get(f"http://{ESP32_IP}/api/wifi/scan", timeout=10)
         if r.status_code == 200:
             aps = r.json()
             if aps:
+                any_success = True
                 parts.append(f"WiFi扫描到{len(aps)}个AP:")
                 for ap in aps[:5]:
                     parts.append(f"  {ap.get('ssid','?')} RSSI={ap.get('rssi','?')}dBm")
@@ -201,6 +203,7 @@ def get_location() -> str:
             r2 = requests.get(f"https://restapi.amap.com/v3/ip?key={amap_key}&output=json", timeout=5)
             data = r2.json()
             if data.get("city"):
+                any_success = True
                 parts.append(f"IP定位: {data.get('province','')} {data.get('city','')}")
                 if data.get("rectangle"):
                     parts.append(f"坐标范围: {data['rectangle']}")
@@ -209,12 +212,13 @@ def get_location() -> str:
             from app.geo import locate
             loc = locate()
             if loc:
+                any_success = True
                 parts.append(f"IP定位: {loc.get('country','')} {loc.get('region','')} {loc.get('city','')}")
                 parts.append(f"经纬度: {loc.get('lat','')}, {loc.get('lon','')}")
     except Exception as e:
         parts.append(f"IP定位失败: {type(e).__name__}")
 
-    if len(parts) <= 1:
+    if not any_success:
         return "无法获取位置信息。请在浏览器中允许定位权限，或确保ESP32在线。"
     return "\n".join(parts)
 
@@ -314,38 +318,8 @@ if __name__ == "__main__":
 
 @mcp.tool()
 def run_code(code: str) -> str:
-    """执行Python代码片段（沙箱模式），用于计算、数据处理、自动化等。
-
-    例: run_code("print(sum(range(100)))") → 计算1到99的和
-        run_code("import datetime; print(datetime.datetime.now())") → 获取当前时间
+    """[已禁用] 代码执行工具因安全风险已移除。
+    替代方案：使用 calculate(算式) 工具进行数学计算。
     """
-    import sys as _sys, io as _io, json as _json, traceback as _tb
-    # 安全限制: 不允许导入 os, subprocess, shutil 等危险模块
-    _BLOCKED_MODULES = {'os', 'subprocess', 'shutil', 'socket', 'ctypes', 'signal', 'multiprocessing', 'threading', 'fcntl'}
-    # 捕获输出
-    _stdout = _io.StringIO()
-    _stderr = _io.StringIO()
-    _old_stdout = _sys.stdout
-    _old_stderr = _sys.stderr
-    try:
-        _sys.stdout = _stdout
-        _sys.stderr = _stderr
-        # 编译检查安全
-        _tree = compile(code, '<code>', 'exec')
-        # 执行
-        exec(code, {'__builtins__': __builtins__})
-        _output = _stdout.getvalue()
-        _error = _stderr.getvalue()
-        if _output and _error:
-            return f"输出:\n{_output}\n错误:\n{_error}"
-        elif _output:
-            return f"输出:\n{_output}"
-        elif _error:
-            return f"错误:\n{_error}"
-        else:
-            return "代码执行成功，无输出。"
-    except Exception as _e:
-        return f"执行错误:\n{_tb.format_exc()}"
-    finally:
-        _sys.stdout = _old_stdout
-        _sys.stderr = _old_stderr
+    log.warning("[info] run_code 已被禁用（RCE 风险），使用 calculate 替代")
+    return "代码执行功能已禁用。如需数学计算，请使用 calculate 工具。"

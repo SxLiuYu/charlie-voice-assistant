@@ -2,7 +2,11 @@
 
 Extracted from voice_server.py.
 """
-import os, sys, json, time, hashlib, logging, asyncio, struct, zlib, platform
+import os, sys, json, time, hashlib, logging, asyncio, struct, zlib, platform, tempfile
+try:
+    import fcntl
+except ImportError:  # Windows 无 fcntl
+    import fcntl_compat as fcntl
 import requests
 
 from fastapi import APIRouter, Request, Response, HTTPException
@@ -22,6 +26,11 @@ from app import env_catalog
 from app.background_task import BackgroundTask
 
 log = logging.getLogger("magic")
+
+def _safe_error(e: Exception, context: str = "") -> JSONResponse:
+    """Log the full error server-side, return a generic message to the client."""
+    log.error(f"[manage] {context} error: {e}", exc_info=True)
+    return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 router = APIRouter(tags=["manage"])
 
@@ -189,7 +198,8 @@ async def tunnel_status(request: Request):
     try:
         import voice_server
         voice_server._reload_cors_origins()
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 197: {e}")
         pass
     try:
         with open(TUNNEL_FILE, "r", encoding="utf-8") as f:
@@ -198,7 +208,8 @@ async def tunnel_status(request: Request):
         if url:
             return json_response(request, {"active": True, "url": url},
                                 etag_token=tunnel_token if tunnel_token == tunnel_token_after_read else None)
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 206: {e}")
         pass
     tunnel_token_after_read = file_etag_token(TUNNEL_FILE, "tunnel")
     return json_response(request, {"active": False, "url": None, "message": "隧道未运行, 运行 bash start_tunnel.sh 启动"},
@@ -207,11 +218,25 @@ async def tunnel_status(request: Request):
 @router.get("/health")
 def health():
     uptime_s = int(time.time() - _start_time) if _start_time else 0
+    # Check subsystem status
+    mqtt_ok = False
+    feishu_ws_ok = False
+    try:
+        from app.mqtt_server import get_server
+        mqtt_ok = get_server() is not None
+    except Exception:
+        pass
+    try:
+        import feishu_ws
+        feishu_ws_ok = getattr(feishu_ws, "_started", False)
+    except Exception:
+        pass
     return {
         "ok": True, "service": "magic-phone-voice", "version": "3.2.0",
         "uptime_seconds": uptime_s, "uptime_human": f"{uptime_s//3600}h{(uptime_s%3600)//60}m",
         "brain_ready": _brain_is_warm(), "websocket_clients": _ws_client_count(),
         "sse_clients": sse_client_count(), "auth_enabled": bool(AUTH_TOKEN),
+        "mqtt_running": mqtt_ok, "feishu_ws_connected": feishu_ws_ok,
     }
 
 # ===== Preferences =====
@@ -311,7 +336,7 @@ async def decision_status():
                 user_state = {"state": "unknown"}
             return {"user_state": user_state, "rules": _dec.get_rules(), "history": _dec._load_decision_history(), "summary": _dec.decisions_summary()}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.get("/api/devices")
 async def list_devices():
@@ -329,7 +354,7 @@ async def list_devices():
                 mqtt_devices.append({"id": did, "type": "mqtt", "udp_addr": f"{addr[0]}:{addr[1]}" if addr else "waiting...", "connected_at": sess.get("timestamp", 0), "since_seconds": round(time.time() - sess.get("timestamp", time.time()), 1)})
         return {"total": len(ws_devices) + len(mqtt_devices), "websocket_count": len(ws_devices), "mqtt_count": len(mqtt_devices), "websocket_devices": ws_devices, "mqtt_devices": mqtt_devices, "mqtt_server_running": mqtt_server is not None, "mqtt_udp_port": mqtt_server.udp_port if mqtt_server else 0}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.get("/api/decisions/config")
 async def decisions_config():
@@ -345,11 +370,12 @@ async def decisions_config():
         try:
             with open(feedback_file, "r", encoding="utf-8") as f:
                 feedback = json.load(f)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.routes.manage] error at line 353: {e}")
             pass
         return {"cooldown_hours": 12, "rule_count": len(rule_summary), "rules": rule_summary, "feedback": feedback}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.get("/api/behaviors")
 async def behaviors_status():
@@ -361,7 +387,8 @@ async def behaviors_status():
             hf = os.path.join(PROJECT_DIR, "data", "decision_history.json")
             with open(hf, "r", encoding="utf-8") as f:
                 history = json.load(f)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.routes.manage] error at line 369: {e}")
             pass
         trigger_hours = []
         trigger_counts = Counter()
@@ -371,7 +398,8 @@ async def behaviors_status():
                     t = _dt.datetime.fromisoformat(info["trigger_time"])
                     trigger_hours.append(t.hour)
                     trigger_counts[rid] += 1
-                except Exception:
+                except Exception as e:
+                    log.debug(f"[app.routes.manage] error at line 379: {e}")
                     pass
         hour_dist = dict(Counter(trigger_hours)) if trigger_hours else {}
         top_triggered = trigger_counts.most_common(5)
@@ -380,7 +408,8 @@ async def behaviors_status():
             ff = os.path.join(PROJECT_DIR, "data", "decision_feedback.json")
             with open(ff, "r", encoding="utf-8") as f:
                 feedback = json.load(f)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[app.routes.manage] error at line 388: {e}")
             pass
         feedback_scores = {}
         for r in (history if isinstance(history, dict) else {}):
@@ -390,7 +419,7 @@ async def behaviors_status():
             feedback_scores[r] = {"score": round(score, 2) if score is not None else None, "total": total}
         return {"decision_triggers": top_triggered, "hour_distribution": hour_dist, "feedback_scores": feedback_scores, "total_decisions_triggered": sum(trigger_counts.values())}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.get("/api/habits")
 async def habits_status():
@@ -419,7 +448,7 @@ async def habits_status():
             result[habit] = {"total_days": len(logs), "streak": streak, "week_days": len([d for d in logs if _dt.date.fromisoformat(d) >= today - _dt.timedelta(days=today.weekday())]) if logs else 0, "last_log": sorted(logs)[-1] if logs else None, "created": data.get("created", ""), "completed_today": today.strftime("%Y-%m-%d") in logs}
         return {"total": len(result), "habits": result, "insight": f"已记录{sum(r['total_days'] for r in result.values())}次习惯打卡" if result else ""}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.get("/api/memory")
 async def memory_status(request: Request):
@@ -439,7 +468,7 @@ async def memory_status(request: Request):
             }
         return _mem.get_memory_summary()
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.delete("/api/memory")
 async def memory_delete(request: Request):
@@ -454,7 +483,7 @@ async def memory_delete(request: Request):
         result = _mem.forget(query)
         return {"ok": True, "message": result}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 # ===== Setup / config =====
 def _parse_env_file(path):
@@ -470,7 +499,8 @@ def _parse_env_file(path):
                 if "=" in line:
                     k, v = line.split("=", 1)
                     result[k.strip()] = v.strip()
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 478: {e}")
         pass
     return result
 
@@ -515,12 +545,29 @@ def _write_env_file(path, data):
     new_added = False
     for entry in env_catalog.all_entries():
         if entry.name in pending_updates and entry.name not in existing_keys:
-            if not new_added and out_lines and not out_lines[-1].endswith("\n\n"):
+            if not new_added and (not out_lines or not out_lines[-1].endswith("\n\n")):
                 out_lines.append("\n# === 通过 setup 页面新增 ===\n")
                 new_added = True
             out_lines.append(f"{entry.name}={pending_updates[entry.name]}\n")
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(out_lines)
+    # 原子整版替换：同目录 tempfile → flush+fsync → os.replace
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, OSError):
+                log.warning(f"[setup] 文件锁获取失败（并发写入）：{path}")
+            f.writelines(out_lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 def _reload_runtime_env():
     try:
@@ -816,7 +863,7 @@ async def protocols_status():
             result = [{"key": key, "name": proto.get("name", key), "triggers": ", ".join(proto.get("triggers", [])), "step_count": len(proto.get("steps", [])), "is_builtin": key in _sc._BUILTIN_PROTOCOLS} for key, proto in protocols.items()]
             return {"protocols": result}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.post("/api/protocols/learn")
 async def protocols_learn(body: dict):
@@ -830,7 +877,7 @@ async def protocols_learn(body: dict):
             return {"ok": True, "message": result}
     except Exception as e:
         audit_log("api:protocols:learn", input_data=body.get("name", ""), success=False, error=str(e), action="learn")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.get("/api/evolution")
 async def evolution_status():
@@ -844,7 +891,7 @@ async def evolution_status():
             learned = data.get("learned_preferences", {})
             return {"total_conversations": patterns.get("total_conversations", 0), "response_style": adaptation.get("response_style", "default"), "topic_count": len(patterns.get("top_topics", [])), "preferences": learned, "active_hours": patterns.get("active_hours", []), "top_topics": patterns.get("top_topics", [])}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 @router.post("/api/evolution/learn")
 async def evolution_learn():
@@ -857,16 +904,16 @@ async def evolution_learn():
             pass
         return {"ok": True, "message": "学习完成"}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return _safe_error(e)
 
 # ===== Wake / user / logs =====
 @router.post("/api/wake/toggle")
 async def wake_toggle_api(enabled: bool = None):
     from app.audit_log import audit_log
     import local_wake
-    current = local_wake.toggle_wake(enabled)
-    audit_log("api:wake_toggle", input_data=f"enabled={enabled}", output_data=f"enabled={current}", action="toggle")
-    return {"enabled": current}
+    result = local_wake.toggle_wake(enabled)
+    audit_log("api:wake_toggle", input_data=f"enabled={enabled}", output_data=str(result), action="toggle")
+    return result
 
 @router.get("/api/wake/status")
 async def wake_status_api():
@@ -899,7 +946,8 @@ async def get_logs(lines: int = 100, filter: str = ""):
         tail = all_lines[-lines:]
         return {"lines": tail, "total": len(tail), "file": log_path}
     except Exception as e:
-        return {"error": str(e), "lines": [], "total": 0}
+        log.error(f"[manage] logs error: {e}", exc_info=True)
+        return {"error": "Failed to read logs", "lines": [], "total": 0}
 
 # ===== TTS voices =====
 AVAILABLE_TTS_VOICES = {
@@ -938,7 +986,8 @@ async def set_tts_voice(request: Request):
     try:
         role_id = get_current_role()
         set_role_tts_voice(role_id, voice_id)
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 950: {e}")
         pass
     audit_log("api:tts_voice", input_data=voice_id, output_data=voice_id, action="set")
     return {"ok": True, "voice": voice_id, "name": AVAILABLE_TTS_VOICES[voice_id]}
@@ -998,7 +1047,8 @@ async def _internal_xiaozhi_push(payload: dict, request: Request):
             audit_log("api:xiaozhi_push", input_data=text[:50], action="push",
                       output_data="deferred: streaming")
             return JSONResponse({"ok": True, "deferred": True, "reason": "streaming"}, status_code=202)
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 1010: {e}")
         pass
     audit_log("api:xiaozhi_push", input_data=text[:50], action="push")
     import base64 as _b64
@@ -1019,6 +1069,7 @@ async def _internal_xiaozhi_push(payload: dict, request: Request):
         mqtt_pushed = push_tts_to_mqtt(text, mp3_data)
         if mqtt_pushed:
             pushed += 1
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 1031: {e}")
         pass
     return {"ok": True, "pushed": pushed, "total": len(clients), "mqtt": mqtt_pushed}

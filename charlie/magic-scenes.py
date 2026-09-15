@@ -40,7 +40,7 @@ _BUILTIN_PROTOCOLS = {
             {"action": "ac_sleep", "params": {}},
             {"action": "tv_control", "params": {"action": "power_off"}},
             {"action": "reminder", "params": {"text": "起床", "time": "明天8点"}},
-            {"action": "tts", "params": {"template": "晚安，明天{weather}。"}},
+            {"action": "tts", "params": {"template": "晚安，明天{weather_tomorrow}。"}},
         ],
     },
     "good_morning": {
@@ -49,7 +49,7 @@ _BUILTIN_PROTOCOLS = {
         "auto_trigger": None,
         "steps": [
             {"action": "ac_control", "params": {"action": "cool"}},
-            {"action": "tts", "params": {"template": "早上好！今天{weather}，{todo_count}项待办。"}},
+            {"action": "tts", "params": {"template": "早上好！今天{weather}，{todo_count}。"}},
         ],
     },
     "movie_time": {
@@ -113,8 +113,27 @@ def _save_custom_protocol(key: str, protocol: dict):
             log.debug(f"[scenes] 读取自定义协议失败: {e}")
         custom[key] = protocol
         try:
-            with open(PROTOCOLS_FILE, 'w', encoding='utf-8') as f:
-                _json.dump(custom, f, ensure_ascii=False, indent=2)
+            target_dir = os.path.dirname(os.path.abspath(PROTOCOLS_FILE)) or "."
+            fd, tmp_path = tempfile.mkstemp(prefix=".scenes_", suffix=".tmp", dir=target_dir)
+            f_wrapped = False
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f_wrapped = True
+                    _json.dump(custom, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, PROTOCOLS_FILE)
+            except Exception:
+                if not f_wrapped:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             log.warning(f"[scenes] 保存自定义协议失败: {e}")
     _protocols_cache = None  # 使缓存失效
@@ -133,26 +152,33 @@ def check_auto_triggers(user_state: str) -> list[str]:
     return triggered
 
 
-def _get_weather() -> str:
-    """获取今天天气摘要"""
+def _get_weather(tomorrow: bool = False) -> str:
+    """获取天气摘要（tomorrow=True 返回明天预报，供晚安场景）。
+
+    返回不带"今天/明天"语境前缀（由模板决定），温度按低到高播报。
+    """
     AMAP = os.getenv("AMAP_KEY", "")
     AMAP_CITY = os.getenv("AMAP_CITY", "110000")  # 默认北京，可通过环境变量覆盖
     try:
         r = requests.get("https://restapi.amap.com/v3/weather/weatherInfo",
             params={"city": AMAP_CITY, "key": AMAP, "extensions": "all"}, timeout=10).json()
         casts = (r.get("forecasts") or [{}])[0].get("casts", [])
+        idx = 1 if (tomorrow and len(casts) > 1) else 0
         if casts:
-            today = casts[0]
-            day_w = today.get("dayweather", "")
-            night_w = today.get("nightweather", "")
-            day_temp = today.get("daytemp", "")
-            night_temp = today.get("nighttemp", "")
+            day = casts[idx]
+            day_w = day.get("dayweather", "")
+            night_w = day.get("nightweather", "")
             weather_parts = []
             for w in (day_w, night_w):
                 if w and w not in weather_parts:
                     weather_parts.append(w)
             weather = "转".join(weather_parts) if len(weather_parts) > 1 else (weather_parts[0] if weather_parts else "")
-            return f"今天{weather}，{day_temp}到{night_temp}度"
+            try:
+                lo, hi = sorted([int(day.get("nighttemp", 0)), int(day.get("daytemp", 0))])
+                temp = f"{lo}到{hi}度"
+            except ValueError:
+                temp = f"{day.get('daytemp','')}到{day.get('nighttemp','')}度"
+            return f"{weather}，{temp}".lstrip("，")
     except (OSError, KeyError, ValueError) as e:
         log.debug(f"[scenes] 天气获取失败: {e}")
     return ""
@@ -193,7 +219,8 @@ def _get_today_todos() -> list:
         return []
 
 
-def _ac_control(action: str) -> str:  # dead code – kept for import compat only
+def _ac_control(action: str) -> str:
+    """空调控制（已禁用，仅作兼容占位）。"""
     return "空调控制功能已停用"
 
 
@@ -230,15 +257,26 @@ def _ac_sleep() -> str:
 
 
 def _tv_control(action: str) -> str:
-    """控制电视 — 走 ESP32 红外网关（需在 .env 配置 ESP32_IP）。
+    """控制电视 — 优先 DLNA（magic-tv，停止播放/静音），ESP32 红外网关兜底。
 
-    未配置 ESP32_IP 时直接返回明确提示，不再向硬编码的内网地址发请求造成 3 秒超时。
-    （TODO: 后续可改用 Tuya 码库 key_code 参数，与空调 switch_power 抽象不同，待调研设备/码库 ID）
+    DLNA 无电源控制，power_off 场景做"停止播放+静音"（晚安场景的合理等效）。
     """
+    try:
+        from app import load_magic_module
+        _tv_mod = load_magic_module("magic_tv", "magic-tv.py")
+        if _tv_mod and _tv_mod._get_tv():
+            if action in ("power_off", "stop"):
+                r1 = _tv_mod.tv_stop()
+                _tv_mod.set_tv_mute(True)
+                return f"电视已停止播放并静音"
+            if action in ("mute", "vol_down"):
+                return _tv_mod.set_tv_mute(True)
+    except Exception as e:
+        log.debug(f"[tv] DLNA控制失败，回退红外: {e}")
     esp32_ip = os.getenv("ESP32_IP", "").strip()
     if not esp32_ip:
-        log.info("[tv] 未配置 ESP32_IP，跳过电视红外控制")
-        return "电视控制未配置（请在设置中填写 ESP32_IP）"
+        log.info("[tv] DLNA不可用且未配置 ESP32_IP，跳过电视控制")
+        return "电视控制未配置（DLNA不可达且未填写 ESP32_IP）"
     try:
         log.info(f"[tv] 发送红外指令: action={action!r} target=http://{esp32_ip}/api/ir/send")
         resp = requests.post(f"http://{esp32_ip}/api/ir/send",
@@ -252,6 +290,7 @@ def _tv_control(action: str) -> str:
 
 def _set_volume(level: int) -> str:
     """设置系统音量（跨平台）"""
+    level = max(0, min(100, level))  # clamp 到 [0,100]
     try:
         import platform as _pf
         _sys = _pf.system()
@@ -297,8 +336,9 @@ def _fill_template(template: str) -> str:
     """填充模板变量: {weather} {todo_count} {date}"""
     result = template
     result = result.replace("{weather}", _get_weather() or "天气未知")
+    result = result.replace("{weather_tomorrow}", _get_weather(tomorrow=True) or "天气未知")
     todos = _get_today_todos()
-    result = result.replace("{todo_count}", f"{len(todos)}" if todos else "没有")
+    result = result.replace("{todo_count}", f"{len(todos)}项待办" if todos else "没有待办")
     result = result.replace("{date}", _datetime.datetime.now().strftime("%Y年%m月%d日"))
     return result
 
@@ -436,9 +476,15 @@ def execute_protocol(key: str) -> str:
     results = []
     for step in proto.get("steps", []):
         result = _execute_step(step)
-        results.append(result)
+        if result:
+            # 去掉每个步骤结果末尾的句号，避免拼接时出现"。；"
+            result = result.rstrip("。")
+            results.append(result)
     name = proto.get("name", key)
-    return f"{name}场景已执行：" + "；".join(results) + "。"
+    summary = "；".join(results)
+    if summary:
+        return f"{name}场景已执行：{summary}。"
+    return f"{name}场景已执行。"
 
 
 @mcp.tool()

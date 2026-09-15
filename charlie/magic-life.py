@@ -83,31 +83,17 @@ def control_tesla_ac(action: str = "on", temperature: int = 22) -> str:
 @mcp.tool()
 def leaving_home() -> str:
     log.debug("[leaving_home] 被调用")
-    """场景模式：用户要出门了。自动关闭空调，播报今天天气和注意事项。
+    """场景模式：用户要出门了。播报今天天气和注意事项。
 
-    例: leaving_home() → 关空调、关电视、播报天气和待办
+    例: leaving_home() → 播报天气和待办
     """
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
     actions = []
 
-    # 1. 关空调
-    try:
-        from mcp_ir_control import ac_control
-        ac_result = ac_control("off")
-        actions.append("空调已关闭")
-    except Exception:
-        esp32_ip = os.getenv("ESP32_IP", "").strip()
-        if esp32_ip:
-            try:
-                requests.post(f"http://{esp32_ip}/api/ir/send",
-                    json={"device": "ac", "action": "power_off"}, timeout=5)
-                actions.append("空调已关闭")
-            except Exception:
-                actions.append("空调关闭失败（设备可能不在线）")
-        else:
-            actions.append("空调关闭失败（未配置 ESP32_IP）")
+    # 1. 空调控制未配置，跳过
+    actions.append("空调控制未配置，跳过")
 
     # 2. 播报天气
     try:

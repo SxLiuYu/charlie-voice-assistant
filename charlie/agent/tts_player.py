@@ -39,12 +39,15 @@ class TTSParallelPlayer:
         self._stopped = False
         # Async bridge
         self._async_queue: Optional[asyncio.Queue] = None
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._async_bridge_thread: Optional[threading.Thread] = None
 
     def _init_async_bridge(self) -> None:
         """Initialize async bridge (called from async context)"""
         if self._async_queue is None:
-            self._async_queue = asyncio.Queue()
+            # 有界：消费端停止后桥线程不能无限堆积结果
+            self._async_queue = asyncio.Queue(maxsize=_QUEUE_MAX_SIZE)
+            self._async_loop = asyncio.get_running_loop()
             self._async_bridge_thread = threading.Thread(target=self._async_bridge_loop, daemon=True)
             self._async_bridge_thread.start()
 
@@ -54,11 +57,29 @@ class TTSParallelPlayer:
             result = self.get_next_ready(timeout=0.05)
             if result is None:
                 continue
-            if self._async_queue is not None:
+            q = self._async_queue
+            if q is not None:
                 try:
-                    self._async_queue.put_nowait(result)
-                except Exception:
-                    pass
+                    q.put_nowait(result)
+                except asyncio.QueueFull:
+                    # 满时丢最旧保新句（旧句多半已过播放时机）
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(result)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log.debug(f"[agent.tts_player] error at line 60: {e}")
+                    continue
+                # 跨线程 put_nowait 不写 selector 自管道，loop 空闲时不会
+                # 被唤醒，消费端只能靠 timeout 轮询兜底（每句白付尾延迟）。
+                # 补一发空操作唤醒。
+                loop = self._async_loop
+                if loop is not None:
+                    try:
+                        loop.call_soon_threadsafe(lambda: None)
+                    except RuntimeError:
+                        pass  # loop 已关闭
 
     async def async_get_next(self, timeout: float = 1.0) -> Optional[tuple[int, str, Optional[bytes], Optional[dict]]]:
         """Async version of get_next_ready - uses asyncio.Queue for event-driven consumption"""

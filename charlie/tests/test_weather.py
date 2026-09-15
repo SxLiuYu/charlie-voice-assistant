@@ -11,6 +11,21 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 
+# ---------------------------------------------------------------------------
+# Fixture: reset module-level TTL cache before EACH test
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _reset_weather_cache():
+    """Reset the module-level weather TTL cache before each test."""
+    import app.weather as weather_mod
+    with weather_mod._weather_cache_lock:
+        weather_mod._weather_cache.clear()
+    yield
+    with weather_mod._weather_cache_lock:
+        weather_mod._weather_cache.clear()
+
+
 # ======================================================================
 # Helpers
 # ======================================================================
@@ -66,13 +81,14 @@ def _amap_payload(weather="晴", day_temp=30, night_temp=20):
 
 
 # ======================================================================
-# P0-1-a: Open-Meteo success
+# P0-1-a: AMAP success (now primary) / Open-Meteo success (fallback)
 # ======================================================================
 
 class TestWeatherOpenMeteoSuccess:
+    @patch.dict(os.environ, {"AMAP_KEY": ""})
     @patch("app.weather.requests.get")
     def test_returns_open_meteo_source(self, mock_get):
-        """Open-Meteo geocoding + forecast 成功 → source=open-meteo"""
+        """AMAP 未配置 → Open-Meteo geocoding + forecast 成功 → source=open-meteo"""
         from app.weather import get_weather
 
         mock_get.side_effect = [
@@ -90,9 +106,11 @@ class TestWeatherOpenMeteoSuccess:
         assert w["current_weather"] == "晴"
         assert w["rain_prob"] == 0
 
+    @patch.dict(os.environ, {"AMAP_KEY": ""})
     @patch("app.weather.requests.get")
     def test_wmo_code_mapping(self, mock_get):
         """WMO code 映射：雨=61→小雨、雷阵雨=95→雷阵雨、未知码→未知"""
+        import app.weather as weather_mod
         from app.weather import get_weather
 
         cases = [
@@ -105,6 +123,8 @@ class TestWeatherOpenMeteoSuccess:
             (999, "未知"),
         ]
         for code, expected in cases:
+            with weather_mod._weather_cache_lock:
+                weather_mod._weather_cache.clear()
             mock_get.side_effect = [
                 FakeResp(_om_geo_payload([{"latitude": 1.0, "longitude": 2.0}])),
                 FakeResp(_om_forecast_payload(code)),
@@ -114,44 +134,71 @@ class TestWeatherOpenMeteoSuccess:
 
 
 # ======================================================================
-# P0-1-b: Open-Meteo fail → AMAP fallback
+# P0-1-a2: AMAP 主路径成功（get_weather 现在 AMAP 优先）
 # ======================================================================
 
-class TestWeatherFallbackToAmap:
+class TestWeatherAmapPrimary:
     @patch.dict(os.environ, {"AMAP_KEY": "test-amap-key"})
     @patch("app.weather.requests.get")
-    def test_fallback_to_amap_when_open_meteo_fails(self, mock_get):
-        """Open-Meteo 失败 → AMAP → source=amap"""
+    def test_amap_success_returns_amap_source(self, mock_get):
+        """AMAP_KEY 配置且接口成功 → source=amap，字段映射正确（不走 Open-Meteo）"""
         from app.weather import get_weather
 
-        def side_effect(*args, **kwargs):
-            url = args[0] if args else ""
-            if "open-meteo" in url:
-                raise Exception("OM down")
-            return FakeResp(_amap_payload("多云", 28, 20))
-
-        mock_get.side_effect = side_effect
+        mock_get.side_effect = [
+            FakeResp(_amap_payload("多云", 28, 20)),   # AMAP weatherInfo（北京在 city_map 内，无需 geocode）
+        ]
 
         w = get_weather("北京")
         assert w["source"] == "amap"
         assert w["day_weather"] == "多云"
         assert w["day_temp"] == 28
+        assert w["night_temp"] == 20
+        # AMAP 成功时不应该请求 open-meteo
+        assert all("open-meteo" not in str(c.args[0] if c.args else "")
+                   for c in mock_get.call_args_list)
+
+
+# ======================================================================
+# P0-1-b: AMAP fail → Open-Meteo fallback
+# ======================================================================
+
+class TestWeatherFallbackToAmap:
+    @patch.dict(os.environ, {"AMAP_KEY": "test-amap-key"})
+    @patch("app.weather.requests.get")
+    def test_fallback_to_open_meteo_when_amap_fails(self, mock_get):
+        """AMAP 失败 → Open-Meteo → source=open-meteo"""
+        from app.weather import get_weather
+
+        def side_effect(*args, **kwargs):
+            url = args[0] if args else ""
+            if "amap" in url:
+                raise Exception("AMAP down")
+            return FakeResp(_om_forecast_payload(0, 28, 20, 0, 26, 0))
+
+        # AMAP geocode + weather 都失败, 然后 OM geo + forecast
+        mock_get.side_effect = [
+            Exception("AMAP geocode down"),                              # AMAP geocode
+            FakeResp(_om_geo_payload([{"latitude": 39.9, "longitude": 116.4}])),  # OM geo
+            FakeResp(_om_forecast_payload(0, 28, 20, 0, 26, 0)),         # OM forecast
+        ]
+
+        w = get_weather("北京")
+        assert w["source"] == "open-meteo"
 
     @patch.dict(os.environ, {"AMAP_KEY": "test-amap-key"})
     @patch("app.weather.requests.get")
     def test_open_meteo_no_results_falls_back(self, mock_get):
-        """Open-Meteo geocoding 找不到城市 → fallback AMAP"""
+        """AMAP 失败 + Open-Meteo geocoding 找不到城市 → default"""
         from app.weather import get_weather
 
         mock_get.side_effect = [
-            FakeResp({"results": []}),           # OM 中文找不到
-            FakeResp({"results": []}),           # OM 英文拼音找不到
-            FakeResp({"geocodes": [{"adcode": "310000"}]}),  # AMAP geocode
-            FakeResp(_amap_payload("小雨", 25, 18)),          # AMAP weather
+            Exception("AMAP down"),                          # AMAP geocode
+            FakeResp({"results": []}),                        # OM 中文找不到
+            FakeResp({"results": []}),                        # OM 英文拼音找不到
         ]
 
         w = get_weather("不存在城")
-        assert w["source"] == "amap"
+        assert w["source"] == "default"
 
 
 # ======================================================================
@@ -175,8 +222,11 @@ class TestWeatherBothFail:
     @patch("app.weather.requests.get")
     def test_amap_not_configured_then_open_meteo_fails(self, mock_get):
         """AMAP 未配置(AMAP_KEY 为空) + Open-Meteo 失败 → default"""
-        # AMAP_KEY 已由 patch.dict 清除; _amap_get 直接返回 None
-        mock_get.side_effect = Exception("OM down")
+        # AMAP_KEY 已由 patch.dict 清除; _amap_get 直接返回 None, 跳到 OM
+        mock_get.side_effect = [
+            FakeResp({"results": []}),    # OM geo 中文
+            FakeResp({"results": []}),    # OM geo 英文
+        ]
 
         from app.weather import get_weather
         w = get_weather("北京")

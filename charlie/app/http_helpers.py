@@ -58,6 +58,7 @@ def file_not_modified_response(request: Request, path: str, prefix: str) -> Resp
 _open_text_file = open
 _text_file_cache: dict[str, tuple[tuple[int, int, int], str]] = {}
 _text_file_cache_lock = threading.Lock()
+_TEXT_FILE_CACHE_MAX = 100  # 最多缓存 100 个文件
 
 def read_cached_text(path: str, return_token: bool = False):
     """Read a small static text file, reusing contents while file metadata is unchanged."""
@@ -78,6 +79,8 @@ def read_cached_text(path: str, return_token: bool = False):
             with _text_file_cache_lock:
                 cached = _text_file_cache.get(path)
                 if cached is None or cached[0] != token:
+                    if len(_text_file_cache) > _TEXT_FILE_CACHE_MAX:
+                        _text_file_cache.clear()
                     _text_file_cache[path] = (token, text)
             return (text, token) if return_token else text
     return (text, token) if return_token else text

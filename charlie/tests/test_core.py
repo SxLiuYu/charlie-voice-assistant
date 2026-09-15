@@ -5,17 +5,16 @@ magic-decisions (evaluation, cooldown, feedback, pending confirmation),
 magic-scenes (matching, execution, new step types),
 magic-evolution (pattern extraction, optimization).
 """
-import os, sys, json, time, importlib.util, tempfile, shutil
+import os
+import sys
+import time
+import importlib.util
+import pytest
 
 # Test setup: load modules from parent dir
 PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PARENT_DIR)
 os.chdir(PARENT_DIR)
-
-# Temp data dir for tests
-TMP_DIR = tempfile.mkdtemp(prefix="charlie_test_")
-os.environ["ASSISTANT_KID_DATA_DIR"] = TMP_DIR
-os.environ.pop("CHARLIE_USER_ID", None)
 
 
 def _load_module(name, filename):
@@ -25,15 +24,34 @@ def _load_module(name, filename):
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _isolated_data_dir(tmp_path, monkeypatch):
+    """每个测试前隔离数据目录，并在测试结束后自动清理。
+
+    使用 monkeypatch 确保 env 在测试结束时自动恢复，避免跨文件环境污染。
+    tmp_path 由 pytest 自动清理，无需手动 rmtree。
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setenv("ASSISTANT_KID_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("CHARLIE_USER_ID", raising=False)
+    yield
+
+
 # ===== magic-memory tests =====
 
 class TestMagicMemory:
     def setup_method(self):
         self.mem = _load_module("magic_memory_test", "magic-memory.py")
-
-    def teardown_method(self):
-        for f in os.listdir(TMP_DIR):
-            os.remove(os.path.join(TMP_DIR, f))
+        # 隔离: 每个测试前清干净 DATA_DIR，防止全套路时其它测试写入污染本次测试
+        data_dir = self.mem.DATA_DIR
+        for root, dirs, files in os.walk(data_dir):
+            for fname in files:
+                if fname.startswith("episodic_memories"):
+                    try:
+                        os.remove(os.path.join(root, fname))
+                    except OSError:
+                        pass
 
     def test_bigram_extraction(self):
         v = self.mem._text_to_bigrams("项目截止")
@@ -103,10 +121,6 @@ class TestMagicDecisions:
     def setup_method(self):
         self.dec = _load_module("magic_decisions_test", "magic-decisions.py")
 
-    def teardown_method(self):
-        for f in os.listdir(TMP_DIR):
-            os.remove(os.path.join(TMP_DIR, f))
-
     def test_rules_count(self):
         assert len(self.dec._DECISION_RULES) == 12  # expanded rules: morning_wakeup/weather_alert/meeting_reminder/leaving_reminder/lunch_reminder/evening_wind_down/sedentary_break/evening_wrapup/arrive_home/deadline_reminder/casual_checkin
 
@@ -157,10 +171,6 @@ class TestMagicDecisions:
 class TestMagicScenes:
     def setup_method(self):
         self.sc = _load_module("magic_scenes_test", "magic-scenes.py")
-
-    def teardown_method(self):
-        for f in os.listdir(TMP_DIR):
-            os.remove(os.path.join(TMP_DIR, f))
 
     def test_builtin_protocols_count(self):
         assert len(self.sc._BUILTIN_PROTOCOLS) == 4
@@ -254,10 +264,6 @@ class TestMagicEvolution:
     def setup_method(self):
         self.evo = _load_module("magic_evolution_test", "magic-evolution.py")
 
-    def teardown_method(self):
-        for f in os.listdir(TMP_DIR):
-            os.remove(os.path.join(TMP_DIR, f))
-
     def test_load_empty(self):
         data = self.evo._load_evolution_data()
         assert "learned_preferences" in data
@@ -272,8 +278,3 @@ class TestMagicEvolution:
     def test_evolution_status(self):
         status = self.evo._load_evolution_data()
         assert "adaptation_state" in status
-
-
-# Cleanup
-def teardown_module():
-    shutil.rmtree(TMP_DIR, ignore_errors=True)

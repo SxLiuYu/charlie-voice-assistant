@@ -8,6 +8,8 @@ import datetime
 import importlib.util
 from unittest.mock import patch
 
+import pytest
+
 PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PARENT_DIR)
 
@@ -17,6 +19,14 @@ def _load_module(name, filename):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _mock_context_network(monkeypatch):
+    """P1: 把 context 刷新线程依赖的网络调用 mock 为快速返回空，
+    避免真实网络 I/O 导致后台线程跨测试泄漏。"""
+    monkeypatch.setattr("agent.weather.direct_weather_play", lambda *a, **k: "")
+    monkeypatch.setattr("app.geo.locate_text", lambda *a, **k: "")
 
 
 # ===== P0: magic-jarvis proactive conversation =====
@@ -424,7 +434,6 @@ class TestRound4ContextCacheInvalidation:
 
     def test_session_switch_invalidates_context(self):
         from agent.context import get_context, invalidate_context_cache
-        from agent.llm import _last_wm_session_id, brain_stream_sentences
         from agent.working_memory import reset
         reset()
         # 先填充缓存

@@ -58,7 +58,8 @@ def _url_disk_load(url: str, sample_rate: int, frame_duration: int,
         if not isinstance(pkts, list) or not pkts:
             return None
         return list(pkts)
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.xiaozhi_codec] error at line 61: {e}")
         return None
 
 
@@ -80,7 +81,8 @@ def _url_disk_save(url: str, sample_rate: int, frame_duration: int,
                 os.remove(entries.pop(0))
         except OSError:
             pass
-    except Exception:
+    except Exception as e:
+        log.debug(f"[app.xiaozhi_codec] error at line 83: {e}")
         pass
 
 
@@ -123,18 +125,60 @@ def opus_decode_to_wav(frames: list[bytes], sample_rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
+def opus_decode_to_pcm(frames: list[bytes], sample_rate: int = 16000) -> bytes:
+    """Decode a list of raw Opus packets into raw 16-bit mono PCM bytes (no WAV header)."""
+    if opuslib is None:
+        raise RuntimeError("opuslib not available")
+    if not frames:
+        return b""
+    decoder = opuslib.Decoder(sample_rate, 1)
+    pcm_parts: list[bytes] = []
+    frame_size = sample_rate * 60 // 1000
+    for pkt in frames:
+        try:
+            pcm = decoder.decode(pkt, frame_size=frame_size)
+            pcm_parts.append(pcm)
+        except Exception as e:
+            log.warning("opus decode frame error: %s", e)
+    return b"".join(pcm_parts)
+
+
+def pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
+    """Wrap raw 16-bit mono PCM bytes with a WAV header."""
+    if not pcm_data:
+        return b""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm_data)
+    return buf.getvalue()
+
+
 def _mp3_to_pcm(mp3_data: bytes, sample_rate: int = 24000,
                 volume_db: float = 0.0) -> bytes:
     """Convert MP3 bytes to raw 16-bit mono PCM at given sample rate via ffmpeg."""
-    cmd = ["ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0",
+    if not mp3_data or len(mp3_data) < 10:
+        raise RuntimeError(f"ffmpeg mp3->pcm failed: input too small ({len(mp3_data) if mp3_data else 0} bytes)")
+    # 不强制 -f mp3：ffmpeg 8.x 对某些 TTS 输出强制格式会失败（rc=69），
+    # auto-probe 反而更可靠且省去一次失败重试（~2s → ~0.3s）。
+    cmd = ["ffmpeg", "-y", "-i", "pipe:0",
            "-ar", str(sample_rate), "-ac", "1"]
     if volume_db:
         cmd += ["-af", f"volume={volume_db}dB"]
     cmd += ["-f", "s16le", "pipe:1"]
     r = subprocess.run(cmd, input=mp3_data, capture_output=True, timeout=25)
-    if r.returncode != 0 or not r.stdout:
-        raise RuntimeError(f"ffmpeg mp3->pcm failed: {r.stderr.decode(errors='replace')[:200]}")
-    return r.stdout
+    if r.returncode == 0 and r.stdout:
+        return r.stdout
+    stderr = r.stderr.decode(errors='replace')
+    err_lines = [l for l in stderr.split('\n')
+                 if l.strip() and 'ffmpeg version' not in l
+                 and 'built with' not in l and 'configuration:' not in l]
+    err_summary = ' | '.join(err_lines[:3])[:300]
+    raise RuntimeError(
+        f"ffmpeg mp3->pcm failed (rc={r.returncode}, in={len(mp3_data)}B, "
+        f"out={len(r.stdout)}B): {err_summary}")
 
 
 def mp3_to_opus_packets(mp3_data: bytes, sample_rate: int = 24000,
@@ -153,6 +197,10 @@ def mp3_to_opus_packets(mp3_data: bytes, sample_rate: int = 24000,
         raise RuntimeError("opuslib not available")
     if not mp3_data:
         return []
+    if len(mp3_data) < 10:
+        # 与 _mp3_to_pcm 的输入校验对齐：过小输入在下层必然失败，提前抛出
+        raise RuntimeError(
+            f"ffmpeg mp3->opus failed: input too small ({len(mp3_data)} bytes)")
     key = (hashlib.sha256(mp3_data).hexdigest(), sample_rate,
            frame_duration, volume_db)
     with _OPUS_CACHE_LOCK:
@@ -258,6 +306,10 @@ def mp3_to_ogg_opus(mp3_data: bytes, sample_rate: int = 16000) -> bytes:
     OpusTags and OggS pages), not raw Opus packets. ffmpeg produces a valid
     Ogg Opus stream directly.
     """
+    if not mp3_data or len(mp3_data) < 10:
+        raise RuntimeError(
+            f"ffmpeg mp3->ogg opus failed: input too small "
+            f"({len(mp3_data) if mp3_data else 0} bytes)")
     r = subprocess.run(
         ["ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0",
          "-ar", str(sample_rate), "-ac", "1",

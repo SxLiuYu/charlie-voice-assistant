@@ -72,6 +72,9 @@ ENV ARK_BASE="https://ark.cn-beijing.volces.com/api/plan/v3" \
 
 # 暴露端口
 EXPOSE 8000
+EXPOSE 1883
+EXPOSE 8443
+EXPOSE 8888/udp
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

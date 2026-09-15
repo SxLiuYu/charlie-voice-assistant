@@ -3,24 +3,89 @@
 Extracted from voice_agent.py. Handles smart home and system control
 keywords, bypassing LLM for sub-second response.
 """
-import os, sys, re, platform, subprocess, logging
+import atexit
+import os
+import sys
+import re
+import platform
+import subprocess
+import logging
+import concurrent.futures
+import threading
+from typing import Optional
 
 log = logging.getLogger("magic")
+
+# AC 共享线程池（惰性单例，atexit 自动清理）
+_ac_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_ac_pool_lock = threading.Lock()
+_ac_pool_atexit_registered = False
+
+
+def _get_ac_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """获取 AC 共享线程池（惰性初始化，双检锁）。"""
+    global _ac_pool, _ac_pool_atexit_registered
+    if _ac_pool is None:
+        with _ac_pool_lock:
+            if _ac_pool is None:
+                max_workers = int(os.getenv("AC_POOL_SIZE", "2"))
+                _ac_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="ac-tuya",
+                )
+                if not _ac_pool_atexit_registered:
+                    atexit.register(_shutdown_ac_pool)
+                    _ac_pool_atexit_registered = True
+    return _ac_pool
+
+
+def _shutdown_ac_pool():
+    """atexit 回调：关闭共享池。"""
+    global _ac_pool
+    pool = _ac_pool
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:
+            log.debug(f"[ac] 共享池关闭失败: {e}")
+        finally:
+            _ac_pool = None
+
+
+def _run_ac_with_timeout(fn, timeout: float = 8.0, timeout_msg: str = "空调指令发送超时，请稍后重试"):
+    """Run an AC API call in the shared thread pool with a hard timeout budget.
+
+    已知限制：超时返回后 worker 线程至底层 HTTP 自然结束才释放；AC 调用低频，
+    池大小可调（AC_POOL_SIZE 环境变量）兜底。
+    """
+    executor = _get_ac_pool()
+    future = executor.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        log.warning("[ac] API 调用超时(%.1fs)，返回超时文案", timeout)
+        return False, timeout_msg
 
 
 def direct_ac_control(text: str) -> str:
     """空调控制关键词命中时直接调用 Tuya 2B 红外云 API,绕过 LLM+MCP(2-4s→~0.2s)。
     解析: 开/关 + 模式(制冷/制热/除湿/送风/自动) + 温度(X度) + 风速(高/中/低)。
     返回自然语言回复,无明确指令或调用失败时返回空串(回退 brain)。
+
+    AC_DRY_RUN=1 时模拟执行（不调真实设备），用于测试。
     """
     import time as _t
     _ac_start = _t.time()
+    _dry_run = os.getenv("AC_DRY_RUN", "0") == "1"
     try:
         from app.audit_log import audit_log
         audit_log("ac_control", input_data=text, action="voice_command",
                   session_id="voice", source="user")
-    except Exception:
+    except Exception as e:
+        log.debug(f"[agent.device_control] error at line 25: {e}")
         pass
+    if _dry_run:
+        log.warning(f"[ac] 测试模式(AC_DRY_RUN=1)，模拟执行: {text[:30]}")
     try:
         from tuya_api import TuyaCloudAPI
     except Exception as e:
@@ -30,7 +95,8 @@ def direct_ac_control(text: str) -> str:
             audit_log("ac_control", input_data=text, success=False, error=str(e),
                       action="import_failed", session_id="voice", source="user",
                       duration_ms=(_t.time()-_ac_start)*1000)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[agent.device_control] error at line 38: {e}")
             pass
         return ""
     infrared_id = os.getenv("TUYA_IR_DEVICE_ID", "")
@@ -44,6 +110,12 @@ def direct_ac_control(text: str) -> str:
         return ""
     t = text.strip()
 
+    # 否定守卫："不要开空调"/"别开空调" 会被下面的子串匹配误判成开机指令，
+    # 真实操作电器前必须放弃快路径，交给 brain 结合上下文判断
+    if re.search(r"不要|不用|不想|无需|不必|别开|别关|别再", t):
+        log.info(f"[ac] 否定语句跳过快路径: {t[:30]}")
+        return ""
+
     # 关机判断：只匹配明确的祈使指令（"关空调"/"关闭空调"/"把空调关掉"等），
     # 不匹配疑问句/质问句（"你是不是把空调关了"/"空调是不是关了"等）。
     # 历史误触发案例：ASR识别出"你是不是把客厅空调给关了"→ 旧逻辑把空调关了。
@@ -51,26 +123,57 @@ def direct_ac_control(text: str) -> str:
     _power_off_cmd = bool(re.search(
         r"^(?:帮我把?)?(?:关(?:闭|掉|上)?)(?:一下)?\s*(?:客厅)?(?:空调|电扇)"
         r"|(?:帮我把?)?(?:客厅)?(?:空调|电扇)\s*关(?:闭|掉|上)?"
-        r"|关了空调$",
+        r"|关了空调$"
+        r"|把空调关了"
+        r"|把空调关掉"
+        r"|空调关掉"
+        r"|空调关了吧",
         t))
     if _power_off_cmd and not _is_question:
+        # 陈述句防误触："我不小心把空调关了" 是陈述不是指令。
+        # 祈使特征：带 帮/请/麻烦，或非第一人称开头（"我要关空调"不匹配关机模式）
+        if re.match(r"^\s*我", t) and not any(k in t for k in ("帮", "请", "麻烦")) \
+                and not any(k in t for k in ("我要", "我想")):
+            log.info(f"[ac] 陈述句跳过关机快路径: {t[:30]}")
+            return ""
         try:
+            if _dry_run:
+                log.warning(f"[ac] 测试模式: 模拟关机 → power=0")
+                return "好的，空调已关闭（测试模式）。"
             log.info(f"[ac] 查询当前状态: infrared={infrared_id[:8]}... remote={remote_id[:8]}...")
-            cur = api.ac_status(infrared_id, remote_id)
-            log.info(f"[ac] 操作前状态: power={cur.get('power')} mode={cur.get('mode')} temp={cur.get('temp')}°C wind={cur.get('wind')}")
-            api.ac_scenes_command(infrared_id, remote_id, power=0)
-            log.info(f"[ac] 直连关机: ASR={t[:20]} → power=0")
+            cur = None
+            try:
+                cur = api.ac_status(infrared_id, remote_id)
+                log.info(f"[ac] 操作前状态: power={cur.get('power')} mode={cur.get('mode')} temp={cur.get('temp')}°C wind={cur.get('wind')}")
+            except Exception as e:
+                log.warning(f"[ac] 状态查询失败，仍尝试关机: {e}")
+            _timeout_msg = "空调指令发送超时，请稍后重试"
+
+            def _do_power_off():
+                return api.ac_scenes_command(infrared_id, remote_id, power=0)
+
+            _ok = _run_ac_with_timeout(_do_power_off, timeout=8.0, timeout_msg=_timeout_msg)
+            if isinstance(_ok, tuple):
+                _ok = _ok[0]
             try:
                 from app.audit_log import audit_log
-                audit_log("ac_control", input_data=t, output_data="power=0",
-                          action="power_off", session_id="voice", source="user",
+                audit_log("ac_control", input_data=t,
+                          output_data="power=0" if _ok else "power=0 FAILED",
+                          success=_ok, action="power_off", session_id="voice",
+                          source="user",
                           duration_ms=(_t.time()-_ac_start)*1000)
-            except Exception:
+            except Exception as e:
+                log.debug(f"[agent.device_control] error at line 83: {e}")
                 pass
+            if not _ok:
+                # 部分命令失败时如实反馈，不能播报假成功让用户以为已关闭
+                log.warning(f"[ac] 关机指令未全部生效: ASR={t[:20]}")
+                return "空调指令可能没生效，请稍后再说一次。"
+            log.info(f"[ac] 直连关机: ASR={t[:20]} → power=0")
             return "好的，空调已关闭。"
         except Exception as e:
             log.warning(f"[ac] 关机失败: {e}")
-            return ""
+            return "空调指令发送失败，请稍后重试。"
 
     power = False
     mode = None
@@ -118,18 +221,38 @@ def direct_ac_control(text: str) -> str:
     if power:
         eff_temp = max(16, min(30, temp if temp is not None else 26))
         try:
+            if _dry_run:
+                mode_str = {0: "制冷", 1: "制热", 2: "自动", 3: "送风", 4: "除湿"}.get(mode, "")
+                fan_str = {1: "低风", 2: "中风", 3: "高风"}.get(fan, "")
+                reply = f"空调已打开，{mode_str}，{eff_temp}度{f'，{fan_str}' if fan_str else ''}（测试模式）。"
+                log.warning(f"[ac] 测试模式: 模拟开机 → {reply}")
+                return reply
             log.info(f"[ac] 查询当前状态: infrared={infrared_id[:8]}... remote={remote_id[:8]}...")
             cur = api.ac_status(infrared_id, remote_id)
             log.info(f"[ac] 操作前状态: power={cur.get('power')} mode={cur.get('mode')} temp={cur.get('temp')}°C wind={cur.get('wind')}")
             log.info(f"[ac] 发送指令: power=1 mode={mode} temp={eff_temp} wind={fan} (ASR={t[:30]})")
-            api.ac_scenes_command(infrared_id, remote_id, power=1, mode=mode, temp=eff_temp, wind=fan)
+            _timeout_msg = "空调指令发送超时，请稍后重试"
+
+            def _do_power_on():
+                return api.ac_scenes_command(infrared_id, remote_id, power=1, mode=mode, temp=eff_temp, wind=fan)
+
+            _ok = _run_ac_with_timeout(_do_power_on, timeout=8.0, timeout_msg=_timeout_msg)
+            if isinstance(_ok, tuple):
+                _ok = _ok[0]
             try:
                 from app.audit_log import audit_log
-                audit_log("ac_control", input_data=t, output_data=f"power=1 mode={mode} temp={eff_temp} wind={fan}",
-                          action="power_on", session_id="voice", source="user",
+                audit_log("ac_control", input_data=t,
+                          output_data=f"power=1 mode={mode} temp={eff_temp} wind={fan}" + ("" if _ok else " FAILED"),
+                          success=_ok, action="power_on", session_id="voice",
+                          source="user",
                           duration_ms=(_t.time()-_ac_start)*1000)
-            except Exception:
+            except Exception as e:
+                log.debug(f"[agent.device_control] error at line 152: {e}")
                 pass
+            if not _ok:
+                # 设备可能处于半配置状态（如开机成功但温度未下发），如实反馈
+                log.warning(f"[ac] 开机指令未全部生效: ASR={t[:30]}")
+                return "空调指令可能没生效，请稍后再说一次。"
             parts = ["空调已打开"]
             if mode is not None:
                 parts.append({0: "制冷", 1: "制热", 2: "自动", 3: "送风", 4: "除湿"}[mode])
@@ -141,12 +264,13 @@ def direct_ac_control(text: str) -> str:
             return reply
         except Exception as e:
             log.warning(f"[ac] 开机失败: {e}")
-            return ""
+            return "空调指令发送失败，请稍后重试。"
     return ""
 
 
 def set_volume(delta_pct: int) -> bool:
     """跨平台系统音量增减(delta_pct 正=调大/负=调小)。返回是否成功。"""
+    delta_pct = max(-100, min(100, delta_pct))  # clamp 到 [-100,100]
     _sys = platform.system()
     try:
         if _sys == "Darwin":
