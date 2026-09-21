@@ -99,7 +99,7 @@ from agent.asr_tts import (
     _TTS_CODE_BLOCK_RE, _TTS_INLINE_CODE_RE, _TTS_LIST_ITEM_RE, _TTS_MARKDOWN_LINK_RE, _TTS_WHITESPACE_RE,
 )
 from agent.state import update_user_state, get_user_state, _infer_user_state, _user_state, _user_state_lock
-from agent.system_msg import _build_system_msg, _build_user_profile, invalidate_system_msg_cache, _MCP_SYSTEM_PROMPTS
+from agent.system_msg import _build_system_msg, _build_user_profile, invalidate_system_msg_cache, _build_tools_doc
 
 # ===== 向后兼容: 共享状态别名 (tests 和外部代码引用 voice_agent._xxx) =====
 # 可变对象 (dict, lock, OrderedDict) — 直接引用同一对象
@@ -234,6 +234,73 @@ def _decision_feedback_handler(text: str, session_id: str = "default") -> str | 
     return None
 
 
+# ===== 用户画像捕获（USER_PROFILE_ENABLED / AUTOSTORE 门控，默认不触发、零行为变更）=====
+def _capture_profile(text: str, session_id: str, assistant_reply: str) -> None:
+    """把本轮对话里的用户画像信号落库，喂给 user_profile 门面的读路径。
+
+    默认全不触发（两个开关都默认 0）。只有在明确开启后才会有副作用：
+      - USER_PROFILE_ENABLED=1：解析用户显式画像指令（我喜欢X/我住在X/说简短点/
+        记住X）→ record_explicit 立即路由落库（写的是既有库，非新增存储）。
+      - USER_PROFILE_AUTOSTORE=1：每轮后台抽取沉淀 → apply_extracted（含敏感闸）。
+
+    纯后台动作，绝不影响返回值与延迟；任何异常都静默吞掉。
+    """
+    if os.getenv("USER_PROFILE_ENABLED") != "1" and os.getenv("USER_PROFILE_AUTOSTORE") != "1":
+        return
+    try:
+        import threading as _pt
+        import contextvars as _cv
+        _ctx = _cv.copy_context()
+        from agent.user_profile import record_explicit, apply_extracted
+
+        def _run() -> None:
+            try:
+                if os.getenv("USER_PROFILE_ENABLED") == "1":
+                    record_explicit(session_id, text)
+                if os.getenv("USER_PROFILE_AUTOSTORE") == "1":
+                    apply_extracted(session_id, text, assistant_reply)
+            except Exception as _e:
+                log.debug(f"[user_profile] 捕获落库跳过: {_e}")
+
+        _pt.Thread(target=lambda: _ctx.run(_run), daemon=True).start()
+    except Exception as _e:
+        log.debug(f"[user_profile] 捕获线程启动跳过: {_e}")
+
+
+# ===== Laya + Needle3 工具快路径 =====
+def _laya_tool_fastpath(text: str, session_id: str = "default") -> str | None:
+    """Laya 中文意图路由 + Needle3 英文工具执行的端侧快路径（LAYA_TOOL_ENABLED=1）。
+
+    在 LLM 之前拦截中文**只读/可逆**工具意图，由 Laya+Needle3 双引擎直接解析
+    并执行 charlie 真实工具，省一次云端 LLM fncall 循环。写操作（add_reminder/
+    play_music）默认只规划不执行；不确定/澄清/闲聊都返回 None 落回 _brain_llm。
+
+    默认关闭（不进生产路径）；这是 decider-first 精神在工具侧的延伸。所有异常
+    静默兜底为 None——它在语音热路径上，绝不能因为它崩了而让用户没话。
+    """
+    if os.getenv("LAYA_TOOL_ENABLED") != "1":
+        return None
+    try:
+        from scripts.laya_needle_bridge import LayaNeedleBridge
+        bridge = LayaNeedleBridge()
+        plan = bridge.execute(text, allow_writes=False)
+        action = plan.get("action")
+        # 只有真实执行成功（只读/可逆工具）才采信；其余一律落回 LLM
+        if action == "call" and plan.get("executed") is True:
+            result = plan.get("result") or ""
+            log.info(f"[laya_tool] 端侧工具命中 {plan.get('name')} "
+                     f"(intent={plan.get('intent')}, {plan.get('latency_ms')}ms)")
+            return str(result)
+        if action == "clarify":
+            # 槽位缺失：回澄清问句，让 LLM 后续轮接住
+            return plan.get("clarify_question")
+        # action == "chitchat" / 未执行：静默落回 LLM
+        return None
+    except Exception as e:
+        log.warning(f"[laya_tool] 快路径异常，落回 LLM: {e}")
+        return None
+
+
 # ===== brain() 公共入口 =====
 def brain(text: str, session_id: str = "default") -> str:
     """大脑推理: 系统控制快路径(角色切换/社交) → LLM 意图分类 → MCP 工具调用。"""
@@ -241,6 +308,18 @@ def brain(text: str, session_id: str = "default") -> str:
     _start = _t.time()
     log.debug(f"[brain] 收到请求: {text[:50]}")
     try:
+        # 多轮指代消解（MULTITURN_COREF_ENABLED=1）：把当前句的"它/那个/那首歌"
+        # 等就近还原成字面实体，喂给后续所有路径（含 Laya 快路径、LLM）。默认关，
+        # 关时 text 原样透传、零行为变更。
+        if os.getenv("MULTITURN_COREF_ENABLED") == "1":
+            try:
+                from agent.coreference import resolve_for_session
+                _resolved, _changed, _map = resolve_for_session(text, session_id)
+                if _changed:
+                    log.info(f"[coref] 消解: {text!r} → {_resolved!r} {_map}")
+                    text = _resolved
+            except Exception as _e:
+                log.debug(f"[coref] 消解跳过，原句透传: {_e}")
         _cmd_reply = _handle_smart_command(text)
         if _cmd_reply is not None:
             _append_history(_get_history(session_id), text, _cmd_reply)
@@ -292,11 +371,32 @@ def brain(text: str, session_id: str = "default") -> str:
         # garbled 判定误杀，而快路径是明确关键词匹配，乱码匹配不上自然落到这里）
         if is_garbled_asr(text):
             return LOW_INTENT_ASR_REPLY
+        # Laya + Needle3 工具快路径（LAYA_TOOL_ENABLED=1）：中文工具意图在 LLM
+        # 之前由端侧双引擎直接解析并执行**只读/可逆**工具，省一次云端 LLM fncall
+        # 循环；写操作/不确定/澄清则落回 _brain_llm（LLM 的 fncall 或澄清）。
+        # 默认关闭，不进入生产路径；启用即 decider-first 精神的工具侧延伸。
+        _lt = _laya_tool_fastpath(text, session_id)
+        if _lt is not None:
+            return _lt
+        # 用户画像只读观测（USER_PROFILE_ENABLED=1，P1）：把聚合后的统一画像
+        # 记进审计日志，**只读不改行为**，用于灰度前看画像覆盖率/质量。默认关。
+        if os.getenv("USER_PROFILE_ENABLED") == "1":
+            try:
+                from agent.user_profile import get_user_profile
+                from app.audit_log import audit_log
+                _prof = get_user_profile(session_id)
+                audit_log("user_profile", input_data=text, output_data=_prof,
+                          action="profile_view", session_id=session_id,
+                          duration_ms=(_t.time()-_start)*1000)
+            except Exception as _e:
+                log.debug(f"[user_profile] 画像观测跳过: {_e}")
         result = _brain_llm(text, session_id)
         from app.audit_log import audit_log
         audit_log("brain", input_data=text, output_data=result,
                   action="llm", session_id=session_id,
                   duration_ms=(_t.time()-_start)*1000)
+        # 用户画像捕获（开关门控，默认不触发）：本轮显式/自动信号落库，喂读路径。
+        _capture_profile(text, session_id, result)
         return result
     except Exception as e:
         from app.audit_log import audit_log
@@ -366,6 +466,7 @@ class FastPath:
                   duration_ms=(_t.time()-_start)*1000)
         if reply:
             _append_history(_get_history(session_id), text, reply)
+            _capture_profile(text, session_id, reply)
             return reply
         log.info(f"[{self.name}] 未命中或失败，回退")
         return None

@@ -12,6 +12,9 @@ suggestions_state.json.lock
 suggestions_state.json.runner.lock
 conversation_history.json.lock
 preferences.json.lock
+# FR-14 设备→用户映射（含家庭成员称呼，属个人配置，不入库）
+device_users.json
+device_users.json.tmp.*
 
 # HTTPS证书
 cert/

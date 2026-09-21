@@ -16,86 +16,29 @@ _SYSTEM_MSG_CACHE = {}  # key: (mcp_set, role) → (timestamp, msg)
 _SYSTEM_MSG_TTL = int(os.getenv("SYSTEM_MSG_TTL", "300"))  # 5 分钟
 _SYSTEM_MSG_LOCK = threading.Lock()
 
-_MCP_SYSTEM_PROMPTS = {
+# 域行为注释（static：与 mcp_set 绑定，进缓存）。
+# ⚠️ 这里**只写行为规则/语义提示，不写工具清单**——工具清单由
+# `_derive_tools_line(mcp_set)` 从真实 function_list（resolve_inproc_tools）
+# 实时派生。历史上工具清单手写在这里，结果与真实工具面反复漂移：amap 广告
+# 5 个工具而真实 12 个（calculate/get_exchange_rate/get_holiday_info 等
+# 模型根本不知道存在），filesystem 广告"读写文件"而真实域是 magic-notes
+# 的备忘录工具。手写清单 = 每次增删工具都要记得改两处，必然烂。
+# 2026-09-20 起清单只有一份真源：function_list 本身。
+_DOMAIN_NOTES = {
     "amap-maps": (
-        "可用工具：get_detailed_weather(城市)查详细天气+穿衣建议，get_location()获取当前位置，"
-        "get_news(主题,条数)查新闻，get_current_time()获取当前时间，translate(文本,目标语言)翻译。"
         "调用工具获取真实数据，不要编造天气信息。"
+        "汇率换算用 get_exchange_rate，节假日问询用 get_holiday_info。"
     ),
     "magic-music": (
-        "可用工具：play_music(歌名或歌手名)搜索并播放音乐，search_music(关键词)搜索歌曲，"
-        "play_random_music()随机播放一首，stop_music()停止播放，"
-        "list_playlists()列出歌单，play_playlist()播放歌单或每日推荐。"
-        "\\n播放音乐时不要说话，直接调用工具，不要回复任何文字。"
-    ),
-    "magic-reminder": (
-        "可用工具：add_reminder(文本, 时间)设提醒，set_timer(分钟数, 提示语)倒计时，"
-        "get_calendar_today()读取Apple日历，schedule_task(名称,时间,动作)创建定时任务，"
-        "list_alarms()列出所有闹钟和定时任务。"
-    ),
-    "magic-notes": (
-        "可用工具：save_note(标题, 内容)保存备忘录，list_notes()列出所有备忘录，"
-        "add_shopping_item(商品,数量)添加购物清单，list_shopping_items()查看购物清单，"
-        "clear_shopping_list()清空购物清单。"
-    ),
-    "magic-system": (
-        "可用工具：set_volume(0-100)调音量，set_speech_speed(slow/normal/fast)调语速，"
-        "system_status()查CPU/内存/磁盘/运行时间。"
-    ),
-    "magic-info": (
-        "可用工具：get_current_time()获取当前时间，get_detailed_weather(城市)查天气+穿衣建议，"
-        "get_news(主题, 条数)查新闻，get_location()获取当前位置，"
-        "translate(文本, 目标语言)翻译，calculate(算式)计算或换算，"
-        "run_code(代码)执行Python代码进行数学计算、数据处理等。"
-    ),
-    "magic-life": (
-        "可用工具：open_lifestyle_app(intent)打开外卖/购物/打车等App，"
-        "search_charging_stations(城市)查充电桩，control_tesla_ac(on/off)控特斯拉空调，"
-        "leaving_home()出门场景。"
-    ),
-    "magic-feishu": (
-        "可用工具：search_docs(关键词)搜索飞书云端文档，send_message(用户ID,消息)发送飞书消息，"
-        "list_messages(群聊ID)读取飞书最近的聊天消息，get_calendar()查看飞书日历日程。"
-    ),
-    "magic-douyin": (
-        "可用工具：search_videos(关键词)搜索抖音视频，get_trending()获取抖音热搜，get_video_info(URL)获取视频信息。"
-    ),
-    "magic-taobao": (
-        "可用工具：search_products(关键词)搜索淘宝商品，search_jd(关键词)搜索京东商品，compare_price(商品名)跨平台比价。"
+        "\n播放音乐时不要说话，直接调用工具，不要回复任何文字。"
     ),
     "magic-recipe": (
-        "可用工具：get_recipe(菜名)查菜谱做法(本地346道菜+AI兜底)，"
-        "search_recipe(关键词)按菜名或食材搜索，list_recipes(类别)列出菜谱(可按凉菜/热菜/汤羹/主食等筛选)，"
-        "random_recipe()随机推荐一道，recommend_recipe(食材,菜系)按现有食材推荐，"
-        "recommend_daily()今日个性化推荐(基于口味画像)，recommend_by_context(场景)按场景推荐(如想吃辣的/想吃肉)，"
-        "add_recipe(菜名,食材,步骤,难度,时间)添加菜谱，generate_recipe(菜名,食材)AI生成菜谱。"
         "调用工具拿真实菜谱，不要编造做法。"
     ),
     "magic-apps": (
-        "可用工具：打开微信/支付宝/抖音/今日头条/美团/淘宝/京东/拼多多/大众点评/猫眼/大麦/咸鱼/飞书的网页版。"
-    ),
-    "magic-scenes": (
-        "可用工具：goodnight()晚安模式，good_morning()早安模式，movie_time()电影模式，leaving_home()出门模式。"
-    ),
-    "magic-browser": (
-        "可用工具：browse_page(网址)打开网页，read_page()读取当前页面，"
-        "search_web(搜索词,站点)通过浏览器搜索，click_element(选择器)点击，"
-        "fill_form(选择器,文字)填写表单，screenshot()截取页面截图。"
-    ),
-    "magic-evolution": (
-        "可用工具：learn_from_history()从对话历史学习，self_optimize()自动优化，"
-        "suggest_preferences()建议个性化偏好，evolution_status()查看自进化状态。"
-    ),
-    "baize-skills": (
-        "可用工具：web_search(关键词)搜索互联网，web_search_free(关键词)免费搜索，"
-        "shopping_search(商品)购物推荐，deep_research(主题)深度研究。"
-    ),
-    "filesystem": (
-        "可用工具：读写文件。"
+        "打开对应App的网页版。"
     ),
     "magic-dev": (
-        "可用工具：list_project_files(子目录)列出项目文件，read_file(路径)读取文件内容，"
-        "edit_file(路径, 原文, 新内容)精确替换文件片段。"
         "代码修改前必须先 read_file 查看内容，edit_file 后会记录确认请求，"
         "用户回复'确认'才真正写盘。禁止删除文件、禁止批量修改、禁止访问 .env/.git 等敏感路径。"
     ),
@@ -108,16 +51,69 @@ _MCP_SYSTEM_PROMPTS = {
         "你有视觉能力：可以截图或分析用户提供的图片。"
     ),
     "magic-preferences": (
-        "可用工具：set_pref(偏好名, 值)记住偏好，get_pref(偏好名)查询偏好，"
-        "forget_pref(偏好名)删除偏好，list_prefs()列出所有偏好。"
         "当用户表达偏好（如'以后...''我喜欢...''别再...''我习惯...'）时立即调用 set_pref 记住。"
+    ),
+    "magic-roles": (
+        "用户说'切换到X''变成X''回到默认'时调用 switch_role(角色ID) 切换角色；"
+        "可用角色：charlie（默认）、jarvis、baize。不确定当前有哪些角色先 list_roles()。"
+    ),
+    "magic-jarvis": (
+        "股票/空气质量/地震/赛事数据来自外部接口，可能耗时数秒；"
+        "拿到结果如实转述，不要编造数据，也不要在工具未返回前猜测。"
     ),
 }
 
-def _build_user_profile() -> str:
+# 不进提示的禁用/内部工具：告诉模型有这些工具，只会诱导它去调一个必然
+# 失败的调用（run_code 是 magic-info.py 里因 RCE 风险永久禁用的桩；
+# code_interpreter 同理）。数学计算走 calculate。
+_HIDDEN_TOOLS = {"run_code", "code_interpreter"}
+
+
+def _derive_tools_line(mcp_set: str) -> str:
+    """从真实 function_list 派生"可用工具"行——提示与工具面零漂移的唯一办法。
+
+    名字与参数全部取自 resolve_inproc_tools(mcp_set) 的包装后 BaseTool
+    （.parameters 的 JSON schema properties），模型在 function_list 里收到
+    的完整 schema 与此行严格一致；缺描述的键已在 inproc_tools 侧省略，
+    不会把参数名当描述回填。stdio 回退路径的 brain 与 inproc 加载同一批
+    模块，派生结果同样成立。
+
+    任何失败（模块加载异常等）返回空串——上游照发只有行为注释的系统提示，
+    不比现在差。首访有 _tool_cache，brain 构建时工具已加载过，无额外延迟。
+    """
+    try:
+        from agent.inproc_tools import resolve_inproc_tools
+        tools = resolve_inproc_tools(mcp_set)
+    except Exception as e:
+        log.debug(f"[agent.system_msg] 工具清单派生失败({mcp_set}): {e}")
+        return ""
+    parts = []
+    for t in tools:
+        if t.name in _HIDDEN_TOOLS:
+            continue
+        props = list(((t.parameters or {}).get("properties") or {}).keys())
+        parts.append(f"{t.name}({', '.join(props)})" if props
+                     else f"{t.name}()")
+    if not parts:
+        return ""
+    return "可用工具：" + "，".join(parts) + "。"
+
+
+def _build_tools_doc(mcp_set: str) -> str:
+    """域工具文档 = 真实派生的工具清单 + 手写的行为注释。"""
+    line = _derive_tools_line(mcp_set)
+    notes = _DOMAIN_NOTES.get(mcp_set, "")
+    return line + notes if notes else line
+
+def _build_user_profile(uid: str | None = None) -> str:
     try:
         import json as _json
-        uid = os.environ.get("CHARLIE_USER_ID", _current_user_id)
+        if not uid:
+            try:
+                from agent.user_context import resolve_user
+                uid = resolve_user()
+            except Exception:
+                uid = os.environ.get("CHARLIE_USER_ID", _current_user_id) or "default"
         _evolution_file = os.path.join(DATA_DIR, f"evolution_data_{uid}.json" if uid != "default" else "evolution_data.json")
         if not os.path.exists(_evolution_file):
             return ""
@@ -183,7 +179,8 @@ def _replace_system_msg_for_channel(sys_msg: str, channel: str) -> str:
     if channel == "voice":
         _VOICE_CONSTRAINT = (
             "（语音回复：最多2句、40字以内，先给结论；禁止markdown、列表、emoji。"
-            "天气等结构化信息首句短答，细节等用户追问。）"
+            "天气等结构化信息首句短答，细节等用户追问。"
+            "禁止任何方括号标记（如[状况/结果]、[导航已启动]），直接说内容本身。）"
         )
         return sys_msg.replace(_VOICE_RULE, _VOICE_CONSTRAINT)
     if channel == "feishu_text":
@@ -195,24 +192,38 @@ def _replace_system_msg_for_channel(sys_msg: str, channel: str) -> str:
     return sys_msg
 
 
-def _build_system_msg(mcp_set: str = "none", session_id: str = "default") -> str:
-    """返回完整 system_msg：static 段走 TTL 缓存，dynamic 段每轮实时拼。调用方零改动。"""
+def _build_system_msg_static_cached(mcp_set: str = "none") -> str:
+    """静态段的缓存入口：命中 `_SYSTEM_MSG_CACHE` 则零重建，否则构建并写入。
+
+    与 `_build_system_msg` 共用同一个缓存桶与同一个键 `(mcp_set, role)`：
+    静态段本来就与 session/user 无关，`_build_system_msg` 缓存过的值
+    这里能直接复用，反之亦然。
+
+    主要给 `agent/llm.py:_get_brain` 用：它每轮都要把静态段刷回共享的
+    `brain.system_message`。以前直接调 `_build_system_msg_static`，等于每轮
+    重跑一遍 persona/规则/工具文档拼接（还顺手把共享对象写脏）；现在命中
+    缓存时返回的是**同一个字符串对象**，TTL（默认 300s）内零重建。
+    """
     from agent.roles import get_current_role
-    # 缓存键只用 mcp_set + role（不含 session_id）：static 段与 session_id 无关
     cache_key = (mcp_set, get_current_role())
     now = time.time()
     with _SYSTEM_MSG_LOCK:
         cached = _SYSTEM_MSG_CACHE.get(cache_key)
         if cached and now - cached[0] < _SYSTEM_MSG_TTL:
-            static_part = cached[1]
-        else:
-            static_part = None
-    if static_part is None:
-        static_part = _build_system_msg_static(mcp_set)
-        with _SYSTEM_MSG_LOCK:
-            current_role = get_current_role()
-            if current_role == cache_key[1]:
-                _SYSTEM_MSG_CACHE[cache_key] = (now, static_part)
+            return cached[1]
+    static_part = _build_system_msg_static(mcp_set)
+    with _SYSTEM_MSG_LOCK:
+        #  race-proof：构建期间角色被切走就不写缓存，避免 A 角色的静态段
+        #  被贴到 B 角色的键上（5 分钟 TTL 内持续串角色）
+        current_role = get_current_role()
+        if current_role == cache_key[1]:
+            _SYSTEM_MSG_CACHE[cache_key] = (now, static_part)
+    return static_part
+
+
+def _build_system_msg(mcp_set: str = "none", session_id: str = "default") -> str:
+    """返回完整 system_msg：static 段走 TTL 缓存，dynamic 段每轮实时拼。调用方零改动。"""
+    static_part = _build_system_msg_static_cached(mcp_set)
     dynamic_part = _build_system_msg_dynamic(session_id)
     return static_part + dynamic_part
 
@@ -322,24 +333,66 @@ def _build_system_msg_static(mcp_set: str = "none") -> str:
         result += (
             "\n\n✅ AI 大脑已就绪，正在调用 LLM 推理。"
         )
-    # MCP 工具文档（static：与 mcp_set 绑定，进缓存）
-    tools_doc = _MCP_SYSTEM_PROMPTS.get(mcp_set, "")
+    # MCP 工具文档（static：与 mcp_set 绑定，进缓存）。
+    # 清单来自真实 function_list 派生，行为注释手写于 _DOMAIN_NOTES——
+    # 派生是 mcp_set 的纯函数，缓存键 (mcp_set, role) 依然成立。
+    tools_doc = _build_tools_doc(mcp_set)
     if tools_doc:
         result += f"\n{tools_doc}"
-    # persona prompt（static：当前角色 persona 不变时内容不变）
-    try:
-        from agent.persona import get_persona_prompt, contextual_response_style
-        result += get_persona_prompt()
-        result += contextual_response_style()
-    except Exception as e:
-        log.debug(f"[agent.system_msg] error at line 342: {e}")
-        pass
+    # ⚠️ persona 段**已移出** static（FR-14 批次 5）。
+    #
+    # `get_persona_prompt()` / `contextual_response_style()` 都按 uid 读
+    # `persona_state_{uid}.json`（mood / emotion / relationship_level）—— 是**用户态**，
+    # 而 static 段的缓存键是 `(mcp_set, role)`（`_build_system_msg` 第 207 行），
+    # **不含 uid**；更要命的是 `agent/llm.py:952` 把它写进
+    # `brain.system_message`，而 brain 本身按 mcp_set 缓存（`_st.brains[mcp_set]`）。
+    #
+    # 于是"谁先说话谁的人格被烤进共享 brain"，5 分钟 TTL（`_SYSTEM_MSG_TTL=300`）内
+    # 妈妈会拿到老于的心情与亲密度 —— 与本批次修的角色/音色串台是同一族。
+    #
+    # 现在移到 `_build_system_msg_dynamic(uid)`：那里 uid 按会话正确解析，
+    # 且每轮实时拼、不进缓存（顺带修掉 persona 变化后最长 5 分钟不生效的陈旧问题）。
     return result
 
 
-def _build_system_msg_dynamic(session_id: str = "default") -> str:
-    """构建 system_msg 的动态段：每轮实时拼，不进缓存。"""
+def _build_system_msg_dynamic(session_id: str = "default", uid: str | None = None) -> str:
+    """构建 system_msg 的动态段：每轮实时拼，不进缓存。
+
+    uid 为空时按当前用户解析（FR-14 多人场景）。
+    """
     parts: list[str] = []
+    # 0. persona 人格段（FR-14 批次 5：从 static 段移来）
+    #
+    # ⚠️ 必须在 dynamic 段，且必须传 `uid`：
+    # `get_persona_prompt()` / `contextual_response_style()` 读的是
+    # `persona_state_{uid}.json` 里的 mood / emotion / relationship_level ——
+    # 一旦留在 static 段就会被 `(mcp_set, role)` 缓存 + 烤进共享 brain，
+    # 变成"谁先说话谁的人格"（详见 `_build_system_msg_static` 末尾的注释）。
+    #
+    # 放在 dynamic 首位 = 紧跟在 static 段之后，与改造前**位置相同**。
+    try:
+        from agent.persona import get_persona_prompt, contextual_response_style
+        _persona_txt = (get_persona_prompt(uid) or "") + (contextual_response_style(uid=uid) or "")
+        if _persona_txt:
+            parts.append(_persona_txt)
+    except Exception as _e_persona:
+        log.debug(f"[persona] 人格注入跳过: {_e_persona}")
+    # 0b. 设备所在房间（FR-14 批次 6）
+    #
+    # 为什么在 dynamic 段：房间是**按设备/按会话**的事实，不是用户态也不是全局态。
+    # 放进 static 段会被 `(mcp_set, role)` 缓存 ⇒ 第一次说话那台设备的房间
+    # 会被烤进共享 brain，之后所有入口都自称在同一个房间（与 persona 段同一个坑）。
+    #
+    # 只在真的配了房间时才拼 —— 默认（没有 `device_users.json` / 没设房间）
+    # 输出与改造前**逐字节一致**，不会污染任何既有断言。
+    # 非 `xiaozhi-*` 形状的 session（HTTP /ws、飞书）没有设备归属，返回 None。
+    try:
+        from agent.device_users import room_for_session
+        _room = room_for_session(session_id)
+        if _room:
+            parts.append(f"\n当前设备位置：{_room}")
+    except Exception as _e_room:
+        log.debug(f"[device_users] 房间注入跳过: {_e_room}")
     # 1. 历史对话摘要（按 session_id 隔离，NB6）
     try:
         from agent.history import _context_summaries
@@ -352,7 +405,7 @@ def _build_system_msg_dynamic(session_id: str = "default") -> str:
     # 2. 用户偏好
     try:
         from agent.preferences import list_preferences
-        _pref_items = list_preferences()
+        _pref_items = list_preferences(uid)
         if _pref_items:
             _pref_txt = "、".join(f"{k}={v}" for k, v in list(_pref_items.items())[:8])
             parts.append(f"\n用户偏好：{_pref_txt}")
@@ -361,15 +414,26 @@ def _build_system_msg_dynamic(session_id: str = "default") -> str:
     # 2b. 情感基调（每轮动态，不进缓存）
     try:
         from agent.persona import get_current_mood
-        _mood = get_current_mood()
+        _mood = get_current_mood(uid)
         if _mood and _mood != "neutral":
             parts.append(f"\n当前情绪基调：{_mood}，回复语气与之匹配。")
     except Exception:
         pass
     # 3. user profile
-    _profile_parts = _build_user_profile()
+    _profile_parts = _build_user_profile(uid)
     if _profile_parts:
         parts.append("\n" + _profile_parts)
+    # 3b. 统一用户画像注入（USER_PROFILE_INJECT=1，P4）：把 reply_style/喜好/位置
+    #     聚合成一段。默认关——关时下面整段不执行，输出与改造前逐字节一致。
+    #     只放稳定持久字段，情绪人设仍由上面 persona 通道负责，避免重复/打架。
+    try:
+        if os.getenv("USER_PROFILE_INJECT") == "1":
+            from agent.user_profile import get_user_profile, format_profile_for_prompt
+            _up_frag = format_profile_for_prompt(get_user_profile(session_id), uid)
+            if _up_frag:
+                parts.append("\n" + _up_frag)
+    except Exception as _e_up:
+        log.debug(f"[user_profile] 画像注入跳过: {_e_up}")
     # 4. magic_memory 记忆注入
     try:
         from app import load_magic_module
@@ -377,7 +441,11 @@ def _build_system_msg_dynamic(session_id: str = "default") -> str:
         if _mem:
             try:
                 from agent.history import get_recent_user_message
-                _recent_msg = get_recent_user_message()
+                # 必须传 session_id + uid：记忆检索以"本会话最近一句用户消息"
+                # 为 query，原来恒取 default 会话——MQTT/飞书/多会话入口下
+                # 检索的是另一个会话的话题，召回全偏；uid 让磁盘回落读本人
+                # 分片而不是绑定/默认用户的（FR-14 隔离）。
+                _recent_msg = get_recent_user_message(session_id, uid)
             except Exception:
                 _recent_msg = ""
             _memories_text = _mem.format_memories_for_prompt(_recent_msg, limit=2)
@@ -388,7 +456,7 @@ def _build_system_msg_dynamic(session_id: str = "default") -> str:
     # 4b. SQLite 长期记忆注入 (memory_store)
     try:
         from agent.history import get_recent_user_message as _grum2
-        _recent_msg2 = _grum2()
+        _recent_msg2 = _grum2(session_id, uid)
     except Exception:
         _recent_msg2 = ""
     try:
@@ -401,7 +469,7 @@ def _build_system_msg_dynamic(session_id: str = "default") -> str:
     # 5. format_context_for_prompt（待办/日历等实时上下文）
     try:
         from agent.context import format_context_for_prompt
-        ctx_snippet = format_context_for_prompt(session_id=session_id)
+        ctx_snippet = format_context_for_prompt(session_id=session_id, uid=uid)
         if ctx_snippet:
             parts.append("\n\n📌 上下文感知：\n" + ctx_snippet)
     except Exception as e:
