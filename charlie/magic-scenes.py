@@ -17,7 +17,7 @@ __mcp_meta__ = {
 }
 
 from mcp.server.fastmcp import FastMCP
-import os, requests, datetime as _datetime, subprocess, json as _json, threading, time, logging, re
+import os, requests, datetime as _datetime, subprocess, json as _json, threading, time, logging, re, tempfile
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
