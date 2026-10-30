@@ -32,19 +32,36 @@ class ReminderRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=200)
     time: str = Field(default="")
     repeat: str = Field(default="")
+    # FR-14：显式指定归属用户；不传 = "default"（广播），**不读 env**
+    user: str = Field(default="")
 
 @router.get("/api/reminders")
 async def list_reminders(request: Request):
-    cached = file_not_modified_response(request, REMINDERS_FILE, "reminders")
+    """提醒列表。
+
+    `?user=` 不传 ⇒ **全局视图**（管理台没有用户身份，默认按 env 过滤会
+    让管理台看不到家人通过语音设的提醒）；传了 ⇒ 只返回该用户的。
+    """
+    user = (request.query_params.get("user") or "").strip()
+    scope = user or "all"
+    cached = file_not_modified_response(request, REMINDERS_FILE, f"reminders:{scope}")
     if cached is not None:
         return cached
-    reminders_token = file_etag_token(REMINDERS_FILE, "reminders")
+    reminders_token = file_etag_token(REMINDERS_FILE, f"reminders:{scope}")
     data = _load_reminders()
-    reminders_token_after_load = file_etag_token(REMINDERS_FILE, "reminders")
+    reminders_token_after_load = file_etag_token(REMINDERS_FILE, f"reminders:{scope}")
+    if user:
+        from app.reminders import reminder_owner
+        data = [r for r in data if reminder_owner(r) == user]
     pending = [r for r in data if not r.get("done")]
+    for r in data:
+        # 让前端能看出每条属于谁（旧数据按 default 展示）
+        from app.reminders import reminder_owner
+        r.setdefault("owner", reminder_owner(r))
     return json_response(
         request,
-        {"total": len(data), "pending": len(pending), "reminders": data},
+        {"total": len(data), "pending": len(pending), "reminders": data,
+         "scope": scope},
         etag_token=reminders_token if reminders_token == reminders_token_after_load else None,
     )
 
@@ -58,16 +75,20 @@ async def add_reminder(req: ReminderRequest):
     if time_str:
         from utils import parse_time_str
         due = parse_time_str(time_str)
+    # 显式传了 user 才定向；不传就是 broadcast（写路径刻意不读 env）
+    owner = _sanitize_text(req.user, 64) if req.user else None
     if repeat:
-        item = append_reminder(text, time_str, due, repeat=repeat)
+        item = append_reminder(text, time_str, due, repeat=repeat, owner=owner)
     else:
-        item = append_reminder(text, time_str, due)
+        item = append_reminder(text, time_str, due, owner=owner)
     rid = item["id"]
     when = f"，提醒时间{due.replace('T', ' ')}" if due else (f"（时间'{time_str}'未解析出时刻）" if time_str else "")
     repeat_desc = {"daily": "（每天重复）", "weekly": "（每周重复）", "weekdays": "（工作日重复）"}.get(repeat, "")
     audit_log("api:reminders", input_data=f"text={text} time={time_str} repeat={repeat}",
               output_data=f"id={rid}", action="add")
-    return {"ok": True, "id": rid, "message": f"已添加提醒：{text}{when}{repeat_desc}"}
+    from app.reminders import reminder_owner
+    return {"ok": True, "id": rid, "owner": reminder_owner(item),
+            "message": f"已添加提醒：{text}{when}{repeat_desc}"}
 
 @router.delete("/api/reminders/{rid}")
 async def delete_reminder(rid: int):

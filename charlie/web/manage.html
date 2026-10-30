@@ -49,6 +49,7 @@ input,select{padding:6px 10px;border:1px solid #333;border-radius:6px;background
   <button onclick="showTab('mcp')">MCP工具</button>
   <button onclick="showTab('tts')">TTS音色</button>
   <button onclick="showTab('latency')">延迟监控</button>
+  <button onclick="showTab('devices')">设备与用户</button>
 </div>
 
 <div id="tab-status"><div class="card"><h3>加载中...</h3></div></div>
@@ -60,6 +61,7 @@ input,select{padding:6px 10px;border:1px solid #333;border-radius:6px;background
 <div id="tab-mcp" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
 <div id="tab-tts" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
 <div id="tab-latency" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
+<div id="tab-devices" style="display:none"><div class="card"><h3>加载中...</h3></div></div>
 
 <script>
 const API = '';
@@ -71,7 +73,7 @@ function showTab(name) {
   document.querySelectorAll('[id^="tab-"]').forEach(d => d.style.display = 'none');
   document.getElementById('tab-'+name).style.display = 'block';
   document.querySelectorAll('#tabs button').forEach(b => {
-    if (b.textContent.includes({status:'系统状态',memories:'记忆',decisions:'决策',protocols:'协议',evolution:'进化',logs:'日志',mcp:'MCP工具',tts:'TTS音色',latency:'延迟监控'}[name])) b.classList.add('active');
+    if (b.textContent.includes({status:'系统状态',memories:'记忆',decisions:'决策',protocols:'协议',evolution:'进化',logs:'日志',mcp:'MCP工具',tts:'TTS音色',latency:'延迟监控',devices:'设备与用户'}[name])) b.classList.add('active');
   });
   loadTab(name);
 }
@@ -98,6 +100,7 @@ function loadTab(name) {
     case 'mcp': loadMCP(); break;
     case 'tts': loadTTS(); break;
     case 'latency': loadLatency(); break;
+    case 'devices': loadDevices(); break;
   }
 }
 
@@ -478,6 +481,144 @@ async function loadLatency() {
   } catch(e) {
     document.getElementById('tab-latency').innerHTML = '<div class="card"><h3>延迟数据加载失败</h3></div>';
   }
+}
+
+// === 设备与用户（FR-14 批次 6）===
+let _devicesCache = {};
+
+async function loadDevices() {
+  try {
+    const data = await fetchJSON('/api/device-users');
+    _devicesCache = data || {};
+    renderDevices();
+  } catch (e) {
+    document.getElementById('tab-devices').innerHTML =
+      '<div class="card"><h3>设备接口不可用</h3></div>';
+  }
+}
+
+function renderDevices() {
+  const data = _devicesCache || {};
+  const mappings = data.mappings || {};
+  const rooms = data.rooms || {};
+  const roomUsers = data.room_users || {};
+  const online = data.online_devices || [];
+
+  const onlineHtml = online.length
+    ? online.map(d => `
+        <div class="item">
+          <div>
+            <span class="status-dot ${d.source === 'none' ? 'warn' : 'ok'}"></span>
+            ${escHtml(d.device_key) || '(未知设备)'}
+            <span style="font-size:10px;color:#888">${escHtml(d.source)}</span>
+          </div>
+          <div>${escHtml(d.bound_user || '未绑定')}</div>
+        </div>`).join('')
+    : '<div class="item">当前没有在线设备</div>';
+
+  // 合并 devices / rooms 两张表的 key，一行一台设备
+  const keys = Array.from(new Set([...Object.keys(mappings), ...Object.keys(rooms)])).sort();
+  const rows = keys.length
+    ? keys.map(k => `
+        <div class="item">
+          <div>
+            <div>${escHtml(k)}</div>
+            <div style="font-size:10px;color:#888">用户: ${escHtml(mappings[k] || '未绑定')} · 房间: ${escHtml(rooms[k] || '—')}</div>
+          </div>
+          <div class="btn-row" style="margin:0">
+            <button data-act="bind" data-key="${escHtml(k)}">绑定</button>
+            <button data-act="clear-room" data-key="${escHtml(k)}">清除房间</button>
+            <button data-act="remove" data-key="${escHtml(k)}">移除</button>
+          </div>
+        </div>`).join('')
+    : '<div class="item">还没有绑定任何设备</div>';
+
+  const roomUserKeys = Object.keys(roomUsers).sort();
+  const roomUserRows = roomUserKeys.length
+    ? roomUserKeys.map(r => `
+        <div class="item">
+          <div>${escHtml(r)} → ${escHtml(roomUsers[r])}</div>
+          <div class="btn-row" style="margin:0">
+            <button data-act="room-unbind" data-key="${escHtml(r)}">解绑</button>
+          </div>
+        </div>`).join('')
+    : '<div class="item">还没有房间兜底绑定</div>';
+
+  const html = `
+    <div class="card">
+      <h3>在线设备</h3>
+      ${onlineHtml}
+    </div>
+    <div class="card">
+      <h3>设备绑定</h3>
+      ${rows}
+      <div class="btn-row">
+        <button data-act="add-device">新增/修改绑定</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>房间兜底（设备没绑定时按房间推身份）</h3>
+      ${roomUserRows}
+      <div class="btn-row">
+        <button data-act="add-room-user">新增/修改房间绑定</button>
+      </div>
+    </div>
+  `;
+  const container = document.getElementById('tab-devices');
+  container.innerHTML = html;
+  bindDeviceEvents(container);
+}
+
+// 动态数据一律走 data-* + 事件委托，不拼 onclick 字符串（避免 XSS）
+function bindDeviceEvents(container) {
+  container.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('button[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    const key = btn.dataset.key || '';
+    try {
+      if (act === 'bind') {
+        const uid = prompt('绑定到哪个用户？（留空 = 解绑）', _devicesCache.mappings?.[key] || '');
+        if (uid === null) return;
+        await postDeviceUsers({ device_key: key, user_id: uid });
+      } else if (act === 'clear-room') {
+        await postDeviceUsers({ device_key: key, user_id: _devicesCache.mappings?.[key] || '', clear_room: true });
+      } else if (act === 'remove') {
+        if (!confirm('移除设备 ' + key + ' 的绑定？')) return;
+        await fetch(API + '/api/device-users?device_key=' + encodeURIComponent(key), { method: 'DELETE' }).then(r => r.json());
+        await loadDevices();
+      } else if (act === 'add-device') {
+        const k = prompt('设备标识 device_key（如 aa:bb:cc:dd:ee:ff）');
+        if (!k) return;
+        const uid = prompt('绑定到哪个用户？') || '';
+        const room = prompt('房间名（可留空）') || '';
+        await postDeviceUsers({ device_key: k, user_id: uid, room: room });
+      } else if (act === 'add-room-user') {
+        const room = prompt('房间名');
+        if (!room) return;
+        const uid = prompt('绑定到哪个用户？（留空 = 解绑）') || '';
+        await fetch(API + '/api/room-users?room=' + encodeURIComponent(room) +
+                    '&user_id=' + encodeURIComponent(uid), { method: 'POST' }).then(r => r.json());
+        await loadDevices();
+      } else if (act === 'room-unbind') {
+        await fetch(API + '/api/room-users?room=' + encodeURIComponent(key) +
+                    '&user_id=', { method: 'POST' }).then(r => r.json());
+        await loadDevices();
+      }
+    } catch (e) {
+      alert('操作失败: ' + e);
+    }
+  });
+}
+
+async function postDeviceUsers(fields) {
+  const qs = Object.keys(fields)
+    .filter(k => fields[k] !== undefined && fields[k] !== null)
+    .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(fields[k]))
+    .join('&');
+  const res = await fetch(API + '/api/device-users?' + qs, { method: 'POST' }).then(r => r.json());
+  if (res && res.ok === false) alert(res.error || '操作失败');
+  await loadDevices();
 }
 
 // Start

@@ -39,6 +39,58 @@ TUNNEL_FILE = os.path.join(PROJECT_DIR, "tunnel_url.txt")
 _LOG_DIR = os.environ.get("ASSISTANT_KID_LOG_DIR", os.path.join(PROJECT_DIR, "logs"))
 _start_time = time.time()  # voice_server.py will update this
 
+
+def _data_dir() -> str:
+    """数据目录：**调用期**读 `ASSISTANT_KID_DATA_DIR`，默认回落仓库根。
+
+    改造前这里写的是 `os.path.join(PROJECT_DIR, "data", ...)`，而 `PROJECT_DIR`
+    是 `charlie/` **子目录**，真实数据在仓库根 —— 于是 `/api/habits` 永远返回
+    "暂无习惯数据"，决策反馈读写也全都落在不存在的目录里（静默失效）。
+    """
+    return os.environ.get("ASSISTANT_KID_DATA_DIR") or PROJECT_DIR
+
+
+def _data_file(name: str) -> str:
+    """数据目录下的某个文件。"""
+    return os.path.join(_data_dir(), name)
+
+
+def _habits_file_for(uid: str) -> str:
+    """某用户的习惯分片文件；命名必须与 `magic-habits._get_habits_file()` 一致。
+
+    两边不一致 = "语音记的习惯管理台看不到"，这类静默少数据最难查。
+    """
+    if not uid or uid == "default":
+        return os.path.join(_data_dir(), "habits.json")
+    return os.path.join(_data_dir(), f"habits_{uid}.json")
+
+
+def _habits_shards() -> list[tuple[str, str]]:
+    """枚举所有习惯分片：`[(uid, path), ...]`，`default` 排最前，其余按 uid 升序。
+
+    扫目录而不是读配置：习惯文件是工具层按需创建的，没有中心登记表。
+    `habits_.json`（空 uid）与非 `.json` 后缀一律跳过。
+    """
+    d = _data_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    found: list[tuple[str, str]] = []
+    for name in names:
+        if not name.startswith("habits") or not name.endswith(".json"):
+            continue
+        if name == "habits.json":
+            found.append(("default", os.path.join(d, name)))
+            continue
+        mid = name[len("habits_"):-len(".json")]
+        if not mid:            # habits_.json → 空 uid，不算
+            continue
+        found.append((mid, os.path.join(d, name)))
+    found.sort(key=lambda t: (t[0] != "default", t[0]))
+    return found
+
+
 if getattr(sys, 'frozen', False):
     _ENV_FILE = os.path.join(os.path.dirname(sys.executable), ".env")
 else:
@@ -365,7 +417,7 @@ async def decisions_config():
             return {"error": "magic-decisions模块未加载"}
         rules = _dec.get_rules()
         rule_summary = [{"id": r["id"], "priority": r.get("priority", 0), "confirm": r.get("confirm", False), "condition": r.get("condition", {}).get("check_desc", "")} for r in rules]
-        feedback_file = os.path.join(PROJECT_DIR, "data", "decision_feedback.json")
+        feedback_file = _data_file("decision_feedback.json")
         feedback = {}
         try:
             with open(feedback_file, "r", encoding="utf-8") as f:
@@ -384,7 +436,7 @@ async def behaviors_status():
         from collections import Counter
         history = {}
         try:
-            hf = os.path.join(PROJECT_DIR, "data", "decision_history.json")
+            hf = _data_file("decision_history.json")
             with open(hf, "r", encoding="utf-8") as f:
                 history = json.load(f)
         except Exception as e:
@@ -405,7 +457,7 @@ async def behaviors_status():
         top_triggered = trigger_counts.most_common(5)
         feedback = {}
         try:
-            ff = os.path.join(PROJECT_DIR, "data", "decision_feedback.json")
+            ff = _data_file("decision_feedback.json")
             with open(ff, "r", encoding="utf-8") as f:
                 feedback = json.load(f)
         except Exception as e:
@@ -422,31 +474,95 @@ async def behaviors_status():
         return _safe_error(e)
 
 @router.get("/api/habits")
-async def habits_status():
+async def habits_status(user: str = ""):
+    """习惯打卡概览。
+
+    `user` 为空 → 全局视图（合并所有分片，`scope="all"`）；
+    非空 → 只看该用户的分片（`scope=user`）。
+
+    分片来自 `magic-habits`（工具层按 uid 写文件），这里只读不写。
+    """
     try:
         import datetime as _dt
-        habits_file = os.path.join(PROJECT_DIR, "data", "habits.json")
-        if not os.path.exists(habits_file):
-            return {"total": 0, "habits": {}, "insight": "暂无习惯数据，开始记录吧"}
-        with open(habits_file, "r", encoding="utf-8") as f:
-            habits = json.load(f)
-        today = _dt.date.today()
-        result = {}
-        for habit, data in habits.items():
-            logs = data.get("logs", [])
-            streak = 0
-            check = today
-            for d_str in sorted(set(logs), reverse=True):
+
+        def _parse_logs(logs):
+            """只保留合法 ISO 日期，并按天去重（历史脏数据可能重复或含非字符串）。"""
+            if not isinstance(logs, list):
+                return []
+            seen = set()
+            for d_str in logs:
+                if not isinstance(d_str, str):
+                    continue
                 try:
-                    d = _dt.date.fromisoformat(d_str)
-                    if (check - d).days <= streak:
-                        streak += 1
-                    else:
-                        break
+                    _dt.date.fromisoformat(d_str)
                 except Exception:
-                    break
-            result[habit] = {"total_days": len(logs), "streak": streak, "week_days": len([d for d in logs if _dt.date.fromisoformat(d) >= today - _dt.timedelta(days=today.weekday())]) if logs else 0, "last_log": sorted(logs)[-1] if logs else None, "created": data.get("created", ""), "completed_today": today.strftime("%Y-%m-%d") in logs}
-        return {"total": len(result), "habits": result, "insight": f"已记录{sum(r['total_days'] for r in result.values())}次习惯打卡" if result else ""}
+                    continue
+                seen.add(d_str)
+            return sorted(seen)
+
+        if user:
+            shards = [(_u, _p) for _u, _p in _habits_shards() if _u == user]
+            scope = user
+        else:
+            shards = _habits_shards()
+            scope = "all"
+
+        # 先全部读进来，再决定是否要加 owner 前缀（只有真冲突才加）
+        parsed: list[tuple[str, dict]] = []
+        for uid, path in shards:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue          # 坏 JSON / 不存在 → 跳过，不拖垮整个概览
+            if isinstance(data, dict):
+                parsed.append((uid, data))
+
+        # 统计同名习惯出现在几个分片里
+        name_counts: dict[str, int] = {}
+        for _uid, data in parsed:
+            for habit in data:
+                name_counts[habit] = name_counts.get(habit, 0) + 1
+
+        today = _dt.date.today()
+        today_str = today.strftime("%Y-%m-%d")
+        week_start = today - _dt.timedelta(days=today.weekday())
+        result = {}
+        for uid, data in parsed:
+            for habit, info in data.items():
+                if not isinstance(info, dict):
+                    continue
+                logs = _parse_logs(info.get("logs", []))
+                # 连续天数：从今天（或昨天）往前数
+                streak = 0
+                check = today
+                for d_str in reversed(logs):
+                    d = _dt.date.fromisoformat(d_str)
+                    if d == check or d == check - _dt.timedelta(days=1):
+                        streak += 1
+                        check = d
+                    elif d < check - _dt.timedelta(days=1):
+                        break
+                week_days = len([d for d in logs
+                                 if _dt.date.fromisoformat(d) >= week_start])
+                # 只有真的重名才加所有者前缀，否则用户会以为数据丢了
+                key = f"{uid}·{habit}" if name_counts.get(habit, 0) > 1 else habit
+                result[key] = {
+                    "total_days": len(logs),
+                    "streak": streak,
+                    "week_days": week_days,
+                    "last_log": logs[-1] if logs else None,
+                    "created": info.get("created", ""),
+                    "completed_today": today_str in logs,
+                    "owner": uid,
+                }
+        total_days = sum(r["total_days"] for r in result.values())
+        return {
+            "total": len(result),
+            "habits": result,
+            "insight": f"已记录{total_days}次习惯打卡" if result else "暂无习惯数据，开始记录吧",
+            "scope": scope,
+        }
     except Exception as e:
         return _safe_error(e)
 
@@ -921,17 +1037,168 @@ async def wake_status_api():
     return local_wake.wake_status()
 
 @router.post("/api/user/switch")
-async def switch_user_api(user_id: str = "default"):
+async def switch_user_api(user_id: str = "default", session_id: str = ""):
+    """切换用户。`session_id` 为空 = 进程级切换（旧行为，带风险提示）；
+    非空 = 只绑定该会话，不影响其他正在服务的会话。
+    """
     from app.audit_log import audit_log
     from voice_agent import set_current_user, get_current_user
+    if session_id:
+        set_current_user(user_id, session_id=session_id)
+        audit_log("api:user_switch", input_data=f"{user_id}@{session_id}",
+                  output_data=user_id, action="switch_session")
+        return {
+            "user_id": user_id or "default",
+            "message": f"已将会话 {session_id} 绑定到用户: {user_id or 'default'}",
+            "scope": "session",
+            "session_id": session_id,
+        }
     set_current_user(user_id)
     audit_log("api:user_switch", input_data=user_id, output_data=get_current_user(), action="switch")
-    return {"user_id": get_current_user(), "message": f"已切换到用户: {user_id}"}
+    return {
+        "user_id": get_current_user(),
+        "message": f"已切换到用户: {user_id}",
+        "scope": "process",
+        "warning": "这是进程级切换，会影响所有会话。只想改单个会话请传 session_id。",
+    }
 
 @router.get("/api/user/current")
 async def current_user_api():
     from voice_agent import get_current_user
     return {"user_id": get_current_user()}
+
+# ===== 设备与用户映射（FR-14 批次 6）=====
+
+def _du():
+    """按模块取 device_users，而不是导入具体函数。
+
+    `DATA_DIR` 是 import 期常量：测试/多实例会直接改模块属性，
+    因此所有读写都必须走模块层函数，不能在 import 时抓快照。
+    """
+    import agent.device_users as du
+    return du
+
+
+def _online_devices() -> list:
+    """当前在线设备 + 解析出的用户身份（含来源标记）。"""
+    from app import state as app_state
+    du = _du()
+    out = []
+    try:
+        clients = app_state.snapshot_xiaozhi_clients()
+    except Exception as e:
+        log.debug(f"[device-users] 在线设备快照失败: {e}")
+        return out
+    for client_id, info in (clients or {}).items():
+        dk = str((info or {}).get("device_key") or "")
+        item = {"client_id": client_id, "device_key": dk,
+                "bound_user": "", "source": "none"}
+        if dk:
+            direct = du.all_mappings().get(dk)
+            if direct:
+                item["bound_user"] = direct
+                item["source"] = "direct"
+            else:
+                room = du.all_rooms().get(dk)
+                fallback = du.all_room_users().get(room) if room else None
+                if fallback:
+                    item["bound_user"] = fallback
+                    item["source"] = "room"
+                elif room:
+                    item["room"] = room
+        out.append(item)
+    return out
+
+
+def _device_users_payload() -> dict:
+    du = _du()
+    return {
+        "ok": True,
+        "mappings": du.all_mappings(),
+        "rooms": du.all_rooms(),
+        "room_users": du.all_room_users(),
+        "online_devices": _online_devices(),
+        "stats": du.stats(),
+    }
+
+
+@router.get("/api/device-users")
+async def list_device_users():
+    """三张映射表 + 在线设备当前身份（管理页「设备与用户」面板用）。"""
+    return _device_users_payload()
+
+
+@router.post("/api/device-users")
+async def bind_device_user(device_key: str = "", user_id: str = "",
+                           room: str = "", clear_room: bool = False):
+    """绑定设备 → 用户，可选同时设置房间。
+
+    - 不传 `room` ⇒ 不动该设备已有的房间标记（只改归属）
+    - `clear_room=true` ⇒ 清除房间标记
+    """
+    from app.audit_log import audit_log
+    du = _du()
+    if not (device_key or "").strip():
+        return {"ok": False, "error": "device_key 不能为空"}
+    user_changed = room_changed = False
+    try:
+        user_changed = du.set_device_user(device_key, user_id or None)
+        if clear_room:
+            room_changed = du.set_device_room(device_key, None)
+        elif (room or "").strip():
+            room_changed = du.set_device_room(device_key, room)
+    except ValueError as e:
+        # 非法 uid/room 必须回显给用户，不能静默丢弃
+        audit_log("api:device_users", input_data=f"{device_key}={user_id}/{room}",
+                  success=False, error=str(e), action="bind")
+        return {"ok": False, "error": str(e)}
+    ck = du._sanitize_device_key(device_key)
+    audit_log("api:device_users", input_data=f"{ck}={user_id}/{room}",
+              output_data=f"user_changed={user_changed} room_changed={room_changed}",
+              action="bind")
+    payload = _device_users_payload()
+    payload.update({"changed": user_changed, "room_changed": room_changed,
+                    "device_key": ck,
+                    "user_id": payload["mappings"].get(ck, ""),
+                    "room": payload["rooms"].get(ck, "")})
+    return payload
+
+
+@router.delete("/api/device-users")
+async def unbind_device_user(device_key: str = ""):
+    """忘记这台设备（连带清除房间标记，避免它继续靠房间兜底拿到身份）。"""
+    from app.audit_log import audit_log
+    du = _du()
+    if not (device_key or "").strip():
+        return {"ok": False, "error": "device_key 不能为空"}
+    changed = du.remove_device_user(device_key)
+    ck = du._sanitize_device_key(device_key)
+    audit_log("api:device_users", input_data=ck, output_data=f"changed={changed}",
+              action="delete")
+    payload = _device_users_payload()
+    payload.update({"changed": changed, "device_key": ck})
+    return payload
+
+
+@router.post("/api/room-users")
+async def bind_room_user(room: str = "", user_id: str = ""):
+    """房间 → 用户兜底绑定（设备换了/固件改名后仍能识别身份）。"""
+    from app.audit_log import audit_log
+    du = _du()
+    if not (room or "").strip():
+        return {"ok": False, "error": "房间名不能为空"}
+    try:
+        changed = du.set_room_user(room, user_id or None)
+    except ValueError as e:
+        audit_log("api:room_users", input_data=f"{room}={user_id}",
+                  success=False, error=str(e), action="bind")
+        return {"ok": False, "error": str(e)}
+    audit_log("api:room_users", input_data=f"{room}={user_id}",
+              output_data=f"changed={changed}", action="bind")
+    payload = _device_users_payload()
+    payload.update({"changed": changed, "room": du.sanitize_room(room) or ""})
+    return payload
+
 
 @router.get("/api/logs")
 async def get_logs(lines: int = 100, filter: str = ""):

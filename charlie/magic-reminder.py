@@ -75,7 +75,8 @@ def list_reminders() -> str:
     """
     log.info("[reminder] list_reminders 被调用")
     try:
-        from app.reminders import list_reminders as _list
+        from app.reminders import list_reminders_for as _list
+        # 用户面工具只看本人：问"我有哪些提醒"不该听到家人的
         items = _list(include_completed=False)
         if not items:
             return "当前没有未完成的提醒。"
@@ -96,7 +97,9 @@ def delete_reminder(reminder_id: int = 0, text: str = "") -> str:
     """
     log.info(f"[reminder] delete_reminder(id={reminder_id}, text={text})")
     try:
-        from app.reminders import list_reminders as _list, _load_reminders, _write_locked_reminders
+        from app.reminders import list_reminders_for as _list
+        from app.reminders import _load_reminders, _write_locked_reminders
+        # ⚠️ 必须按本人过滤：用全局列表会让"帮我删掉吃药提醒"误删家人的
         items = _list(include_completed=False)
         if not items:
             return "当前没有可删除的提醒。"
@@ -217,9 +220,12 @@ def list_alarms() -> str:
     """
     try:
         from datetime import datetime as _dt
-        from app.reminders import _load_reminders
+        from app.reminders import _load_reminders, reminder_owner, _resolve_owner
+        # 按本人过滤：闹钟列表同样属于用户面
+        _me = _resolve_owner()
         reminders = _load_reminders()
-        active = [r for r in reminders if not r.get("done")]
+        active = [r for r in reminders
+                  if not r.get("done") and reminder_owner(r) == _me]
         if not active:
             return "当前没有闹钟或定时任务。"
         lines = [f"共 {len(active)} 个闹钟/定时任务："]
