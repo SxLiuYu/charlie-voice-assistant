@@ -24,14 +24,26 @@ DATA_DIR = os.getenv("ASSISTANT_KID_DATA_DIR",
                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 
 
-def _get_habits_file():
-    uid = os.environ.get("CHARLIE_USER_ID", "default")
-    if uid == "default":
-        return os.path.join(DATA_DIR, "habits.json")
-    return os.path.join(DATA_DIR, f"habits_{uid}.json")
+def _resolve_uid() -> str:
+    """当前用户（FR-14）：ContextVar → session → env → default。调用期解析。"""
+    from agent.user_context import resolve_user
+    return resolve_user()
 
 
-HABITS_FILE = _get_habits_file()
+def _get_habits_file() -> str:
+    uid = _resolve_uid()
+    if uid and uid != "default":
+        return os.path.join(DATA_DIR, f"habits_{uid}.json")
+    return os.path.join(DATA_DIR, "habits.json")
+
+
+def __getattr__(name):
+    """PEP 562：`HABITS_FILE` 改为动态属性，不再导入期快照。"""
+    if name == "HABITS_FILE":
+        return _get_habits_file()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 _habits_lock = threading.Lock()
 
 

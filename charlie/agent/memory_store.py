@@ -42,24 +42,65 @@ log = logging.getLogger("magic")
 
 DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 
+DEFAULT_USER = "default"
+
+
+def _resolve_uid(uid: str | None = None) -> str:
+    """显式 uid 优先，其次 ContextVar（`bind_user`），最后环境变量。"""
+    if uid:
+        return uid
+    from agent.user_context import resolve_user
+    return resolve_user()
+
 
 def _get_uid() -> str:
-    return os.environ.get("CHARLIE_USER_ID", "default")
+    return _resolve_uid(None)
 
 
-def _get_db_path() -> str:
-    uid = _get_uid()
-    name = f"memory_{uid}.db" if uid != "default" else "memory.db"
+def _get_db_path(uid: str | None = None) -> str:
+    u = _resolve_uid(uid)
+    name = f"memory_{u}.db" if u != DEFAULT_USER else "memory.db"
     return os.path.join(DATA_DIR, name)
 
 
 # ===== 线程安全锁 =====
 _db_lock = threading.RLock()
 
+# 已建表的库文件路径集合 —— 避免每次连接都跑一遍 executescript。
+_db_ready_paths: set[str] = set()
+
 # ===== LRU 热事实缓存 =====
+# default 用户沿用模块级 `_hot_fact_cache`（兼容既有测试/外部导入），
+# 其他 uid 各自一份 OrderedDict。
+#
+# ⚠️ 键是 **(db_path, uid)** 而不是裸 uid：缓存内容属于某个具体库文件，
+# 只按 uid 建键会让测试里换过 `DATA_DIR` 之后仍命中上一个目录的缓存
+# （表现为"单独跑过、全量跑失败"的顺序依赖）。
 _HOT_FACT_CACHE_MAX = 500
 _hot_fact_cache: OrderedDict[str, dict] = OrderedDict()
+_uid_hot_caches: dict[tuple[str, str], OrderedDict[str, dict]] = {}
 _hot_cache_lock = threading.Lock()
+# default 缓存归属的库文件路径；`DATA_DIR` 被换掉时自动作废
+_default_cache_db_path: str | None = None
+
+
+def _get_hot_cache(uid: str | None = None) -> OrderedDict:
+    global _default_cache_db_path
+    u = _resolve_uid(uid)
+    db_path = _get_db_path(u)
+    if u == DEFAULT_USER:
+        # 数据目录变了 ⇒ 旧缓存指向另一个库，必须作废
+        if _default_cache_db_path != db_path:
+            _hot_fact_cache.clear()
+            _default_cache_db_path = db_path
+        return _hot_fact_cache
+    key = (db_path, u)
+    cache = _uid_hot_caches.get(key)
+    if cache is None:
+        cache = _uid_hot_caches[key] = OrderedDict()
+    return cache
+
+
 
 
 # ===== Schema & 初始化 =====
@@ -138,22 +179,25 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 """
 
 
-def _init_db() -> None:
+def _init_db(uid: str | None = None) -> None:
     """初始化数据库(创建表 + 索引), 幂等。"""
-    db_path = _get_db_path()
+    db_path = _get_db_path(uid)
     try:
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         with _db_lock:
             with sqlite3.connect(db_path, timeout=10) as conn:
                 conn.executescript(_SCHEMA)
                 conn.commit()
+            _db_ready_paths.add(db_path)
     except Exception as e:
         log.warning(f"[memory_store] init_db 失败: {e}")
 
 
-def _get_conn() -> sqlite3.Connection:
+def _get_conn(uid: str | None = None) -> sqlite3.Connection:
     """获取数据库连接(每次调用新建, 使用 with 管理生命周期)。"""
-    db_path = _get_db_path()
+    db_path = _get_db_path(uid)
+    if db_path not in _db_ready_paths:
+        _init_db(uid)
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -163,19 +207,19 @@ def _get_conn() -> sqlite3.Connection:
 
 # ===== 热事实缓存 LRU =====
 
-def _cache_hot_facts() -> int:
+def _cache_hot_facts(uid: str | None = None) -> int:
     """启动时加载高频访问事实到内存 cache。返回缓存条目数。"""
-    global _hot_fact_cache
-    _hot_fact_cache.clear()
+    cache = _get_hot_cache(uid)
+    cache.clear()
     try:
-        with _get_conn() as conn:
+        with _get_conn(uid) as conn:
             rows = conn.execute(
                 "SELECT key, value, category, confidence, source, access_count "
                 "FROM facts ORDER BY access_count DESC LIMIT ?",
                 (_HOT_FACT_CACHE_MAX,)
             ).fetchall()
             for row in rows:
-                _hot_fact_cache[row["key"]] = {
+                cache[row["key"]] = {
                     "value": row["value"],
                     "category": row["category"],
                     "confidence": row["confidence"],
@@ -184,28 +228,30 @@ def _cache_hot_facts() -> int:
                 }
     except Exception as e:
         log.warning(f"[memory_store] 热缓存加载失败: {e}")
-    return len(_hot_fact_cache)
+    return len(cache)
 
 
-def _warm_cache_on_read(key: str, entry: dict) -> None:
+def _warm_cache_on_read(key: str, entry: dict, uid: str | None = None) -> None:
     """Update cache entry (LRU slide). Called after DB writes too, so
     always refresh the stored value."""
+    cache = _get_hot_cache(uid)
     with _hot_cache_lock:
-        if key in _hot_fact_cache:
-            _hot_fact_cache[key].update(entry)
-            _hot_fact_cache.move_to_end(key)
+        if key in cache:
+            cache[key].update(entry)
+            cache.move_to_end(key)
         else:
-            if len(_hot_fact_cache) >= _HOT_FACT_CACHE_MAX:
-                _hot_fact_cache.popitem(last=False)
-            _hot_fact_cache[key] = entry
+            if len(cache) >= _HOT_FACT_CACHE_MAX:
+                cache.popitem(last=False)
+            cache[key] = entry
 
 
-def get_hot_fact(key: str) -> dict | None:
+def get_hot_fact(key: str, uid: str | None = None) -> dict | None:
     """从热缓存读取事实(SQLite 不落盘)。"""
+    cache = _get_hot_cache(uid)
     with _hot_cache_lock:
-        entry = _hot_fact_cache.get(key)
+        entry = cache.get(key)
         if entry:
-            _hot_fact_cache.move_to_end(key)
+            cache.move_to_end(key)
             return dict(entry)
     return None
 
@@ -213,7 +259,8 @@ def get_hot_fact(key: str) -> dict | None:
 # ===== Facts CRUD =====
 
 def upsert_fact(key: str, value: str, category: str = "fact",
-                confidence: float = 1.0, source: str = "extracted") -> None:
+                confidence: float = 1.0, source: str = "extracted",
+                uid: str | None = None) -> None:
     """插入或更新事实(UPSERT)。
     同时更新 SQLite 和热缓存。
     """
@@ -228,7 +275,7 @@ def upsert_fact(key: str, value: str, category: str = "fact",
         "access_count": 1,
     }
     try:
-        with _get_conn() as conn:
+        with _get_conn(uid) as conn:
             conn.execute(
                 "INSERT INTO facts (key, value, category, confidence, source, access_count, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, 1, ?) "
@@ -244,16 +291,16 @@ def upsert_fact(key: str, value: str, category: str = "fact",
     except Exception as e:
         log.warning(f"[memory_store] upsert_fact 失败: {e}")
         return
-    _warm_cache_on_read(key, entry)
+    _warm_cache_on_read(key, entry, uid)
 
 
-def get_fact(key: str) -> dict | None:
+def get_fact(key: str, uid: str | None = None) -> dict | None:
     """读取事实(优先热缓存, cache miss 查 SQLite)。"""
-    entry = get_hot_fact(key)
+    entry = get_hot_fact(key, uid)
     if entry:
         return entry
     try:
-        with _get_conn() as conn:
+        with _get_conn(uid) as conn:
             row = conn.execute(
                 "UPDATE facts SET access_count=access_count+1, last_accessed=? "
                 "WHERE key=? RETURNING value, category, confidence, source, access_count",
@@ -267,18 +314,19 @@ def get_fact(key: str) -> dict | None:
                     "source": row["source"],
                     "access_count": row["access_count"],
                 }
-                _warm_cache_on_read(key, entry)
+                _warm_cache_on_read(key, entry, uid)
                 return entry
     except Exception as e:
         log.debug(f"[memory_store] get_fact cache miss: {e}")
     return None
 
 
-def get_facts_by_category(category: str, limit: int = 100) -> list[dict]:
+def get_facts_by_category(category: str, limit: int = 100,
+                          uid: str | None = None) -> list[dict]:
     """按分类批量读取事实。"""
     rows = []
     try:
-        with _get_conn() as conn:
+        with _get_conn(uid) as conn:
             rows = conn.execute(
                 "SELECT key, value, category, confidence, source, access_count "
                 "FROM facts WHERE category=? ORDER BY updated_at DESC LIMIT ?",
@@ -289,11 +337,11 @@ def get_facts_by_category(category: str, limit: int = 100) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_all_facts(limit: int = 1000) -> list[dict]:
+def get_all_facts(limit: int = 1000, uid: str | None = None) -> list[dict]:
     """读取所有事实(按更新倒序)。"""
     rows = []
     try:
-        with _get_conn() as conn:
+        with _get_conn(uid) as conn:
             rows = conn.execute(
                 "SELECT key, value, category, confidence, source, updated_at "
                 "FROM facts ORDER BY updated_at DESC LIMIT ?",
@@ -304,15 +352,15 @@ def get_all_facts(limit: int = 1000) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def delete_fact(key: str) -> bool:
+def delete_fact(key: str, uid: str | None = None) -> bool:
     """删除事实。返回是否删除成功。"""
     try:
-        with _get_conn() as conn:
+        with _get_conn(uid) as conn:
             cur = conn.execute("DELETE FROM facts WHERE key=?", (key,))
             conn.commit()
             if cur.rowcount > 0:
                 with _hot_cache_lock:
-                    _hot_fact_cache.pop(key, None)
+                    _get_hot_cache(uid).pop(key, None)
                 return True
     except Exception as e:
         log.warning(f"[memory_store] delete_fact 失败: {e}")
@@ -576,26 +624,26 @@ def _extract_semantic_from_fact(key: str, value: str) -> list:
 
 # ===== 统计 & 调试 =====
 
-def get_memory_stats() -> dict:
+def get_memory_stats(uid: str | None = None) -> dict:
     """记忆系统统计信息。"""
     stats = {"facts": 0, "events": 0, "sessions": 0, "corrections": 0,
              "semantic_knowledge": 0, "cache_size": 0}
     try:
-        with _get_conn() as conn:
+        with _get_conn(uid) as conn:
             for table in ["facts", "events", "sessions", "corrections", "semantic_knowledge"]:
                 row = conn.execute(f"SELECT COUNT(*) as c FROM {table}").fetchone()
                 stats[table] = row["c"]
     except Exception as e:
         log.debug(f"[memory_store] get_memory_stats 失败: {e}")
     with _hot_cache_lock:
-        stats["cache_size"] = len(_hot_fact_cache)
+        stats["cache_size"] = len(_get_hot_cache(uid))
     return stats
 
 
-def warm_up_cache() -> int:
+def warm_up_cache(uid: str | None = None) -> int:
     """公共接口: 初始化并预热热缓存。返回缓存条目数。"""
-    _init_db()
-    return _cache_hot_facts()
+    _init_db(uid)
+    return _cache_hot_facts(uid)
 
 
 def format_memories_for_prompt(query: str, limit: int = 3) -> str:

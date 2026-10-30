@@ -15,15 +15,26 @@ DATA_DIR = os.environ.get(
 )
 
 
+DEFAULT_USER = "default"
+
+
+def _resolve_uid(uid: str | None = None) -> str:
+    """显式 uid 优先，其次 ContextVar（`bind_user`），最后环境变量。"""
+    if uid:
+        return uid
+    from agent.user_context import resolve_user
+    return resolve_user()
+
+
 def _get_current_uid() -> str:
-    return os.environ.get("CHARLIE_USER_ID", "default")
+    return _resolve_uid(None)
 
 
-def _persona_file() -> str:
-    uid = _get_current_uid()
-    if uid == "default":
+def _persona_file(uid: str | None = None) -> str:
+    u = _resolve_uid(uid)
+    if u == DEFAULT_USER:
         return os.path.join(DATA_DIR, "persona_state.json")
-    return os.path.join(DATA_DIR, f"persona_state_{uid}.json")
+    return os.path.join(DATA_DIR, f"persona_state_{u}.json")
 
 
 # 默认人设状态（合并旧 schema + 新 schema，保持向后兼容）
@@ -45,7 +56,7 @@ _STATE_LOCK = threading.RLock()
 _states: dict[str, dict] = {}
 
 
-def _load(uid: str = None) -> dict:
+def _load(uid: str | None = None) -> dict:
     if uid is None:
         uid = _get_current_uid()
     with _STATE_LOCK:
@@ -53,9 +64,11 @@ def _load(uid: str = None) -> dict:
             return _states[uid]
         state = None
         try:
-            with open(_persona_file(), encoding="utf-8") as f:
+            with open(_persona_file(uid), encoding="utf-8") as f:
                 state = json.load(f)
         except Exception:
+            state = copy.deepcopy(_DEFAULT)
+        if not isinstance(state, dict):
             state = copy.deepcopy(_DEFAULT)
         # 迁移：旧文件缺少新字段时补默认值
         for k, v in _DEFAULT.items():
@@ -64,22 +77,23 @@ def _load(uid: str = None) -> dict:
         return state
 
 
-def _save(uid: str = None) -> None:
+def _save(uid: str | None = None) -> None:
     if uid is None:
         uid = _get_current_uid()
     with _STATE_LOCK:
         state = _states.get(uid)
         if state is None:
             return
+        path = _persona_file(uid)
         # tempfile + os.replace 原子替换：并发/中途崩溃都不会留下半写文件
         payload = json.dumps(state, ensure_ascii=False, indent=2)
         fd, tmp_path = tempfile.mkstemp(
-            dir=os.path.dirname(_persona_file()) or ".",
+            dir=os.path.dirname(path) or ".",
             prefix=".persona_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
-            os.replace(tmp_path, _persona_file())
+            os.replace(tmp_path, path)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -88,9 +102,9 @@ def _save(uid: str = None) -> None:
             raise
 
 
-def reset() -> None:
+def reset(uid: str | None = None) -> None:
     """重置当前用户的人设状态到默认值。"""
-    uid = _get_current_uid()
+    uid = _resolve_uid(uid)
     with _STATE_LOCK:
         _states[uid] = copy.deepcopy(_DEFAULT)
         _save(uid)
@@ -125,10 +139,11 @@ def detect_emotion(text: str) -> str:
     return max(scores, key=scores.get)
 
 
-def update(text: str):
+def update(text: str, uid: str | None = None):
     """根据用户输入更新人设状态"""
+    uid = _resolve_uid(uid)
     with _STATE_LOCK:
-        state = _load()
+        state = _load(uid)
         emotion = detect_emotion(text)
         state["interaction_count"] += 1
         recent = state.get("recent_emotions", [])
@@ -150,7 +165,7 @@ def update(text: str):
             state["mood"] = "neutral"
             state["humor_level"] = 0.3
 
-        _save()
+        _save(uid)
 
 
 _EMOTION_TO_TTS = {
@@ -164,12 +179,12 @@ _EMOTION_TO_TTS = {
 }
 
 
-def get_current_emotion() -> str:
+def get_current_emotion(uid: str | None = None) -> str:
     """返回最近一次检测到的用户情绪，映射为 TTS 情感标签。
 
     返回值: happy / sad / serious / "" (空=默认中性)
     """
-    state = _load()
+    state = _load(uid)
     recent = state.get("recent_emotions", [])
     if not recent:
         return ""
@@ -177,15 +192,15 @@ def get_current_emotion() -> str:
     return _EMOTION_TO_TTS.get(raw, "")
 
 
-def get_current_mood() -> str:
+def get_current_mood(uid: str | None = None) -> str:
     """返回当前 mood（playful/caring/serious/neutral）"""
-    state = _load()
+    state = _load(uid)
     return state.get("mood", "neutral")
 
 
-def get_persona_prompt() -> str:
+def get_persona_prompt(uid: str | None = None) -> str:
     """返回动态人设提示片段，注入到 system message"""
-    state = _load()
+    state = _load(uid)
     mood = state.get("mood", "neutral")
 
     prompts = {
@@ -202,9 +217,9 @@ def get_persona_prompt() -> str:
 
 # ===== P3: 人格稳定性增强 =====
 
-def get_tone_profile() -> dict:
+def get_tone_profile(uid: str | None = None) -> dict:
     """获取当前语气配置"""
-    state = _load()
+    state = _load(uid)
     return {
         "tone": state.get("tone_profile", "casual"),
         "formality": state.get("formality", "casual"),
@@ -212,26 +227,28 @@ def get_tone_profile() -> dict:
     }
 
 
-def get_relationship_level() -> str:
+def get_relationship_level(uid: str | None = None) -> str:
     """获取当前关系等级"""
-    state = _load()
+    state = _load(uid)
     return state.get("relationship_level", "acquaintance")
 
 
-def set_relationship_level(level: str) -> None:
+def set_relationship_level(level: str, uid: str | None = None) -> None:
     """设置关系等级（stranger/acquaintance/friend/family）"""
     if level not in ("stranger", "acquaintance", "friend", "family"):
         level = "acquaintance"
+    uid = _resolve_uid(uid)
     with _STATE_LOCK:
-        state = _load()
+        state = _load(uid)
         state["relationship_level"] = level
-        _save()
+        _save(uid)
 
 
-def update_relationship_from_interaction(text: str) -> None:
+def update_relationship_from_interaction(text: str, uid: str | None = None) -> None:
     """根据用户输入更新关系亲密度"""
+    uid = _resolve_uid(uid)
     with _STATE_LOCK:
-        state = _load()
+        state = _load(uid)
         state["interaction_count"] = state.get("interaction_count", 0) + 1
         count = state["interaction_count"]
 
@@ -255,10 +272,10 @@ def update_relationship_from_interaction(text: str) -> None:
         else:
             state["tone_profile"] = "casual"
 
-        _save()
+        _save(uid)
 
 
-def contextual_response_style(level: str = "") -> str:
+def contextual_response_style(level: str = "", uid: str | None = None) -> str:
     """根据关系等级返回回复风格提示片段
 
     关系等级影响：
@@ -267,7 +284,7 @@ def contextual_response_style(level: str = "") -> str:
     - friend:   轻松、幽默、可以开玩笑
     - family:   随意、亲密、像家人一样
     """
-    state = _load()
+    state = _load(uid)
     if not level:
         level = state.get("relationship_level", "acquaintance")
     tone = state.get("tone_profile", "casual")

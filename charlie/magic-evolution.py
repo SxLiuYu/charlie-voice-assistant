@@ -66,12 +66,28 @@ def _bucket_hour(hour: int) -> str | None:
 
 # ===== 学习数据存储 =====
 DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
-def _get_evolution_file():
-    uid = os.environ.get("CHARLIE_USER_ID", "default")
-    if uid == "default":
-        return os.path.join(DATA_DIR, "evolution_data.json")
-    return os.path.join(DATA_DIR, f"evolution_data_{uid}.json")
-EVOLUTION_FILE = _get_evolution_file()
+
+
+def _resolve_uid() -> str:
+    """当前用户（FR-14）：ContextVar → session → env → default。调用期解析。"""
+    from agent.user_context import resolve_user
+    return resolve_user()
+
+
+def _get_evolution_file() -> str:
+    uid = _resolve_uid()
+    if uid and uid != "default":
+        return os.path.join(DATA_DIR, f"evolution_data_{uid}.json")
+    return os.path.join(DATA_DIR, "evolution_data.json")
+
+
+def __getattr__(name):
+    """PEP 562：`EVOLUTION_FILE` 改为动态属性，不再导入期快照。"""
+    if name == "EVOLUTION_FILE":
+        return _get_evolution_file()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 _evolution_lock = threading.Lock()
 
 

@@ -29,12 +29,43 @@ log = logging.getLogger("magic")
 mcp = FastMCP("magic-memory")
 
 DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
-def _get_memory_file():
-    uid = os.environ.get("CHARLIE_USER_ID", "default")
-    if uid == "default":
-        return os.path.join(DATA_DIR, "episodic_memories.json")
-    return os.path.join(DATA_DIR, f"episodic_memories_{uid}.json")
-MEMORY_FILE = _get_memory_file()  # 初始路径, 切换用户时重新计算
+
+
+def _resolve_uid() -> str:
+    """当前用户（FR-14）：ContextVar → session → env → default。
+
+    **调用期解析**，不在导入期快照 —— 这是本模块能支持多用户的关键。
+    """
+    from agent.user_context import resolve_user
+    return resolve_user()
+
+
+def _user_file(name: str) -> str:
+    """`name` 是无后缀基名，如 `episodic_memories` → `episodic_memories[_uid].json`。
+
+    `default` 保留改造前的原文件名，老数据零迁移。
+    """
+    uid = _resolve_uid()
+    if uid and uid != "default":
+        return os.path.join(DATA_DIR, f"{name}_{uid}.json")
+    return os.path.join(DATA_DIR, f"{name}.json")
+
+
+def _get_memory_file() -> str:
+    return _user_file("episodic_memories")
+
+
+def __getattr__(name):
+    """PEP 562：`MEMORY_FILE` 改为动态属性（FR-14）。
+
+    改造前它是导入期快照 `MEMORY_FILE = _get_memory_file()`，一旦定义就把
+    "谁在用"冻结成进程启动那一刻的身份。现在每次读都按当前 uid 重新解析。
+    """
+    if name == "MEMORY_FILE":
+        return _get_memory_file()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 _memory_lock = threading.RLock()
 
 
@@ -518,17 +549,26 @@ def get_working_memory() -> dict:
 
 
 # 语义记忆：从 episodic 中提取的语义知识（用户偏好/习惯/关系）
-_SEMANTIC_FILE = None
+# 语义记忆路径缓存：uid → path（FR-14）。
+#
+# 改造前是单例 `_SEMANTIC_FILE = None` + `if _SEMANTIC_FILE is None`：进程早期
+# 第一次调用（uid 恒为 default）就把路径固化，之后**所有用户**读写同一个文件。
+# 比"uid 解析读错"更隐蔽 —— 解析本身是对的，只是结果被缓存成了全局值。
+_SEMANTIC_FILES: dict[str, str] = {}
 _semantic_lock = threading.Lock()
+# ⚠️ 必须是**独立**的锁：`_load/_save_semantic_memories` 在持有 `_semantic_lock`
+# 时调 `_get_semantic_file()`，复用同一把非重入 Lock 会自锁死（整个服务卡住）。
+_semantic_path_lock = threading.Lock()
 
 
 def _get_semantic_file() -> str:
-    global _SEMANTIC_FILE
-    if _SEMANTIC_FILE is None:
-        uid = os.environ.get("CHARLIE_USER_ID", "default")
-        name = f"semantic_memories_{uid}.json" if uid != "default" else "semantic_memories.json"
-        _SEMANTIC_FILE = os.path.join(DATA_DIR, name)
-    return _SEMANTIC_FILE
+    uid = _resolve_uid()
+    with _semantic_path_lock:
+        cached = _SEMANTIC_FILES.get(uid)
+        if cached is None:
+            name = f"semantic_memories_{uid}.json" if uid != "default" else "semantic_memories.json"
+            cached = _SEMANTIC_FILES[uid] = os.path.join(DATA_DIR, name)
+        return cached
 
 
 def _load_semantic_memories() -> list:

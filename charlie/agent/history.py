@@ -20,17 +20,26 @@ MAX_HISTORY = 30
 MAX_SESSIONS = 10
 _history_lock = threading.Lock()
 
+DEFAULT_USER = "default"
+
 def _data_dir() -> str:
     return os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-def _get_history_file():
-    uid = os.environ.get("CHARLIE_USER_ID", "default")
-    if uid == "default":
-        return os.path.join(_data_dir(), "conversation_history.json")
-    return os.path.join(_data_dir(), f"conversation_history_{uid}.json")
+def _resolve_uid(uid: str | None = None) -> str:
+    """显式 uid 优先，其次 ContextVar（`bind_user`），最后环境变量。"""
+    if uid:
+        return uid
+    from agent.user_context import resolve_user
+    return resolve_user()
 
-def _get_history_lock_file():
-    return _get_history_file() + ".lock"
+def _get_history_file(uid: str | None = None):
+    u = _resolve_uid(uid)
+    if u == DEFAULT_USER:
+        return os.path.join(_data_dir(), "conversation_history.json")
+    return os.path.join(_data_dir(), f"conversation_history_{u}.json")
+
+def _get_history_lock_file(uid: str | None = None):
+    return _get_history_file(uid) + ".lock"
 
 # 向后兼容导出（供 voice_agent.py 等 import）
 HISTORY_FILE = _get_history_file()
@@ -41,13 +50,28 @@ REMINDERS_FILE = os.path.join(_data_dir(), "reminders.json")
 _history_file_signatures: dict[str, Optional[tuple]] = {}
 _history_file_caches: dict[str, dict] = {}
 _history_file_lock = threading.Lock()
-_history_save_seq = 0
+_history_save_seq = 0          # default 用户的落盘序号（外部测试直接读写的标量）
+_history_save_seqs: dict[str, int] = {}
 _history_append_count = 0  # 每 N 次 _append_history 后自动落盘，防止崩溃丢失
 HISTORY_SAVE_EVERY = 2     # 每 2 轮对话（4 条消息）落盘一次，减少崩溃丢失
 _context_summaries = {}  # key = session_id
 
-def _history_file_sig() -> Optional[tuple]:
-    path = _get_history_file()
+def _next_save_seq(u: str) -> int:
+    global _history_save_seq
+    if u == DEFAULT_USER:
+        _history_save_seq += 1
+        return _history_save_seq
+    seq = _history_save_seqs.get(u, 0) + 1
+    _history_save_seqs[u] = seq
+    return seq
+
+def _get_save_seq(u: str) -> int:
+    if u == DEFAULT_USER:
+        return _history_save_seq
+    return _history_save_seqs.get(u, 0)
+
+def _history_file_sig(uid: str | None = None) -> Optional[tuple]:
+    path = _get_history_file(uid)
     try:
         st = os.stat(path)
     except OSError:
@@ -55,8 +79,8 @@ def _history_file_sig() -> Optional[tuple]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 @contextmanager
-def _locked_history_file(shared: bool = False):
-    lock_path = _get_history_lock_file()
+def _locked_history_file(shared: bool = False, uid: str | None = None):
+    lock_path = _get_history_lock_file(uid)
     with open(lock_path, "a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         try:
@@ -64,22 +88,22 @@ def _locked_history_file(shared: bool = False):
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
-def _read_history_file_locked() -> Optional[dict]:
-    uid = os.environ.get("CHARLIE_USER_ID", "default")
-    sig = _history_file_sig()
+def _read_history_file_locked(uid: str | None = None) -> Optional[dict]:
+    u = _resolve_uid(uid)
+    sig = _history_file_sig(u)
     if sig is None:
-        _history_file_signatures.pop(uid, None)
-        _history_file_caches.pop(uid, None)
+        _history_file_signatures.pop(u, None)
+        _history_file_caches.pop(u, None)
         return None
-    if sig == _history_file_signatures.get(uid) and uid in _history_file_caches:
-        return _history_file_caches[uid]
-    path = _get_history_file()
+    if sig == _history_file_signatures.get(u) and u in _history_file_caches:
+        return _history_file_caches[u]
+    path = _get_history_file(u)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        _history_file_signatures.pop(uid, None)
-        _history_file_caches.pop(uid, None)
+        _history_file_signatures.pop(u, None)
+        _history_file_caches.pop(u, None)
         return None
     if isinstance(data, dict):
         parsed = data
@@ -91,13 +115,13 @@ def _read_history_file_locked() -> Optional[dict]:
     for session_id, messages in parsed.items():
         if isinstance(messages, list):
             normalized[session_id] = messages
-    _history_file_signatures[uid] = sig
-    _history_file_caches[uid] = normalized
+    _history_file_signatures[u] = sig
+    _history_file_caches[u] = normalized
     return normalized
 
-def _read_history_file() -> Optional[dict]:
-    with _history_file_lock, _locked_history_file(shared=True):
-        return _read_history_file_locked()
+def _read_history_file(uid: str | None = None) -> Optional[dict]:
+    with _history_file_lock, _locked_history_file(shared=True, uid=uid):
+        return _read_history_file_locked(uid)
 
 def _evict_overflow_sessions_locked() -> None:
     """维持会话数硬上限（须持有 _history_lock）。
@@ -174,18 +198,17 @@ def _session_summaries() -> list:
             })
         return summaries
 
-def _save_history() -> None:
-    global _history_save_seq
+def _save_history(uid: str | None = None) -> None:
+    u = _resolve_uid(uid)
     with _history_lock:
         data = {sid: list(hist) for sid, hist in _sessions.items()}
-        save_seq = _history_save_seq + 1
-        _history_save_seq = save_seq
-    path = _get_history_file()
+        save_seq = _next_save_seq(u)
+    path = _get_history_file(u)
     tmp_path = None
     try:
-        with _history_file_lock, _locked_history_file(shared=False):
+        with _history_file_lock, _locked_history_file(shared=False, uid=u):
             # 并发 snapshot 保护: 排队期间有更新 save 则旧快照跳过
-            if save_seq != _history_save_seq:
+            if save_seq != _get_save_seq(u):
                 return
             fd, tmp_path = tempfile.mkstemp(
                 dir=os.path.dirname(path) or ".", prefix=".history.", suffix=".tmp")
@@ -194,7 +217,7 @@ def _save_history() -> None:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                if save_seq != _history_save_seq:
+                if save_seq != _get_save_seq(u):
                     return
                 os.replace(tmp_path, path)
                 tmp_path = None
@@ -206,7 +229,7 @@ def _save_history() -> None:
     except Exception as e:
         log.error(f"[history] 保存失败: {e}")
 
-def _append_history(hist: list, user_text: str, assistant_reply: str) -> None:
+def _append_history(hist: list, user_text: str, assistant_reply: str, uid: str | None = None) -> None:
     global _history_append_count
     now = time.time()
     with _history_lock:
@@ -220,14 +243,14 @@ def _append_history(hist: list, user_text: str, assistant_reply: str) -> None:
     if _history_append_count >= HISTORY_SAVE_EVERY:
         _history_append_count = 0
         try:
-            _save_history()
+            _save_history(uid)
         except Exception as e:
             log.debug(f"[agent.history] error at line 202: {e}")
             pass
 
-def _load_history() -> None:
+def _load_history(uid: str | None = None) -> None:
     try:
-        file_data = _read_history_file()
+        file_data = _read_history_file(uid)
     except Exception as e:
         log.debug(f"[agent.history] error at line 208: {e}")
         return

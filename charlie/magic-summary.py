@@ -33,6 +33,20 @@ mcp = FastMCP("magic-summary")
 DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 
 
+def _resolve_uid() -> str:
+    """当前用户（FR-14）：ContextVar → session → env → default。调用期解析。"""
+    from agent.user_context import resolve_user
+    return resolve_user()
+
+
+def _user_file(name: str) -> str:
+    """`name` 是无后缀基名；`default` 保留原文件名（老数据零迁移）。"""
+    uid = _resolve_uid()
+    if uid and uid != "default":
+        return os.path.join(DATA_DIR, f"{name}_{uid}.json")
+    return os.path.join(DATA_DIR, f"{name}.json")
+
+
 # ===== 辅助函数 =====
 
 def _now() -> datetime.datetime:
@@ -190,7 +204,7 @@ def _get_daily_memories(date_str: str = None) -> list:
         pass
     # 2. 回退: JSON
     try:
-        memory_file = os.path.join(DATA_DIR, "episodic_memories.json")
+        memory_file = _user_file("episodic_memories")
         if os.path.exists(memory_file):
             with open(memory_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)

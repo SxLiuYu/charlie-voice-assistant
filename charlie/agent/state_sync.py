@@ -26,6 +26,11 @@ import time
 import threading
 import logging
 import os
+try:
+    import fcntl
+except ImportError:  # Windows 无 fcntl，退化为 no-op 锁
+    import fcntl_compat as fcntl
+from typing import Any
 from datetime import datetime, timezone
 
 log = logging.getLogger("magic")
@@ -34,9 +39,20 @@ DATA_DIR = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.absp
 
 # ===== 同步文件路径 =====
 
-def _get_sync_file() -> str:
-    uid = os.environ.get("CHARLIE_USER_ID", "default")
-    name = f"user_state_sync_{uid}.json" if uid != "default" else "user_state_sync.json"
+DEFAULT_USER = "default"
+
+
+def _resolve_uid(uid: str | None = None) -> str:
+    """显式 uid 优先，其次 ContextVar（`bind_user`），最后环境变量。"""
+    if uid:
+        return uid
+    from agent.user_context import resolve_user
+    return resolve_user()
+
+
+def _get_sync_file(uid: str | None = None) -> str:
+    u = _resolve_uid(uid)
+    name = f"user_state_sync_{u}.json" if u != DEFAULT_USER else "user_state_sync.json"
     return os.path.join(DATA_DIR, name)
 
 
@@ -51,10 +67,9 @@ _DIRTY = threading.Event()  # 标记有未同步的变更
 
 # ===== 文件级状态(机器内多进程共享) =====
 
-def _acquire_file_lock():
+def _acquire_file_lock(uid: str | None = None):
     """获取状态文件锁。返回 (fd, filepath) 或 None."""
-    import fcntl
-    path = _get_sync_file()
+    path = _get_sync_file(uid)
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
         fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -67,10 +82,9 @@ def _acquire_file_lock():
         return None, None
 
 
-def _acquire_file_lock_write():
+def _acquire_file_lock_write(uid: str | None = None):
     """获取状态文件写锁(独占)。"""
-    import fcntl
-    path = _get_sync_file()
+    path = _get_sync_file(uid)
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -88,16 +102,15 @@ def _release_file_lock(fd):
     if fd is None:
         return
     try:
-        import fcntl
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
     except Exception:
         pass
 
 
-def read_shared_state() -> dict:
+def read_shared_state(uid: str | None = None) -> dict:
     """从共享文件读取最新状态(非阻塞, 加共享锁)。"""
-    fd, path = _acquire_file_lock()
+    fd, path = _acquire_file_lock(uid)
     if fd is None:
         return {}
     try:
@@ -111,9 +124,9 @@ def read_shared_state() -> dict:
     return {}
 
 
-def write_shared_state(state: dict) -> bool:
+def write_shared_state(state: dict, uid: str | None = None) -> bool:
     """写入共享状态文件(独占锁, 原子替换)。"""
-    fd, path = _acquire_file_lock_write()
+    fd, path = _acquire_file_lock_write(uid)
     if fd is None:
         return False
     try:
@@ -132,7 +145,7 @@ def write_shared_state(state: dict) -> bool:
 
 # ===== MQTT 跨设备广播 =====
 
-def _publish_mqtt(state: dict) -> None:
+def _publish_mqtt(state: dict, uid: str | None = None) -> None:
     """发布状态到 MQTT topic (异步, fire-and-forget)。"""
     try:
         from app.mqtt_server import get_mqtt_client, _MQTT_AVAILABLE
@@ -141,8 +154,8 @@ def _publish_mqtt(state: dict) -> None:
         client = get_mqtt_client()
         if client is None:
             return
-        uid = os.environ.get("CHARLIE_USER_ID", "default")
-        topic = f"charlie/state/{uid}"
+        u = _resolve_uid(uid)
+        topic = f"charlie/state/{u}"
         payload = json.dumps({
             "ts": time.time(),
             "state": state,
@@ -178,7 +191,7 @@ def sync_state(section: str, data: dict, immediate: bool = False) -> None:
         _schedule_flush()
 
 
-def get_synced_state(section: str = "", default=None) -> dict | any:
+def get_synced_state(section: str = "", default=None) -> Any:
     """读取本地缓存的状态段。
     如果本地为空则尝试从共享文件加载(启动时热加载)。
     """
@@ -322,8 +335,8 @@ def setup_mqtt_listener() -> None:
         if client is None:
             return
 
-        uid = os.environ.get("CHARLIE_USER_ID", "default")
-        topic = f"charlie/state/{uid}"
+        u = _resolve_uid()
+        topic = f"charlie/state/{u}"
 
         def _on_message(client, userdata, msg):
             try:
@@ -364,11 +377,11 @@ def _apply_remote_state(state: dict) -> None:
     if "persona" in state:
         try:
             from agent.persona import _load, _save
-            uid = _persona_load()
+            persona = _load()
             persona_state = state["persona"]
             for key in ("mood", "formality", "humor_level", "relationship_level", "tone_profile"):
                 if key in persona_state:
-                    uid[key] = persona_state[key]
+                    persona[key] = persona_state[key]
             _save()
         except Exception:
             pass
