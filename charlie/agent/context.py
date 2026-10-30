@@ -84,19 +84,11 @@ def _refresh_context_cache(session_id: str = "default") -> None:
         except Exception:
             ctx["user_state"] = {}
 
-        # 7. 待办事项（本地 I/O，保持吞错）
-        try:
-            from app.reminders import _load_reminders
-            now = datetime.datetime.now()
-            pending = []
-            for r in _load_reminders():
-                if isinstance(r, dict) and not r.get("done"):
-                    due = str(r.get("due", ""))[:10]
-                    if due == now.strftime("%Y-%m-%d"):
-                        pending.append(str(r.get("text", ""))[:40])
-            ctx["todos"] = pending
-        except Exception:
-            ctx["todos"] = []
+        # 7. 待办事项：**刻意不算**。
+        #
+        # 这个函数跑在后台线程里，**没有用户上下文** —— 在这里算 todos 必然是
+        # "某一个人"的今日待办，再被 60 秒共享缓存固化，注入到所有会话。
+        # 正确做法是读取时按会话 uid 现算，见 `_override_todos()`。
 
         with _context_cache_lock:
             _context_cache = ctx
@@ -121,11 +113,35 @@ def _override_recent(ctx: dict[str, Any], session_id: str) -> None:
         pass
 
 
-def get_context(session_id: str = "default") -> dict[str, Any]:
+def _override_todos(ctx: dict[str, Any], uid: str | None = None) -> None:
+    """用**当前用户**的今日待办覆盖缓存里的 todos。
+
+    `todos` 不能进 60 秒共享缓存（`_refresh_context_cache` 跑在后台线程、没有
+    用户上下文），所以与 `_override_recent()` 同一套路，在读取时现算。
+
+    ⚠️ `location` / `weather` **刻意保持共享**：一家人同一个房子、同一份天气，
+    按会话重算意味着每会话一次网络请求。这是取舍，不是遗漏。
+    """
+    try:
+        from app.reminders import list_reminders_for
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        ctx["todos"] = [
+            str(r.get("text", ""))[:40]
+            for r in list_reminders_for(uid)
+            if str(r.get("due", ""))[:10] == today
+        ]
+    except Exception as e:
+        log.debug(f"[context] todos 解析失败: {e}")
+        ctx["todos"] = []
+
+
+def get_context(session_id: str = "default", uid: str | None = None) -> dict[str, Any]:
     """聚合所有上下文信息，返回结构化字典。
 
     每个字段失败时返回空值/默认值，不影响其他字段。
     天气查询在缓存过期时由后台线程异步刷新，当前请求返回不含天气的上下文。
+
+    `uid` 只影响 `todos`（按用户过滤）；其余字段是一家人共享的。
     """
     global _context_cache, _context_cache_ts, _context_refresh_thread
     global _context_backoff_until
@@ -134,6 +150,7 @@ def get_context(session_id: str = "default") -> dict[str, Any]:
         if _context_cache and time.time() - _context_cache_ts < _context_ttl:
             result = dict(_context_cache)
             _override_recent(result, session_id)
+            _override_todos(result, uid)
             return result
         # stale-while-revalidate: 缓存过期但有旧值时，后台刷新并返回旧值
         stale_ctx = dict(_context_cache) if _context_cache else None
@@ -149,6 +166,7 @@ def get_context(session_id: str = "default") -> dict[str, Any]:
     if stale_ctx:
         result = stale_ctx
         _override_recent(result, session_id)
+        _override_todos(result, uid)
         return result
     ctx: dict[str, Any] = {}
     # 1. 时间
@@ -188,19 +206,10 @@ def get_context(session_id: str = "default") -> dict[str, Any]:
         ctx["user_state"] = get_user_state()
     except Exception:
         ctx["user_state"] = {}
-    # 7. 待办事项（通过 app.reminders 加载，复用锁和畸形过滤）
-    try:
-        from app.reminders import _load_reminders
-        now = datetime.datetime.now()
-        pending = []
-        for r in _load_reminders():
-            if isinstance(r, dict) and not r.get("done"):
-                due = str(r.get("due", ""))[:10]
-                if due == now.strftime("%Y-%m-%d"):
-                    pending.append(str(r.get("text", ""))[:40])
-        ctx["todos"] = pending
-    except Exception:
-        ctx["todos"] = []
+    # 7. 待办事项：不在这里算（后台线程无用户上下文），读取时由
+    #    `get_context()` 的 `_override_todos()` 现算。
+    ctx["todos"] = []
+    _override_todos(ctx, uid)
     return ctx
 
 
@@ -212,10 +221,12 @@ def invalidate_context_cache() -> None:
         _context_cache_ts = 0.0
 
 
-def format_context_for_prompt(ctx: Optional[dict[str, Any]] = None, session_id: str = "default") -> str:
+def format_context_for_prompt(ctx: Optional[dict[str, Any]] = None,
+                              session_id: str = "default",
+                              uid: str | None = None) -> str:
     """将上下文格式化为系统 prompt 片段。"""
     if ctx is None:
-        ctx = get_context(session_id=session_id)
+        ctx = get_context(session_id=session_id, uid=uid)
     parts: list[str] = []
 
     # 时间

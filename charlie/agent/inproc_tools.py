@@ -9,6 +9,7 @@
 - 工具调用延迟 = 函数本身执行时间（无 IPC 开销）
 """
 import os, sys, importlib, inspect, logging, threading
+import contextvars
 from typing import Any, Dict, List, Optional, Union
 
 log = logging.getLogger("magic")
@@ -129,8 +130,13 @@ def _make_tool_class(name: str, description: str, parameters: dict, fn, is_async
                 try:
                     asyncio.get_running_loop()
                     import concurrent.futures
+                    # 线程池不继承 ContextVar：不拷上下文的话，异步工具里
+                    # `resolve_user()` 会掉回 env/default（静默串台，不报错）。
+                    ctx = contextvars.copy_context()
                     with concurrent.futures.ThreadPoolExecutor() as ex:
-                        result = ex.submit(asyncio.run, fn(**valid_params)).result(timeout=30)
+                        result = ex.submit(
+                            ctx.run, asyncio.run, fn(**valid_params)
+                        ).result(timeout=30)
                 except RuntimeError:
                     result = asyncio.run(fn(**valid_params))
             else:

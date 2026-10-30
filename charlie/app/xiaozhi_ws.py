@@ -8,6 +8,8 @@ it processes the utterance (ASR→Brain→TTS) and streams back Opus audio.
 
 import asyncio
 import base64
+import contextvars
+import functools
 import hmac
 import json
 import logging
@@ -248,6 +250,20 @@ async def _is_speech_vad_async(pcm_bytes: bytes, rms: int, rms_threshold: float)
     """_is_speech_vad 的异步版：torch 前向挪到 _vad_pool，不阻塞事件循环"""
     return await asyncio.get_running_loop().run_in_executor(
         _vad_pool, _is_speech_vad, pcm_bytes, rms, rms_threshold)
+
+
+async def _ctx_run_in_executor(loop, executor, fn, *args):
+    """`loop.run_in_executor` 的上下文传播版（FR-14）。
+
+    裸 `run_in_executor` **不继承** ContextVar（见 `agent/user_context.py`
+    的模块 docstring），线程池里的 `resolve_user()` 会掉回 env/default，
+    表现为"妈妈听到老于的音色"。
+
+    每次调用独立 `copy_context()`：两个用户并发时各拷一份，
+    互不污染（`asyncio.gather` 并发场景已验证）。
+    """
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(executor, functools.partial(ctx.run, fn, *args))
 
 _beep_mp3 = None
 _beep_lock = threading.Lock()
@@ -630,7 +646,7 @@ def register_xiaozhi_routes(app: FastAPI):
             if stream_task and not stream_task.done():
                 return
             try:
-                mp3 = await _loop.run_in_executor(None, _synth_mp3, text)
+                mp3 = await _ctx_run_in_executor(_loop, None, _synth_mp3, text)
             except Exception:
                 return
             if not mp3 or len(mp3) < 100:
@@ -875,8 +891,8 @@ def register_xiaozhi_routes(app: FastAPI):
                                 # 注意：不提前发 tts stop，否则客户端/测试会误认为 TTS 结束而停止收消息
                                 try:
                                     _fb = "抱歉，反应慢了，请再说一遍"
-                                    _fb_mp3 = await loop.run_in_executor(
-                                        None, _synth_mp3, _fb)
+                                    _fb_mp3 = await _ctx_run_in_executor(
+                                        loop, None, _synth_mp3, _fb)
                                     if _fb_mp3 and len(_fb_mp3) > 100:
                                         await send_json({"type": "tts", "state": "start"})
                                         await send_json({"type": "tts", "state": "sentence_start", "text": _fb})
@@ -941,8 +957,8 @@ def register_xiaozhi_routes(app: FastAPI):
                         if not pkts:
                             # 下载/转码失败：给用户一句解释而不是静默跳过
                             try:
-                                fb_mp3 = await loop.run_in_executor(
-                                    None, _synth_mp3, "抱歉，音乐加载失败")
+                                fb_mp3 = await _ctx_run_in_executor(
+                                    loop, None, _synth_mp3, "抱歉，音乐加载失败")
                                 if fb_mp3 and len(fb_mp3) > 100:
                                     _put_blocking(("抱歉，音乐加载失败", fb_mp3))
                             except Exception:
@@ -1415,14 +1431,29 @@ def register_xiaozhi_routes(app: FastAPI):
                 log.info("[xiaozhi] recv %s/%s", mtype, state)
 
                 if mtype == "hello":
+                    # 复用写入侧同一套清洗规则：两侧规则漂移会让绑定静默失效
+                    from agent.device_users import _sanitize_device_key
+                    _hello_dev = ""
                     for dev_key in ("client_id", "device_id", "device"):
                         cand = data.get(dev_key)
                         if isinstance(cand, dict):
                             cand = (cand.get("device_id") or cand.get("mac")
                                     or cand.get("client_id") or cand.get("name"))
                         if cand:
-                            device_key = re.sub(r"[^0-9A-Za-z_-]", "", str(cand))[:32] or device_key
+                            _hello_dev = _sanitize_device_key(cand)
+                            if _hello_dev:
+                                device_key = _hello_dev
                             break
+                    # 告诉连接表"这条连接是哪台设备"，定向提醒才能路由过来。
+                    # hello 可能晚于 register_xiaozhi_client：那时连接已存在才写得进去；
+                    # 早于注册则静默 no-op，flush 时再按 session_id 反推设备号兜底。
+                    # 空值一律不写 —— 否则会被当成"已绑定空设备"。
+                    if _hello_dev:
+                        try:
+                            from app.state import set_xiaozhi_client_device
+                            set_xiaozhi_client_device(session_id, _hello_dev)
+                        except Exception as _de:
+                            log.debug("[xiaozhi] 记录连接设备号失败: %s", _de)
                     await send_json({
                         "type": "hello",
                         "id": session_id,
