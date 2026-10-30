@@ -38,24 +38,87 @@ FEISHU_PUSH_ENABLED = os.getenv("FEISHU_PUSH_ENABLED", "1") == "1" and bool(FEIS
 # ntfy backup channel
 from app.ntfy_push import push_ntfy_async as _push_ntfy_async
 
+def _has_fallback_channel() -> bool:
+    """除 ESP32 外，还有没有能真正送达用户的通道。
+
+    撤销离线队列前必须先问这个：队列是 ESP32 唯一的补发来源，
+    撤了又没有兜底 ⇒ 消息彻底丢失。任一通道可用即算有。
+    """
+    if FEISHU_PUSH_ENABLED:
+        return True
+    try:
+        from app.ntfy_push import NTFY_TOPIC
+        return bool(NTFY_TOPIC)
+    except Exception as e:
+        log.debug(f"[notification] ntfy 通道检测失败: {e}")
+        return False
+
+
+def _drop_xiaozhi_duplicate(text: str) -> int:
+    """兜底通道已送达 ⇒ 把 ESP32 队列里的同一条撤掉（跨通道去重）。"""
+    from app.state import drop_xiaozhi_pending
+    n = drop_xiaozhi_pending(text)
+    if n:
+        log.info(f"[notification] 兜底已送达，撤销 ESP32 队列 {n} 条: {text[:40]}")
+    return n
+
+
+def _feishu_send_once(text: str) -> bool:
+    """同步推一次飞书，返回**是否确认送达**。
+
+    ⚠️ 只有 `code == 0` 才算送达：token 失效 / open_id 无效时 HTTP 也可能是
+    200 但 body 里带错误码。按状态码判成功会导致"没送到却撤了队列"⇒ 消息丢失。
+    body 不是 JSON 时退回按 HTTP 状态码判定（某些网关会返回纯文本）。
+    """
+    try:
+        from feishu_token import get_tenant_access_token
+        token = get_tenant_access_token()
+        if not token:
+            return False
+        r = requests.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"receive_id": FEISHU_PUSH_OPEN_ID, "msg_type": "text",
+                  "content": json.dumps({"text": text})}, timeout=10)
+        if r.status_code != 200:
+            log.warning(f"[feishu] 推送失败 HTTP {r.status_code}: {text[:40]}")
+            return False
+        try:
+            body = r.json()
+        except Exception:
+            # 非 JSON body：状态码 200 视为送达
+            log.info(f"[feishu] 推送成功(非JSON响应): {text[:40]}")
+            _drop_xiaozhi_duplicate(text)
+            return True
+        if isinstance(body, dict) and body.get("code") == 0:
+            log.info(f"[feishu] 推送成功: {text[:40]}")
+            # 只有确认送达才撤 ESP32 队列 —— 顺序反了就是丢消息
+            _drop_xiaozhi_duplicate(text)
+            return True
+        log.warning(f"[feishu] 推送被拒 code={body.get('code') if isinstance(body, dict) else body}: {text[:40]}")
+        return False
+    except Exception as e:
+        log.warning(f"[feishu] 推送失败: {e}")
+        return False
+
+
+def _feishu_send_async(text: str):
+    """异步推飞书；返回线程对象（未启用时返回 None），供调用方 join。"""
+    if not FEISHU_PUSH_ENABLED:
+        return None
+
+    def _send():
+        # 撤销动作在 `_feishu_send_once` 内部按送达确认触发，这里不再重复
+        _feishu_send_once(text)
+
+    t = threading.Thread(target=_send, daemon=True)
+    t.start()
+    return t
+
+
 def push_feishu_async(text: str):
     """异步推飞书消息(线程, 不阻塞通知/SSE)。所有主动服务触发时自动推送。"""
-    if not FEISHU_PUSH_ENABLED:
-        return
-    def _send():
-        try:
-            from feishu_token import get_tenant_access_token
-            token = get_tenant_access_token()
-            if not token:
-                return
-            requests.post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={"receive_id": FEISHU_PUSH_OPEN_ID, "msg_type": "text",
-                      "content": json.dumps({"text": text})}, timeout=10)
-            log.info(f"[feishu] 推送成功: {text[:40]}")
-        except Exception as e:
-            log.warning(f"[feishu] 推送失败: {e}")
-    threading.Thread(target=_send, daemon=True).start()
+    return _feishu_send_async(text)
 
 def add_notification(text: str, ntype: str = "reminder"):
     """添加通知到队列+SSE推送+飞书推送+ntfy备用
@@ -116,10 +179,40 @@ def _put_sse_event_nowait(client_q: asyncio.Queue, event_frame: str) -> None:
 
 _reminder_audio_serial_lock = threading.Lock()
 
+# 默认称呼。改造前这句是内联字面量，抽成常量后默认行为逐字节不变。
+DEFAULT_REMINDER_PREFIX = "主人，提醒您："
 
-def play_reminder_audio(text: str, reminder_id: int | None = None, _feishu_done: bool = False):
+
+def _reminder_prefix(owner: str | None = None) -> str:
+    """提醒播报的称呼前缀（FR-14）。
+
+    `default` / 空 → 用硬编码默认值，**不查偏好**（默认行为零变化，
+    也避免每个提醒都多一次文件读）。
+
+    ⚠️ 必须函数内 `import agent.preferences as pref` 再 `pref.get_preference(...)`：
+    调用方/测试 monkeypatch 的是**模块属性**，`from ... import get_preference`
+    拿到的会是 patch 之前的旧引用。
+    """
+    if not owner or owner == "default":
+        return DEFAULT_REMINDER_PREFIX
+    try:
+        import agent.preferences as pref
+        custom = pref.get_preference("reminder_prefix", uid=owner)
+        if custom and str(custom).strip():
+            return str(custom)
+    except Exception as e:
+        log.debug(f"[reminder] 读取称呼偏好失败({owner}): {e}")
+    return DEFAULT_REMINDER_PREFIX
+
+
+def play_reminder_audio(text: str, reminder_id: int | None = None,
+                        _feishu_done: bool = False, owner: str | None = None):
     """生成提醒语音并播放到 ESP32 + 浏览器SSE + macOS afplay(异步)
-    afplay 放到独立线程避免阻塞决策/调度线程"""
+    afplay 放到独立线程避免阻塞决策/调度线程
+
+    `owner`（FR-14）：非空且不是 `"default"` 时，投递只定向到该用户的设备；
+    `None` / `"default"` 保持广播 —— 旧行为逐字节不变。
+    """
     import platform as _platform
     try:
         from app.audit_log import audit_log
@@ -128,19 +221,33 @@ def play_reminder_audio(text: str, reminder_id: int | None = None, _feishu_done:
     except Exception as e:
         log.debug(f"[app.notifications] error at line 125: {e}")
         pass
+    # owner 有效 ⇒ 定向到该用户的设备；否则广播（显式传 None 不传默认参数）
+    _target_uids = (owner,) if owner and owner != "default" else None
     # 串行化"TTS 合成→推送→播放"关键段，避免多线程音频交错
     with _reminder_audio_serial_lock:
         try:
             from voice_agent import tts_to_mp3
             log.info(f"[reminder] TTS生成: {text}")
-            _prefix = f"主人，提醒您：" if reminder_id is not None else ""
-            audio = tts_to_mp3(f"{_prefix}{text}")
+            _prefix = _reminder_prefix(owner) if reminder_id is not None else ""
+            if owner and owner != "default":
+                # TTS 在 owner 身份下合成：称呼/人格等用户相关内容取的是它
+                from agent.user_context import bind_user
+                with bind_user(owner):
+                    audio = tts_to_mp3(f"{_prefix}{text}")
+            else:
+                audio = tts_to_mp3(f"{_prefix}{text}")
             if not audio or len(audio) < 100:
                 raise RuntimeError("TTS返回空音频")
 
             # 推送到 ESP32 (xiaozhi WebSocket) — fire and forget
             display_text = f"{_prefix}{text}"
-            delivery = push_tts_to_xiaozhi(display_text, audio, reminder_id=reminder_id)
+            # 广播时**不传** target_uids：保持改造前的实参形状逐字节不变
+            # （既有调用方/测试按位置+关键字断言过这次调用）
+            if _target_uids:
+                delivery = push_tts_to_xiaozhi(display_text, audio, reminder_id=reminder_id,
+                                               target_uids=_target_uids)
+            else:
+                delivery = push_tts_to_xiaozhi(display_text, audio, reminder_id=reminder_id)
 
             # macOS: 仅在直推成功时本地播放（enqueued 不外放——ESP32 离线时用户不在设备边，Mac 外放属惊吓）
             if _platform.system() == "Darwin" and delivery == "direct":
@@ -172,6 +279,10 @@ def play_reminder_audio(text: str, reminder_id: int | None = None, _feishu_done:
                         push_feishu_async(display_text)
                         log.info(f"[reminder] ESP32离线，提醒{reminder_id}已推飞书兜底")
                     else:
+                        # add_notification 已经推过飞书，但那时还没入队，没有成功回调可用
+                        # ⇒ 这里显式撤销。必须先确认确实存在兜底通道，否则撤了就丢消息。
+                        if _has_fallback_channel():
+                            _drop_xiaozhi_duplicate(display_text)
                         log.info(f"[reminder] ESP32离线，提醒{reminder_id}入队(add_notification已推飞书，跳过)")
                 else:
                     log.info(f"[reminder] 提醒{reminder_id}投递状态={delivery}，保持 pending 等待 ESP32 flush")
@@ -181,6 +292,9 @@ def play_reminder_audio(text: str, reminder_id: int | None = None, _feishu_done:
                 # 若 add_notification 已推过飞书，此处跳过避免重复
                 if not _feishu_done:
                     push_feishu_async(display_text)
+                elif _has_fallback_channel():
+                    # 同上：飞书已在 add_notification 阶段推过，这里显式撤队列
+                    _drop_xiaozhi_duplicate(display_text)
                 log.info(f"[notification] ESP32离线，主动推送转飞书兜底: {display_text[:30]}")
         except Exception as e:
             log.error(f"[reminder] 播放失败: {e}")
@@ -244,13 +358,57 @@ def _https_forward_reminder(text: str, mp3_data: bytes) -> None:
         log.debug(f"[xiaozhi-push] HTTPS转发失败: {e}")
 
 
-def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None) -> str:
-    """推送 TTS 到所有连接的 ESP32 设备（从同步线程调用）
+def _client_uid(info: dict) -> str:
+    """一条在线连接属于哪个用户；未绑定/查不到 → `"default"`。"""
+    device_key = (info or {}).get("device_key") or ""
+    if not device_key:
+        return "default"
+    try:
+        from agent.device_users import get_device_user
+        uid = get_device_user(device_key)
+    except Exception as e:
+        log.debug(f"[xiaozhi-push] 设备归属查询失败({device_key}): {e}")
+        return "default"
+    return uid or "default"
+
+
+def _any_device_bound(uids) -> bool:
+    """这些用户里**有没有任何一个**配了设备映射（在线与否都算）。
+
+    - `False` ⇒ 定向毫无意义（排队后没人能取），应降级为广播；
+    - `True`  ⇒ 只是暂时离线，保持定向排队等上线。
+
+    ⚠️ 查询异常时返回 `True`（保守）：宁可晚点送达，也不能把
+    「妈妈的提醒」广播到全屋。
+    """
+    from agent.device_users import devices_for_user
+    for uid in uids or ():
+        try:
+            if devices_for_user(uid):
+                return True
+        except Exception as e:
+            log.debug(f"[xiaozhi-push] 设备映射查询失败({uid}): {e}")
+            return True
+    return False
+
+
+def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None,
+                        target_uids=None) -> str:
+    """推送 TTS 到 ESP32 设备（从同步线程调用）
     本进程有连接则直推；无连接时入队待 flush + 转发HTTPS进程
     返回投递状态: "direct" | "enqueued" | "failed"
+
+    `target_uids`（FR-14）：`None` = 广播（旧行为）；非空元组 = 只推给
+    绑定这些用户的设备。**目标用户连一台设备都没配**时降级为广播 ——
+    否则定向项永远取不出来，提醒会静默消失。
     """
     from app.state import snapshot_xiaozhi_clients, enqueue_xiaozhi_pending
     from app.config import https_port
+
+    targets = tuple(target_uids or ())
+    if targets and not _any_device_bound(targets):
+        log.info("[xiaozhi-push] 目标用户无任何设备映射，降级广播: %s", targets)
+        targets = ()
 
     # 如果正在语音对话 streaming，提醒 TTS 不入队 WS 推送（避免两路音频交错），
     # 改为只走 afplay（本地播放）+ 入队待 flush。
@@ -259,11 +417,13 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None) -> str:
         if is_xiaozhi_streaming():
             log.info("[xiaozhi-push] 对话 streaming 中，提醒 TTS 跳过 WS 推送: %s", text[:30])
             # 本地 afplay 由 play_reminder_audio 负责；这里只做入队 + HTTPS 转发
-            qsize = enqueue_xiaozhi_pending(text, mp3_data, reminder_id=reminder_id)
+            qsize = enqueue_xiaozhi_pending(text, mp3_data, reminder_id=reminder_id,
+                                            target_uids=targets)
             log.info("[xiaozhi-push] 提醒 TTS 入队待flush(%d): %s", qsize, text[:30])
-            # 仍然尝试 HTTPS 转发（ESP32 可能连 8443）— 异步线程避免阻塞
-            _th = threading.Thread(target=_https_forward_reminder, args=(text, mp3_data), daemon=True)
-            _th.start()
+            # 定向推送不走 HTTPS 转发：那个进程只有"广播"接口，转发等于发给所有人
+            if not targets:
+                _th = threading.Thread(target=_https_forward_reminder, args=(text, mp3_data), daemon=True)
+                _th.start()
             return "enqueued"
     except Exception as e:
         log.debug(f"[app.notifications] error at line 245: {e}")
@@ -275,6 +435,8 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None) -> str:
     clients = snapshot_xiaozhi_clients()
     pushed = 0
     for client_id, info in clients.items():
+        if targets and _client_uid(info) not in targets:
+            continue  # 别人的设备，不推
         ws = info["ws"]
         loop = info["loop"]
         try:
@@ -294,20 +456,27 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None) -> str:
 
     # 2. 本进程无连接 → 尝试 MQTT 直推 + 入队 + HTTPS 转发
     # 2a. MQTT 协议端（ESP32 常驻连接时直接推送，秒级响应）
-    try:
-        from app.mqtt_server import push_tts_to_mqtt
-        if push_tts_to_mqtt(text, mp3_data):
-            log.info(f"[xiaozhi-push] MQTT直推成功: {text[:30]}")
-            return "direct"
-    except Exception as e:
-        log.debug(f"[app.notifications] error at line 278: {e}")
-        pass
+    # ⚠️ 定向推送**跳过 MQTT**：MQTT 是广播通道，没有按设备过滤的能力，
+    #    走它就会把「妈妈的提醒」放到老于房间。
+    if not targets:
+        try:
+            from app.mqtt_server import push_tts_to_mqtt
+            if push_tts_to_mqtt(text, mp3_data):
+                log.info(f"[xiaozhi-push] MQTT直推成功: {text[:30]}")
+                return "direct"
+        except Exception as e:
+            log.debug(f"[app.notifications] error at line 278: {e}")
+            pass
 
     # 2b. 入队待 flush（ESP32 下次唤醒时补发）
-    qsize = enqueue_xiaozhi_pending(text, mp3_data, reminder_id=reminder_id)
+    qsize = enqueue_xiaozhi_pending(text, mp3_data, reminder_id=reminder_id,
+                                   target_uids=targets)
     log.info(f"[xiaozhi-push] ESP32未连接，入队({qsize}): {text[:30]}")
 
     # 3. 异步转发到 HTTPS 进程（ESP32 可能连 8443），不阻塞调度线程
+    if targets:
+        # 定向项不转发：对端只有广播接口，转发出去就等于发给所有设备
+        return "enqueued"
     import threading as _th
     _hport = https_port()
     mp3_b64 = _b64enc.b64encode(mp3_data).decode()

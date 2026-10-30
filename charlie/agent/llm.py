@@ -60,7 +60,11 @@ from agent.history import (
     _get_history, _append_history, _save_history,
     _trim_history_tokens,
 )
-from agent.system_msg import _build_system_msg, _build_lite_system_msg
+from agent.system_msg import (
+    _build_system_msg, _build_lite_system_msg,
+    _build_system_msg_static, _build_system_msg_static_cached,
+    _build_system_msg_dynamic,
+)
 from agent.asr_tts import _clean_for_tts, _tts_cleaned_to_mp3
 from agent.intent import LOW_INTENT_ASR_REPLY, is_low_intent_asr, is_garbled_asr
 from agent.working_memory import (
@@ -107,10 +111,16 @@ def _set_last_wm_session(sid: str) -> None:
 
 
 def _get_max_sentences() -> int:
-    """从 evolution_data 读取 max_sentences 适配状态（0 表示无限制）。"""
+    """从当前用户的 evolution_data 分片读取 max_sentences（0 表示无限制）。
+
+    uid 走 `resolve_user()`（ContextVar → session → env），不再直接读 env ——
+    否则妈妈设了简洁模式，老于的回复也一起变短。
+    """
     try:
         import json as _json
-        uid = os.environ.get("CHARLIE_USER_ID", "default")
+        from agent.user_context import resolve_user
+        uid = resolve_user()
+        # 调用期读 env：测试会先 import 再 setenv，不能在模块加载时冻结
         _data_dir = os.environ.get("ASSISTANT_KID_DATA_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         _evolution_file = os.path.join(_data_dir, f"evolution_data_{uid}.json" if uid != "default" else "evolution_data.json")
         if not os.path.exists(_evolution_file):
@@ -766,6 +776,16 @@ def _count_function_msgs(rsp: Any) -> int:
     return sum(1 for m in rsp if isinstance(m, dict) and m.get("role") == "function")
 
 
+def _resolve_uid(session_id: str | None = None) -> str:
+    """会话 → 用户 uid（FR-14 批次 3A 的唯一解析入口）。
+
+    直接转调 `agent.user_context.resolve_user()`：显式绑定 → 会话注册表 → env → default。
+    不要在 llm.py 里另写一套，否则优先级会与数据层漂移。
+    """
+    from agent.user_context import resolve_user
+    return resolve_user(session_id)
+
+
 def _tool_progress_text(tool_name: str) -> str:
     """生成工具调用进度提示文本。"""
     label = _TOOL_PROGRESS_LABELS.get(tool_name)
@@ -828,7 +848,10 @@ def _build_brain_inner(mcp_set="all", session_id="default"):
             tools = resolve_inproc_tools(mcp_set)
             log.info(f"[brain] 构建大脑(inproc) mcp_set={mcp_set}, {len(tools)}个工具")
             brain = Assistant(llm=llm_cfg, name='Charlie',
-                system_message=_build_system_msg(mcp_set, session_id=session_id),
+                # FR-14 3A：共享 brain 只承载**静态段**（与 session/用户无关）。
+                # 动态段（偏好/记忆/摘要/人格/房间）由每次调用注入 messages[0]，
+                # 否则 A 会话的内容会被 B 会话读到（4a 之前"串台"的根因）。
+                system_message=_build_system_msg_static(mcp_set),
                 function_list=tools)
             _install_openai_compat(brain)
             return brain
@@ -849,7 +872,8 @@ def _build_brain_inner(mcp_set="all", session_id="default"):
     log.info(f"[brain] 构建大脑(stdio) mcp_set={mcp_set}, 启用{len(mcp_servers)}个MCP: {list(mcp_servers.keys())}")
     tools = [{"mcpServers": mcp_servers}] if mcp_servers else []
     brain = Assistant(llm=llm_cfg, name='Charlie',
-        system_message=_build_system_msg(mcp_set, session_id=session_id),
+        # 同上：只放静态段
+        system_message=_build_system_msg_static(mcp_set),
         function_list=tools)
     _install_openai_compat(brain)
     _install_mcp_timeout_patch()
@@ -931,7 +955,12 @@ def _get_brain(mcp_set="none", session_id="default"):
                             log.info(f"[brain] 大脑构建完成: mcp={mcp_set}, 缓存总数={len(_st.brains)}")
     # system_message 刷新在锁外（cache miss 时构建耗时 50-200ms，
     # 持锁会阻塞失败计数/watchdog；实例属性赋值 GIL 下原子安全）
-    brain.system_message = _build_system_msg(mcp_set, session_id=session_id)
+    #
+    # ⚠️ 这里只刷**静态段**。这个 brain 对象是按 mcp_set 共享的，任何用户/会话
+    # 相关内容写进来都会被下一个用户读到（FR-14 3A 修的就是这个）。动态段见
+    # `brain_stream_sentences` / `_brain_llm` 注入的 messages[0]。
+    # 用 cached 版本：TTL 内返回同一个字符串对象，避免每轮重建 persona/规则/工具文档。
+    brain.system_message = _build_system_msg_static_cached(mcp_set)
     return brain
 
 _thread_loop_local = threading.local()
@@ -1057,7 +1086,21 @@ def reload_brain_config() -> str:
     log.info("[brain] 配置已热重载, 缓存大脑已清除, 下次请求用新配置重建")
     return "配置已生效，大脑将在下次对话时使用新配置重建"
 
-def set_current_user(user_id: str):
+def set_current_user(user_id: str, session_id: str | None = None):
+    """切换当前用户。
+
+    两条路径，语义**刻意不同**：
+
+    - `session_id` 非空（会话级切换）：只写 `user_context` 的 session 注册表。
+      不碰 `os.environ`、不改进程级 `_st.current_user_id`、不清全局响应缓存
+      —— 那三样都是进程级状态，一次会话切换会误伤正在服务的其他会话。
+    - `session_id` 为空（进程级切换，旧行为）：写 env + 进程级状态 + 清缓存。
+    """
+    if session_id:
+        from agent import user_context as _uc
+        _uc.set_session_user(session_id, user_id or "default")
+        log.info(f"[user] 会话 {session_id} 绑定用户: {user_id or 'default'}")
+        return
     _st.current_user_id = user_id or "default"
     os.environ["CHARLIE_USER_ID"] = _st.current_user_id
     # 切换用户后清响应缓存并失效上下文缓存，避免跨用户串台
@@ -1346,7 +1389,7 @@ def _brain_llm(text: str, session_id: str = "default") -> str:
     final = None
     for _attempt in range(_glm_tries):
         try:
-            brain_instance = _get_brain(mcp_set)
+            brain_instance = _get_brain(mcp_set, session_id=session_id)
         except Exception as e:
             _record_brain_failure(_fmt_exc(e)[:400])
             log.error(f"[brain] 构建失败: {e}", exc_info=True)
@@ -1356,9 +1399,20 @@ def _brain_llm(text: str, session_id: str = "default") -> str:
             return "大脑启动失败，请稍后重试。"
         hist = _get_history(session_id)
         messages = [{'role': m['role'], 'content': m['content']} for m in hist] + [{'role': 'user', 'content': text}]
+        # FR-14 批次 3A：与流式路径一致 —— 静态段来自共享 brain，动态段按本会话现拼，
+        # 合并成**一条** system（双 system 会让 qwen_agent 截断路径抛 400）。
+        _sys_parts_llm = [brain_instance.system_message]
+        try:
+            _dyn_llm = _build_system_msg_dynamic(session_id, _resolve_uid(session_id))
+            if _dyn_llm:
+                _sys_parts_llm.append(_dyn_llm)
+        except Exception as e:
+            log.debug(f"[brain_llm] 动态段注入失败({session_id}): {e}")
         _wm_prompt = _build_wm_anaphor_prompt()
         _mem_prompt = _recall_memory_prompt(text)
-        _sys_combined = "\n\n".join(p for p in (_wm_prompt, _mem_prompt) if p)
+        _sys_parts_llm.extend(p for p in (_wm_prompt, _mem_prompt) if p)
+        _sys_combined = "\n\n".join(
+            p for p in _sys_parts_llm if isinstance(p, str) and p)
         if _sys_combined:
             messages.insert(0, {'role': 'system', 'content': _sys_combined})
         _brain_start = time.time()
@@ -1514,7 +1568,12 @@ def _chat_lite_stream(text: str, session_id: str = "default", channel: str = "vo
     # 粗略估算 token 数：system + 历史；超限时裁剪早期消息
     total_chars = sum(len(m.get("content", "")) for m in messages)
     if total_chars > 4000:  # 中文约 2000 tokens
-        messages = messages[-4:]  # 保留最近 2 轮
+        # ⚠️ 只裁历史，system 必须保留。
+        # 旧实现 `messages = messages[-4:]` 在历史稍长时会把 system 一起丢掉，
+        # 模型随即丢失人格与规则（真实症状：自报 provider 身份"我是 Agnes"）。
+        _sys_msgs = [m for m in messages if m.get("role") == "system"]
+        _non_sys = [m for m in messages if m.get("role") != "system"]
+        messages = _sys_msgs + _non_sys[-2:]  # 保留所有 system + 最近 1 轮
     messages.append({"role": "user", "content": text})
     payload = {
         "model": model, "messages": messages,
@@ -1804,15 +1863,24 @@ def brain_stream_sentences(text: str, session_id: str = "default", interrupted_r
     # 仅允许一条且位于首位的 system——qwen_agent 截断路径遇双 system 直接抛 400
     # ModelServiceError（上下文超限时必现），故 channel 规则与工作记忆合并为一条
     _sys_parts = []
+    # 共享 brain 只持有静态段（_get_brain 保证），通道改写也只作用于它
+    _base_sys = brain_instance.system_message
     if channel in ("voice", "feishu_text"):
         try:
             from agent.system_msg import _replace_system_msg_for_channel
-            _sys_parts.append(_replace_system_msg_for_channel(brain_instance.system_message, channel))
+            _base_sys = _replace_system_msg_for_channel(_base_sys, channel)
         except Exception as e:
             log.debug(f"[agent.llm] error at line 1311: {e}")
             pass
-    else:
-        _sys_parts.append(brain_instance.system_message)
+    _sys_parts.append(_base_sys)
+    # FR-14 批次 3A：动态段（人格/偏好/记忆/摘要/房间/上下文）必须**按本次会话**
+    # 现拼。它是用户态，绝不能留在共享 brain 上，否则 A 会话的内容会被 B 读到。
+    try:
+        _dyn_seg = _build_system_msg_dynamic(session_id, _resolve_uid(session_id))
+        if _dyn_seg:
+            _sys_parts.append(_dyn_seg)
+    except Exception as e:
+        log.debug(f"[agent.llm] 动态段注入失败({session_id}): {e}")
     _wm_prompt = _build_wm_anaphor_prompt()
     if _wm_prompt:
         _sys_parts.append(_wm_prompt)

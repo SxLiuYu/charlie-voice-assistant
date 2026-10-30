@@ -55,14 +55,20 @@ def _get_quiet_hours_retry(now=None):
     return retry
 
 
-def _play_async(text: str, reminder_id=None, _feishu_done: bool = False):
-    """守护线程派发 play_reminder_audio，避免阻塞调度循环"""
-    def _task(_text=text, _rid=reminder_id, _feishu=_feishu_done):
+def _play_async(text: str, reminder_id=None, _feishu_done: bool = False,
+                owner: str | None = None):
+    """守护线程派发 play_reminder_audio，避免阻塞调度循环
+
+    `owner`（FR-14）：真提醒传 `reminder_owner(reminder)`，投递时定向到该用户设备；
+    系统级主动建议（晨报/健康/决策）**不传** ⇒ 广播，行为与改造前一致。
+    """
+    def _task(_text=text, _rid=reminder_id, _feishu=_feishu_done, _owner=owner):
         try:
             if _feishu:
-                play_reminder_audio(_text, reminder_id=_rid, _feishu_done=True)
+                play_reminder_audio(_text, reminder_id=_rid, _feishu_done=True,
+                                    owner=_owner)
             else:
-                play_reminder_audio(_text, reminder_id=_rid)
+                play_reminder_audio(_text, reminder_id=_rid, owner=_owner)
         except Exception:
             log.exception("[scheduler] 异步播报异常")
     threading.Thread(target=_task, daemon=True).start()
@@ -377,7 +383,15 @@ def _reminder_scheduler():
                     # add_notification 已推飞书，无需重复推送
                     continue
 
-                _play_async(text, reminder_id=rid, _feishu_done=True)
+                # 只有定向到具体用户时才多传 owner；"default" = 广播，
+                # 保持改造前的调用形状（老调用方/测试按原签名断言过）
+                from app.reminders import reminder_owner
+                _owner = reminder_owner(reminder)
+                if _owner and _owner != "default":
+                    _play_async(text, reminder_id=rid, _feishu_done=True,
+                                owner=_owner)
+                else:
+                    _play_async(text, reminder_id=rid, _feishu_done=True)
         except Exception as e:
             log.error(f"[reminder] 调度器异常: {e}")
         time.sleep(30)
@@ -401,6 +415,7 @@ def _proactive_suggestions():
                 log.info("[suggest] 已获取机器级运行锁，开始状态感知建议")
             now = datetime.datetime.now()
             hour = now.hour
+            minute = now.minute
             today = now.strftime("%Y-%m-%d")
 
             # 场景定时/天气触发器（每次循环检查）

@@ -302,6 +302,20 @@ _xiaozhi_pending: list[dict] = []  # [{"text": str, "mp3": bytes, "ts": float}]
 _PENDING_TTL = 300  # 5分钟内的待推项才补发（给MQTT wake + ESP32建连留余量）
 
 
+def _uid_for_client(client_id: str) -> str | None:
+    """连接 → 用户 uid；无法确定时返回 None（只取广播项）。"""
+    device_key = xiaozhi_client_device(client_id)
+    if not device_key:
+        return None
+    try:
+        from agent.device_users import resolve_device_user
+        uid = resolve_device_user(device_key)
+    except Exception as e:
+        log.debug(f"[xiaozhi] 设备归属解析失败({device_key}): {e}")
+        return None
+    return uid or None
+
+
 async def _do_flush_xiaozhi_pending(pending: list, ws, loop) -> int:
     """Internal: flush a list of pending items to a connected WS.
 
@@ -345,12 +359,8 @@ async def flush_xiaozhi_pending(session_id: str, ws, loop) -> int:
 
     Returns the number of items handed off to the background task.
     """
-    with _xiaozhi_lock:
-        now = time.time()
-        pending = [p for p in _xiaozhi_pending if now - p["ts"] < _PENDING_TTL]
-        # Remove only the TTL-valid items we are about to flush; expired ones
-        # are left to be cleaned on the next enqueue or flush call.
-        _xiaozhi_pending[:] = [p for p in _xiaozhi_pending if now - p["ts"] >= _PENDING_TTL]
+    # 按本连接的设备归属取件：定向项不匹配就留在队列，等目标设备上线
+    pending = _take_pending_for_flush(_uid_for_client(session_id))
     if not pending:
         return 0
     log.info("[xiaozhi] flush_xiaozhi_pending: %d items for %s", len(pending), session_id)
@@ -366,11 +376,18 @@ async def flush_xiaozhi_pending(session_id: str, ws, loop) -> int:
 
 
 def register_xiaozhi_client(client_id: str, ws, loop) -> list:
-    """注册 xiaozhi ESP32 WebSocket 连接，并 flush 待推送队列"""
+    """注册 xiaozhi ESP32 WebSocket 连接，并 flush 待推送队列
+
+    ⚠️ 注册时 hello 往往还没到，`device_key` 未知 ⇒ 只取广播项。
+    定向项留给 `flush_xiaozhi_pending`（那时身份已确定），
+    或等目标设备自己连上来 —— 不能被"先连上的别人"吃掉。
+    """
     with _xiaozhi_lock:
         _xiaozhi_clients[client_id] = {"ws": ws, "loop": loop}
-        pending = list(_xiaozhi_pending)
-        _xiaozhi_pending.clear()
+    # ⚠️ 必须在锁外取件：`_uid_for_client` / `_take_pending_for_flush` 自己会加
+    # 同一把 `_xiaozhi_lock`（非重入 Lock），在锁内调用会直接死锁 —— 表现为
+    # 连接建立时整个 WS 握手卡住（历史症状：xiaozhi_ws 全套用例 TimeoutError）。
+    pending = _take_pending_for_flush(_uid_for_client(client_id))
     log.info(f"[xiaozhi] 客户端已注册: {client_id} (总计: {len(_xiaozhi_clients)}, 待推送: {len(pending)})")
     # 在注册后直接 flush 补发，并在成功后标记提醒完成
     if pending:
@@ -381,14 +398,126 @@ def register_xiaozhi_client(client_id: str, ws, loop) -> list:
     return []
 
 
-def enqueue_xiaozhi_pending(text: str, mp3: bytes, reminder_id=None) -> int:
-    """ESP32未连接时，将推送暂存队列。返回队列长度。"""
+def set_xiaozhi_client_device(client_id: str, device_key: str) -> None:
+    """给已注册的 xiaozhi 连接补上设备号（hello 拿到 device_key 之后）。
+
+    hello 帧可能早于/晚于 `register_xiaozhi_client()`，两种顺序都不能抛异常：
+    连接不存在时静默 no-op。空参数一律不写 —— 否则 `device_key=""` 会让
+    「设备→用户」映射把这条连接误判成"已绑定空设备"。
+
+    清洗规则复用 `agent.device_users._sanitize_device_key`，与映射表写入侧
+    保持同一套规则（含冒号的 MAC 必须原样保留，否则绑定会静默失效）。
+    """
+    if not client_id or not device_key:
+        return
+    try:
+        from agent.device_users import _sanitize_device_key
+        dk = _sanitize_device_key(device_key)
+    except Exception as e:
+        log.debug(f"[xiaozhi] device_key 清洗失败: {e}")
+        return
+    if not dk:
+        return
+    with _xiaozhi_lock:
+        info = _xiaozhi_clients.get(client_id)
+        if info is None:
+            return
+        info["device_key"] = dk
+
+
+def xiaozhi_client_device(client_id: str) -> str:
+    """查某连接的设备号；未注册/未设置返回空串。"""
+    if not client_id:
+        return ""
+    with _xiaozhi_lock:
+        info = _xiaozhi_clients.get(client_id) or {}
+        return str(info.get("device_key") or "")
+
+
+def enqueue_xiaozhi_pending(text: str, mp3: bytes, reminder_id=None,
+                            target_uids=()) -> int:
+    """ESP32未连接时，将推送暂存队列。返回队列长度。
+
+    `target_uids`（FR-14 批次 4b）：空元组 = 广播，任何设备上线都能取；
+    非空 = 只有 `uid in target_uids` 的设备在 flush 时能取走，其余设备
+    **原样留在队列**（不能被"别人的设备"静默吃掉）。
+    """
     import time
+    targets = tuple(target_uids or ())
     with _xiaozhi_lock:
         now = time.time()
         # 清理过期项
         _xiaozhi_pending[:] = [p for p in _xiaozhi_pending if now - p["ts"] < _PENDING_TTL]
-        _xiaozhi_pending.append({"text": text, "mp3": mp3, "ts": now, "reminder_id": reminder_id})
+        # 去重：同文本 + 同目标 = 同一条投递。刷新时间戳和音频即可，
+        # 否则「磁盘空间不足」这类反复触发的告警会在队列里堆出多份，
+        # 设备上线时连播 N 遍（真实事故 2026-09-17）。
+        for item in _xiaozhi_pending:
+            if item.get("text") != text:
+                continue
+            if tuple(item.get("target_uids") or ()) != targets:
+                continue
+            item["ts"] = now
+            item["mp3"] = mp3
+            if reminder_id is not None:
+                # 不带 reminder_id 的重复入队不能把已有的抹掉
+                item["reminder_id"] = reminder_id
+            return len(_xiaozhi_pending)
+        _xiaozhi_pending.append({"text": text, "mp3": mp3, "ts": now,
+                                 "reminder_id": reminder_id,
+                                 "target_uids": targets})
+        return len(_xiaozhi_pending)
+
+
+def _take_pending_for_flush(uid: str | None) -> list:
+    """按用户取走可投递的待推送项（`uid=None` 表示身份未知，只取广播项）。
+
+    ⚠️ 定向项不匹配时**必须留在队列**：吃掉就等于提醒静默丢失，
+    而目标设备下次上线本来还能补发。过期项无论是否匹配都清掉。
+    """
+    import time
+    now = time.time()
+    taken: list = []
+    with _xiaozhi_lock:
+        keep: list = []
+        for item in _xiaozhi_pending:
+            if now - item["ts"] >= _PENDING_TTL:
+                continue  # 过期，丢弃（不分目标）
+            targets = tuple(item.get("target_uids") or ())
+            if not targets or (uid and uid in targets):
+                taken.append(item)
+            else:
+                keep.append(item)
+        _xiaozhi_pending[:] = keep
+    return taken
+
+
+def drop_xiaozhi_pending(text: str) -> int:
+    """把队列里文本相同的项全部删掉，返回删除条数。
+
+    兜底通道（飞书）**确认送达**后调用，避免设备上线时重复播报。
+    ⚠️ 空文本是"无操作"哨兵：不能当成"匹配全部"，否则会把整个队列清空。
+    """
+    if not text:
+        return 0
+    dropped = 0
+    with _xiaozhi_lock:
+        keep = []
+        for item in _xiaozhi_pending:
+            if item.get("text") == text:
+                dropped += 1
+            else:
+                keep.append(item)
+        if dropped:
+            _xiaozhi_pending[:] = keep
+    return dropped
+
+
+def _requeue_xiaozhi_pending(items: list) -> int:
+    """把没投递成功的项放回队列头部，保留 `target_uids`。返回队列长度。"""
+    if not items:
+        return len(_xiaozhi_pending)
+    with _xiaozhi_lock:
+        _xiaozhi_pending[:0] = list(items)
         return len(_xiaozhi_pending)
 
 

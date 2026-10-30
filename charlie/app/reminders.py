@@ -219,8 +219,62 @@ def _load_reminders():
         return _read_locked_reminders()
 
 
+# ===== FR-14: 每条提醒的归属用户 =====
+#
+# ⚠️ `reminders.json` **不分片**（单一共享文件）。隔离靠每条记录的 `owner` 字段：
+# 写时打标、读时过滤。全局视图（调度器 / 晨报 / 管理台）继续用 `_load_reminders()`。
+#
+# 写路径与读路径的解绑规则**刻意不对称**：
+#   - 写（`_owner_for_new_reminder`）：显式 > bind_user > "default"。**不读 env**。
+#     因为 env 是进程级遗留配置，在"有 CHARLIE_USER_ID 但该用户没有设备映射"
+#     的老配置下，会给新提醒打上 user 标签，然后投递时既推不出去也不广播
+#     —— 用户只看到"已添加提醒"，实际进黑洞。
+#   - 读（`_resolve_owner`）：显式 > resolve_user()（含 env 兜底）。
+#     老配置用户问"我有哪些提醒"时仍能看到自己那批历史数据。
+
+import agent.user_context as _uc  # noqa: E402  (放在这里避免顶部循环导入)
+
+
+def reminder_owner(reminder: dict) -> str:
+    """取某条提醒的归属用户；旧数据没有 owner 字段时归 `"default"`。"""
+    if not isinstance(reminder, dict):
+        return _uc.DEFAULT_USER
+    owner = str(reminder.get("owner") or "").strip()
+    return owner or _uc.DEFAULT_USER
+
+
+def _owner_for_new_reminder(explicit: str | None = None) -> str:
+    """新提醒该归谁（写路径）：显式 > 当前执行流绑定 > default。**不读 env。**"""
+    if explicit:
+        return explicit
+    return _uc.current_binding() or _uc.DEFAULT_USER
+
+
+def _resolve_owner(uid: str | None = None) -> str:
+    """读取视角的用户（读路径）：显式 > ContextVar > session > env > default。"""
+    if uid:
+        return uid
+    return _uc.resolve_user()
+
+
+def list_reminders_for(uid: str | None = None,
+                       include_completed: bool = False) -> list:
+    """返回**某个用户**的提醒列表，按 due 升序。
+
+    `uid` 为空时按当前执行流解析（含 env 兜底，见 `_resolve_owner`）。
+    没有 `owner` 字段的旧提醒不归任何人，因此不会出现在这里
+    —— 它们仍能在全局视图 `list_reminders()` 里看到。
+    """
+    owner = _resolve_owner(uid)
+    reminders = [r for r in _load_reminders()
+                 if isinstance(r, dict) and reminder_owner(r) == owner]
+    if not include_completed:
+        reminders = [r for r in reminders if not r.get("done")]
+    return sorted(reminders, key=lambda r: r.get("due", "") or "")
+
+
 def list_reminders(include_completed: bool = False) -> list:
-    """返回提醒列表，按 due 升序。
+    """返回**全部**提醒（全局视图），按 due 升序。
 
     include_completed=False 时过滤已完成提醒。
     """
@@ -267,19 +321,24 @@ def _save_reminders(data):
             pass
 
 
-def append_reminder(text: str, time_str: str = "", due: str | None = None, repeat: str = "") -> dict:
+def append_reminder(text: str, time_str: str = "", due: str | None = None,
+                    repeat: str = "", owner: str | None = None) -> dict:
     """在排他锁内完成新增提醒的读改写，返回写入后的提醒副本。
 
     repeat: ""=一次性, "daily"=每天, "weekly"=每周, "weekdays"=工作日
+    owner:  归属用户；不传时按 `_owner_for_new_reminder()` 解析
+            （显式 > bind_user > "default"，**不读 env**，见该函数说明）
 
-    去重：已存在相同 text + repeat + due(±60s) 的未完成提醒时，复用已有项，
-    防止晚安场景重复触发导致同内容多份提醒堆积。
+    去重：已存在相同 text + repeat + due(±60s) **且同 owner** 的未完成提醒时，
+    复用已有项。owner 必须参与判重 —— 否则老于和妈妈各自的"喝水提醒"会被
+    合并成一条，谁先建就归谁，另一个人的提醒凭空消失。
     """
+    owner = _owner_for_new_reminder(owner)
     now = dt.datetime.now()
     with _locked_reminders():
         reminders = _read_locked_reminders()
 
-        # 去重检查：同 text + repeat + due(±60s) 且未完成
+        # 去重检查：同 text + repeat + due(±60s) + owner 且未完成
         norm_due = due or ""
         if norm_due:
             try:
@@ -294,6 +353,8 @@ def append_reminder(text: str, time_str: str = "", due: str | None = None, repea
             if existing.get("text", "").strip() != text.strip():
                 continue
             if existing.get("repeat", "") != repeat:
+                continue
+            if reminder_owner(existing) != owner:
                 continue
             ex_due = existing.get("due", "")
             if due_dt and ex_due:
@@ -322,6 +383,7 @@ def append_reminder(text: str, time_str: str = "", due: str | None = None, repea
             "due": due,
             "done": False,
             "repeat": repeat if repeat in ("daily", "weekly", "weekdays") else "",
+            "owner": owner,
         }
         reminders.append(item)
         reminders, removed = _cleanup_old_reminders(reminders)
@@ -510,6 +572,9 @@ def _generate_next_occurrence_locked(reminder: dict, reminders: list, now: dt.da
             "due": next_due.isoformat(),
             "done": False,
             "repeat": repeat,
+            # ⚠️ 必须继承 owner：漏了的话循环提醒从第二天起变成广播，
+            # 全屋所有设备都会响（真实症状：一个人的起床提醒吵醒全家人）。
+            "owner": reminder_owner(reminder),
         })
         reminder["next_generated"] = True
         log.info(f"[reminders] 循环提醒{reminder.get('id')}已生成下次: id={next_id} due={next_due.isoformat()}")
