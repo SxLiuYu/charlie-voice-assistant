@@ -557,14 +557,16 @@ class TestPlayReminderAudioOwner:
         """
         from app.notifications import play_reminder_audio
         play_reminder_audio("吃药", reminder_id=1, owner="default")
-        assert mock_push.call_args.kwargs["target_uids"] is None
+        # 广播路径**不传**该参数（保持改造前的实参形状，老用例按原签名断言过），
+        # 缺省即 None —— 用 get() 断言语义不变。
+        assert mock_push.call_args.kwargs.get("target_uids") is None
 
     @patch("app.notifications.push_tts_to_xiaozhi", return_value="direct")
     @patch("voice_agent.tts_to_mp3", return_value=b"x" * 500)
     def test_no_owner_is_broadcast(self, mock_tts, mock_push, rem, no_binding):
         from app.notifications import play_reminder_audio
         play_reminder_audio("吃药", reminder_id=1)
-        assert mock_push.call_args.kwargs["target_uids"] is None
+        assert mock_push.call_args.kwargs.get("target_uids") is None
 
     @patch("app.notifications.push_tts_to_xiaozhi", return_value="direct")
     @patch("voice_agent.tts_to_mp3", return_value=b"x" * 500)

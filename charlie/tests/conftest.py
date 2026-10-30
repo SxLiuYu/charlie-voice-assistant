@@ -18,6 +18,19 @@ os.environ.setdefault("TTS_VOICE", "Cherry")
 os.environ.setdefault("SKIP_BACKGROUND", "1")  # 跳过后台调度器
 os.environ.setdefault("AGNES_KEY", "test-agnes-key")  # LLM provider 测试用
 
+# provider 优先级链：钉死测试基线，避免开发者本地 .env 覆盖后
+# "只有某些人跑会挂"。load_dotenv() 不覆盖已存在的 env，这里先设即生效。
+# nmcloud 不在列表里 —— 测试不依赖真实自建云。
+os.environ.setdefault("LLM_PRIORITY", "agnes,sagnes,stepfun,glm,ark")
+os.environ.setdefault("ASR_PRIORITY", "sensevoice,baidu,stepfun,vosk")
+os.environ.setdefault("TTS_PRIORITY", "baidu,stepfun,finna")
+# 端口同理：本地 .env 常改端口跑多实例，测试断言的是默认值。
+os.environ.setdefault("ASSISTANT_KID_HTTP_PORT", "8000")
+os.environ.setdefault("ASSISTANT_KID_HTTPS_PORT", "8443")
+# 高德：多份测试模块各自 `setdefault("AMAP_KEY", "test")`，但本地 .env 里
+# 写 `AMAP_KEY=`（空值）会被 load_dotenv 抢先设成空串，setdefault 就失效了。
+os.environ.setdefault("AMAP_KEY", "test-amap-key")
+
 # 测试必须使用独立数据/日志目录，避免覆盖真实对话、提醒、偏好和运行日志。
 _TEST_DATA_DIR = tempfile.mkdtemp(prefix="charlie-test-data-")
 _TEST_LOG_DIR = tempfile.mkdtemp(prefix="charlie-test-logs-")
