@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 
 class TestProviderRegistry:
-    def test_providers_has_five_providers(self):
+    def test_providers_has_six_providers(self):
         from app.llm_config import PROVIDERS
-        assert set(PROVIDERS.keys()) == {"agnes", "sagnes", "stepfun", "glm", "ark"}
+        assert set(PROVIDERS.keys()) == {"nmcloud", "agnes", "sagnes", "stepfun", "glm", "ark"}
 
     def test_resolve_returns_agnes_when_configured(self):
         from app.llm_config import resolve

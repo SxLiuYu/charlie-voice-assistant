@@ -36,6 +36,20 @@ log = logging.getLogger("magic")
 # ======================================================================
 
 PROVIDERS: dict[str, dict] = {
+    "nmcloud": {
+        "base_env": "NM_CLOUD_BASE",
+        "key_env": "NM_CLOUD_KEY",
+        "model_env": "NM_CLOUD_MODEL",
+        "default_base": "https://www.sxliuyu.bond/v1",
+        "default_key": "",
+        "default_model": "deepseek-v4.1-flash",
+        "max_tokens": 1024,
+        "thinking_disabled": True,
+        "label": "nanoMuse 自建云",
+        # 自建 relay（nanomuse-cloud + agent2api），同一把 key 也提供
+        # /v1/audio/speech（百度 TTS）与 /v1/audio/transcriptions（百度 ASR）。
+        # deepseek-v4.1-flash 支持 tool_call / stream，reasoning 可关。
+    },
     "agnes": {
         "base_env": "AGNES_BASE",
         "key_env": "AGNES_KEY",
@@ -100,6 +114,10 @@ PROVIDERS: dict[str, dict] = {
 # 从环境变量读取（与原始行为一致，importlib.reload 后自动反映 env 变化）
 # ======================================================================
 
+NM_CLOUD_BASE: str = os.getenv("NM_CLOUD_BASE", PROVIDERS["nmcloud"]["default_base"])
+NM_CLOUD_KEY: str = os.getenv("NM_CLOUD_KEY", "")
+NM_CLOUD_MODEL: str = os.getenv("NM_CLOUD_MODEL", PROVIDERS["nmcloud"]["default_model"])
+
 AGNES_BASE: str = os.getenv("AGNES_BASE", PROVIDERS["agnes"]["default_base"])
 AGNES_KEY: str = os.getenv("AGNES_KEY", "")
 AGNES_MODEL: str = os.getenv("AGNES_MODEL", PROVIDERS["agnes"]["default_model"])
@@ -120,9 +138,10 @@ ARK_BASE: str = os.getenv("ARK_BASE", PROVIDERS["ark"]["default_base"])
 ARK_KEY: str = os.getenv("ARK_KEY", "")
 ARK_MODEL: str = os.getenv("ARK_MODEL", PROVIDERS["ark"]["default_model"])
 
-# LLM 优先级链（默认 stepfun → agnes → sagnes → glm → ark，import 时读一次 env）
+# LLM 优先级链（默认 nmcloud → stepfun → agnes → sagnes → glm → ark，import 时读一次 env）
+DEFAULT_LLM_PRIORITY = "nmcloud,stepfun,agnes,sagnes,glm,ark"
 LLM_PRIORITY: list[str] = [
-    p.strip() for p in os.getenv("LLM_PRIORITY", "stepfun,agnes,sagnes,glm,ark").lower().split(",")
+    p.strip() for p in os.getenv("LLM_PRIORITY", DEFAULT_LLM_PRIORITY).lower().split(",")
     if p.strip() and p.strip() in PROVIDERS
 ]
 
@@ -174,7 +193,7 @@ def _get_provider_cfg(name: str) -> dict:
 
 def _get_priority_list() -> list[str]:
     """获取当前 LLM 优先级链（仅含 registry 中存在的 provider 名）"""
-    raw = os.getenv("LLM_PRIORITY", "stepfun,agnes,sagnes,glm,ark").lower().split(",")
+    raw = os.getenv("LLM_PRIORITY", DEFAULT_LLM_PRIORITY).lower().split(",")
     return [p.strip() for p in raw if p.strip() and p.strip() in PROVIDERS]
 
 
@@ -184,6 +203,10 @@ def _get_priority_list() -> list[str]:
 
 def is_agnes_configured() -> bool:
     return _is_provider_configured("agnes")
+
+
+def is_nmcloud_configured() -> bool:
+    return _is_provider_configured("nmcloud")
 
 
 def is_sagnes_configured() -> bool:
@@ -305,11 +328,11 @@ def resolve() -> dict:
     raise RuntimeError(
         "未配置 LLM。请至少配置一个 LLM Provider 的 API Key。\n"
         "配置示例:\n"
-        "  LLM_PRIORITY=stepfun,agnes,sagnes,glm,ark  (按优先级排列)\n"
+        "  LLM_PRIORITY=nmcloud,stepfun,agnes,sagnes,glm,ark  (按优先级排列)\n"
         "\n"
         "可用节点:\n"
         + "\n".join(available) +
-        "\n\n获取 Key: https://console.agnes-ai.com  (Agnes 有免费额度)"
+        "\n\n获取 Key: https://www.sxliuyu.bond (自建) / https://console.agnes-ai.com (Agnes 有免费额度)"
     )
 
 

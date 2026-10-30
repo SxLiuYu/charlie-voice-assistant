@@ -196,15 +196,15 @@ class TestTTSPriority:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestProviderRegistry:
-    def test_asr_providers_has_four(self):
+    def test_asr_providers_has_five(self):
         from agent.asr_tts import _ASR_PROVIDERS
-        assert set(_ASR_PROVIDERS.keys()) == {"sensevoice", "baidu", "stepfun", "vosk"}
+        assert set(_ASR_PROVIDERS.keys()) == {"sensevoice", "nmcloud", "baidu", "stepfun", "vosk"}
 
-    def test_tts_providers_has_four(self):
+    def test_tts_providers_has_seven(self):
         from agent.asr_tts import _TTS_PROVIDERS
-        # 6 个 provider：audio8(本地克隆) / cosyvoice(克隆，惰性加载占位 None)
+        # 7 个 provider：nmcloud(自建云) / audio8(本地克隆) / cosyvoice(克隆，惰性加载占位 None)
         assert set(_TTS_PROVIDERS.keys()) == {
-            "baidu", "finna", "stepfun", "edge", "audio8", "cosyvoice"}
+            "nmcloud", "baidu", "finna", "stepfun", "edge", "audio8", "cosyvoice"}
         # cosyvoice 注册前是占位 None，由 tts() 分发循环惰性加载
         assert _TTS_PROVIDERS["cosyvoice"] is None
 

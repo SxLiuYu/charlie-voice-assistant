@@ -108,8 +108,8 @@ def get_current_emotion() -> str:
     """获取当前轮 TTS 情感，空串=默认中性。"""
     return getattr(_emotion_ctx, "emotion", "")
 
-ASR_PRIORITY = [p.strip() for p in os.getenv("ASR_PRIORITY", "sensevoice,baidu,stepfun,vosk").split(",") if p.strip()]
-TTS_PRIORITY = [p.strip() for p in os.getenv("TTS_PRIORITY", "audio8,baidu,stepfun,finna").split(",") if p.strip()]
+ASR_PRIORITY = [p.strip() for p in os.getenv("ASR_PRIORITY", "sensevoice,nmcloud,baidu,stepfun,vosk").split(",") if p.strip()]
+TTS_PRIORITY = [p.strip() for p in os.getenv("TTS_PRIORITY", "nmcloud,baidu,stepfun,finna").split(",") if p.strip()]
 
 # ===== 规范音色 → 各 provider 音色映射（单一真相源）=====
 # 角色 tts_voice 使用规范音色名，由 resolve_voice 翻译成各 provider 的具体音色ID。
@@ -210,8 +210,8 @@ def reload() -> None:
     TTS_CACHE_MAX = int(os.getenv("TTS_CACHE_MAX", "200"))
     _tts_speed = float(os.getenv("TTS_SPEED", "1.0"))
 
-    ASR_PRIORITY = [p.strip() for p in os.getenv("ASR_PRIORITY", "sensevoice,baidu,stepfun,vosk").split(",") if p.strip()]
-    TTS_PRIORITY = [p.strip() for p in os.getenv("TTS_PRIORITY", "audio8,baidu,stepfun,finna").split(",") if p.strip()]
+    ASR_PRIORITY = [p.strip() for p in os.getenv("ASR_PRIORITY", "sensevoice,nmcloud,baidu,stepfun,vosk").split(",") if p.strip()]
+    TTS_PRIORITY = [p.strip() for p in os.getenv("TTS_PRIORITY", "nmcloud,baidu,stepfun,finna").split(",") if p.strip()]
 
     # 清空旧 token（内存 + 落盘文件），下次用新凭证重新获取
     with _baidu_token_lock:
@@ -399,6 +399,9 @@ def tts(text: str) -> bytes:
         if name == "stepfun" and not os.getenv("STEPFUN_KEY", ""):
             log.debug("[tts] StepFun 未配置，跳过")
             continue
+        if name == "nmcloud" and not os.getenv("NM_CLOUD_KEY", "").strip():
+            log.debug("[tts] nanoMuse 云未配置，跳过")
+            continue
         try:
             audio = _retry(lambda fn=provider_fn: fn(cleaned), name=f"TTS({name})")
         except TTSUnavailableError as e:
@@ -450,6 +453,9 @@ def asr(audio_bytes: bytes, fmt: str = "mp3", session_id: str = "default") -> st
         if name == "stepfun" and not os.getenv("STEPFUN_KEY", ""):
             log.debug("[asr] StepFun 未配置，跳过")
             continue
+        if name == "nmcloud" and not os.getenv("NM_CLOUD_KEY", "").strip():
+            log.debug("[asr] nanoMuse 云未配置，跳过")
+            continue
         try:
             text = provider_fn(audio_bytes, fmt)
             if text:
@@ -493,24 +499,38 @@ def _get_race_pool() -> ThreadPoolExecutor:
     return _RACE_POOL
 
 
-def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", deadline_ms: int | None = None) -> tuple[str, str]:
-    """ASR 竞速择优：并行发起本地 SenseVoice 与云端 StepFun，按质量/延迟策略选择结果。
+def _race_cloud_provider() -> tuple[Any, str]:
+    """竞速用云端 ASR：按 ASR_PRIORITY 里 nmcloud / stepfun 的顺序挑第一个已配置的。
 
-    返回 (text, provider)，provider 为 sensevoice / stepfun / legacy / none。
+    返回 (provider_fn, provider_name)；都没配返回 (None, "")。
+    """
+    for name in ASR_PRIORITY:
+        if name == "nmcloud" and os.getenv("NM_CLOUD_KEY", "").strip():
+            return _asr_nmcloud, "nmcloud"
+        if name == "stepfun" and os.getenv("STEPFUN_KEY", "").strip():
+            return _asr_stepfun, "stepfun"
+    return None, ""
+
+
+def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", deadline_ms: int | None = None) -> tuple[str, str]:
+    """ASR 竞速择优：并行发起本地 SenseVoice 与云端 ASR，按质量/延迟策略选择结果。
+
+    云端按 ASR_PRIORITY 在 nmcloud / stepfun 之间取第一个已配置者。
+    返回 (text, provider)，provider 为 sensevoice / nmcloud / stepfun / legacy / none。
     任何异常降级到现有串行 asr()。
     """
     # 回退开关：ASR_RACE=0 时完全走旧路径
     if os.getenv("ASR_RACE", "1") != "1":
         return asr(audio_bytes, fmt, session_id), "legacy"
 
-    stepfun_configured = bool(os.getenv("STEPFUN_KEY", ""))
-    if not stepfun_configured:
+    cloud_fn, cloud_name = _race_cloud_provider()
+    if cloud_fn is None:
         # 云端未配置，只跑本地
         t0 = time.perf_counter()
         try:
             text = _asr_sense_voice(audio_bytes, fmt)
             ms = (time.perf_counter() - t0) * 1000
-            log.info(f"[asr-race] 本地={ms:.0f}ms 云端=N/A(未配置) 选择=local 原因=stepfun未配置")
+            log.info(f"[asr-race] 本地={ms:.0f}ms 云端=N/A(未配置) 选择=local 原因=云端未配置")
             return text, "sensevoice"
         except Exception as e:
             log.warning(f"[asr-race] local failed: {e}")
@@ -529,7 +549,7 @@ def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", 
 
     pool = _get_race_pool()
     local_future = pool.submit(_asr_sense_voice, audio_bytes, fmt)
-    cloud_future = pool.submit(_asr_stepfun, audio_bytes, fmt)
+    cloud_future = pool.submit(cloud_fn, audio_bytes, fmt)
 
     try:
         done, not_done = wait(
@@ -569,7 +589,7 @@ def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", 
             cloud_text = correct_asr_text(cloud_text, session_id=session_id)
         except Exception as e:
             log.debug(f"[agent.asr_tts] error at line ...: {e}")
-        return cloud_text, "stepfun"
+        return cloud_text, cloud_name
 
     # Case B: Cloud failed/empty, wait for local if still running
     if cloud_done and not cloud_text:
@@ -608,7 +628,7 @@ def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", 
                         cloud_text = correct_asr_text(cloud_text, session_id=session_id)
                     except Exception as e:
                         log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                    return cloud_text, "stepfun"
+                    return cloud_text, cloud_name
                 else:
                     log.info(f"[asr-race] 本地={local_ms:.0f}ms 云端=err 选择=local 原因=本地干净+云端失败")
                     try:
@@ -635,7 +655,7 @@ def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", 
                                 cloud_text = correct_asr_text(cloud_text, session_id=session_id)
                             except Exception as e:
                                 log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                            return cloud_text, "stepfun"
+                            return cloud_text, cloud_name
                     except Exception:
                         pass
 
@@ -670,7 +690,7 @@ def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", 
                     cloud_text = correct_asr_text(cloud_text, session_id=session_id)
                 except Exception as e:
                     log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                return cloud_text, "stepfun"
+                return cloud_text, cloud_name
 
             if local_text is not None:
                 log.info(f"[asr-race] 本地={local_ms or 'N/A'}ms 云端={'err' if cloud_ms is None else f'{cloud_ms:.0f}ms'} 选择=local 原因=云端也失败")
@@ -741,6 +761,45 @@ def _asr_sense_voice(audio_bytes: bytes, fmt: str = "mp3") -> str:
     if not text:
         raise RuntimeError("SenseVoice 识别为空")
     return text
+
+def _asr_nmcloud(audio_bytes: bytes, fmt: str = "mp3") -> str:
+    """nanoMuse 自建云 ASR (OpenAI-compatible /audio/transcriptions)
+
+    自建 relay 把 whisper-1 映射到百度短语音识别（实测 0.39~0.55s），
+    Key 与 LLM/TTS 共用一把 NM_CLOUD_KEY。
+    """
+    api_key = os.getenv("NM_CLOUD_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("nanoMuse 云 Key 未配置")
+    base = os.getenv("NM_CLOUD_BASE", "https://www.sxliuyu.bond/v1").rstrip("/")
+    # 百度短语音接口按 mp3/wav 都能吃，但服务端内部会用 ffmpeg 解码；
+    # 统一用 wav 送进去，避免不同上游 codec 差异。
+    if fmt != "wav":
+        import subprocess
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1"],
+            input=audio_bytes, capture_output=True, timeout=10)
+        if not r.stdout or len(r.stdout) < 100:
+            raise RuntimeError("音频转换失败")
+        audio_bytes = r.stdout
+    # 极短音频守卫：<0.35s 百度多半返回空结果，提前短路省一次往返
+    duration_s = len(audio_bytes) / (16000 * 2)
+    if duration_s < 0.35:
+        raise RuntimeError("音频过短，跳过 nanoMuse 云 ASR")
+    from voice_agent import _session
+    r = _session.post(
+        f"{base}/audio/transcriptions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+        data={"model": os.getenv("NM_CLOUD_ASR_MODEL", "whisper-1")},
+        timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"nanoMuse 云 ASR HTTP {r.status_code}: {r.text[:200]}")
+    text = (r.json().get("text") or "").strip()
+    if not text:
+        raise RuntimeError("nanoMuse 云 ASR 识别为空")
+    return text
+
 
 def _asr_stepfun(audio_bytes: bytes, fmt: str = "mp3") -> str:
     """StepFun ASR (OpenAI-compatible /audio/transcriptions, ~0.8s)"""
@@ -919,6 +978,47 @@ def _asr_baidu(audio_bytes: bytes, fmt: str = "mp3") -> str:
             _baidu_invalidate_token()
         raise RuntimeError(f"百度ASR错误 {err_no}: {data.get('err_msg', '')}")
     return data.get("result", [""])[0]
+
+def _tts_nmcloud(text: str) -> bytes:
+    """nanoMuse 自建云 TTS (OpenAI-compatible /audio/speech)
+
+    自建 relay 把 tts-1 映射到百度短文本合成（实测 0.10~0.20s），
+    返回 MP3 64kbps/16kHz。Key 与 LLM/ASR 共用一把 NM_CLOUD_KEY。
+    """
+    api_key = os.getenv("NM_CLOUD_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("nanoMuse 云 Key 未配置")
+    base = os.getenv("NM_CLOUD_BASE", "https://www.sxliuyu.bond/v1").rstrip("/")
+    voice, speed = get_effective_tts_config()
+    # nmcloud 的音色 ID 是 baidu-0/1/3/4；角色配置里的规范音色映射过去。
+    # 服务端只认基础音库四档，_VOICE_MAP 里 per=5（普通女声）在自建云上没有对应项，
+    # 收敛到 per=4（度丫丫）而不是发一个服务端会 400 的 ID。
+    per = resolve_voice(voice, "baidu")
+    if per not in (0, 1, 3, 4):
+        per = 4
+    voice_id = os.getenv("NM_CLOUD_TTS_VOICE", "") or f"baidu-{per}"
+    from voice_agent import _session
+    r = _session.post(
+        f"{base}/audio/speech",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": os.getenv("NM_CLOUD_TTS_MODEL", "tts-1"),
+            "input": text,
+            "voice": voice_id,
+            "response_format": "mp3",
+            "speed": speed,
+        },
+        timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"nanoMuse 云 TTS HTTP {r.status_code}: {r.text[:200]}")
+    audio = r.content
+    if not audio or len(audio) < 100:
+        raise RuntimeError("nanoMuse 云 TTS 返回空音频")
+    return audio
+
 
 def _tts_finna(text: str) -> bytes:
     from voice_agent import _session
@@ -1138,12 +1238,14 @@ def _tts_audio8_stream(text: str, chunk_cb=None):
 # ── Provider 注册表（供 ASR_PRIORITY / TTS_PRIORITY 按需遍历） ──────────────
 _ASR_PROVIDERS: dict[str, Any] = {
     "sensevoice": _asr_sense_voice,
+    "nmcloud": _asr_nmcloud,
     "baidu": _asr_baidu,
     "stepfun": _asr_stepfun,
     "vosk": _vosk_asr,
 }
 
 _TTS_PROVIDERS: dict[str, Any] = {
+    "nmcloud": _tts_nmcloud,
     "baidu": _tts_baidu,
     "finna": _tts_finna,
     "stepfun": _tts_stepfun,

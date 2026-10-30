@@ -102,10 +102,28 @@ GROUP_LABELS = {
 
 ENTRIES: list[EnvEntry] = [
     # --- core（核心：缺这些只会降级，但建议都配） ---
-    # ---- LLM 节点（通过 LLM_PRIORITY 优先级链启用，顺序: stepfun,agnes,sagnes,glm,ark） ----
-    EnvEntry("LLM_PRIORITY", default="stepfun,agnes,sagnes,glm,ark",
+    # ---- LLM 节点（通过 LLM_PRIORITY 优先级链启用，顺序: nmcloud,stepfun,agnes,sagnes,glm,ark） ----
+    EnvEntry("LLM_PRIORITY", default="nmcloud,stepfun,agnes,sagnes,glm,ark",
              group="core", tunable=False,
-             description="LLM 优先级链（逗号分隔，如: stepfun,agnes,sagnes,glm,ark）"),
+             description="LLM 优先级链（逗号分隔，如: nmcloud,stepfun,agnes,sagnes,glm,ark）"),
+    EnvEntry("NM_CLOUD_KEY", group="core", secret=True, demo_supported=True,
+             get_guide="https://www.sxliuyu.bond",
+             description="nanoMuse 自建云 Key（默认可选 LLM，同一把 Key 也提供 ASR/TTS）"),
+    EnvEntry("NM_CLOUD_BASE", default="https://www.sxliuyu.bond/v1",
+             group="core", tunable=True,
+             description="nanoMuse 自建云 API 基址（OpenAI 兼容）"),
+    EnvEntry("NM_CLOUD_MODEL", default="deepseek-v4.1-flash",
+             group="core", tunable=True,
+             description="nanoMuse 自建云模型名"),
+    EnvEntry("NM_CLOUD_ASR_MODEL", default="whisper-1",
+             group="core", tunable=True,
+             description="nanoMuse 自建云 ASR 模型名（服务端映射到百度短语音）"),
+    EnvEntry("NM_CLOUD_TTS_MODEL", default="tts-1",
+             group="core", tunable=True,
+             description="nanoMuse 自建云 TTS 模型名（服务端映射到百度短文本合成）"),
+    EnvEntry("NM_CLOUD_TTS_VOICE", default="baidu-3",
+             group="core", tunable=True,
+             description="nanoMuse 自建云 TTS 音色（baidu-0/1/3/4 对应度小美/小宇/逍遥/丫丫）"),
     EnvEntry("AGNES_KEY", group="core", secret=True, demo_supported=True,
              description="Agnes 中国节点 Key（默认首选 LLM，有免费额度）"),
     EnvEntry("AGNES_BASE", default="https://apihub.agnes-ai.com/v1",
@@ -343,10 +361,10 @@ ENTRIES: list[EnvEntry] = [
              description="TTS 熔断冷却秒数"),
     EnvEntry("LOCAL_TTS_ENABLED", default="0", group="tuning", tunable=True,
              description="1=启用本地 TTS 降级"),
-    EnvEntry("ASR_PRIORITY", default="sensevoice,baidu,stepfun,vosk", group="tuning", tunable=False,
-             description="ASR 优先级链（逗号分隔，如: sensevoice,baidu,stepfun,vosk）"),
-    EnvEntry("TTS_PRIORITY", default="baidu,stepfun,finna", group="tuning", tunable=False,
-             description="TTS 优先级链（逗号分隔；可选 provider: baidu,stepfun,finna,edge,audio8,cosyvoice）"),
+    EnvEntry("ASR_PRIORITY", default="sensevoice,nmcloud,baidu,stepfun,vosk", group="tuning", tunable=False,
+             description="ASR 优先级链（逗号分隔，如: sensevoice,nmcloud,baidu,stepfun,vosk）"),
+    EnvEntry("TTS_PRIORITY", default="nmcloud,baidu,stepfun,finna", group="tuning", tunable=False,
+             description="TTS 优先级链（逗号分隔；可选 provider: nmcloud,baidu,stepfun,finna,edge,audio8,cosyvoice）"),
     EnvEntry("ASR_HOTWORDS", group="tuning", tunable=True,
              description="ASR 热词表（逗号分隔）"),
     EnvEntry("XIAOZHI_VAD_SILENCE_FRAMES", default="8", group="tuning", tunable=True,
@@ -408,11 +426,13 @@ def missing_required() -> list[EnvEntry]:
 
 
 def llm_available() -> bool:
-    """是否有任何一种 LLM 可用：AGNES / SAGNES / STEPFUN / GLM / ARK 已配
+    """是否有任何一种 LLM 可用：NM_CLOUD / AGNES / SAGNES / STEPFUN / GLM / ARK 已配
 
-    开箱即用版推荐 AGNES 免费 Key + 百度免费 ASR/TTS，无需本地 GPU。
+    开箱即用版推荐 NM_CLOUD（自建，一把 Key 覆盖 LLM+ASR+TTS），
+    或 AGNES 免费 Key + 百度免费 ASR/TTS，无需本地 GPU。
     """
-    return (is_configured("AGNES_KEY")
+    return (is_configured("NM_CLOUD_KEY")
+            or is_configured("AGNES_KEY")
             or is_configured("SAGNES_KEY")
             or is_configured("STEPFUN_KEY")
             or is_configured("GLM_KEY")
@@ -424,7 +444,8 @@ def demo_mode_active() -> bool:
 
     此状态下启动会引导用户注册免费 AGNES Key。
     """
-    return not (is_configured("AGNES_KEY")
+    return not (is_configured("NM_CLOUD_KEY")
+                or is_configured("AGNES_KEY")
                 or is_configured("SAGNES_KEY")
                 or is_configured("STEPFUN_KEY")
                 or is_configured("GLM_KEY")
@@ -523,6 +544,7 @@ def render_welcome_status() -> dict:
         "missing_required": [e.name for e in missing_required()],
         "llm_available": llm_available(),
         # 引导向导用：各模块是否已配（不暴露密钥值）
+        "nmcloud_configured": is_configured("NM_CLOUD_KEY"),
         "baidu_configured": (is_configured("BAIDU_APP_ID")
                              and is_configured("BAIDU_API_KEY")
                              and is_configured("BAIDU_SECRET_KEY")),
