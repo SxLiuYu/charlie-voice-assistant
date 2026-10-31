@@ -1304,6 +1304,9 @@ async def _internal_xiaozhi_push(payload: dict, request: Request):
             return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
     text = payload.get("text", "")
     mp3_b64 = payload.get("mp3", "")
+    # FR-14：定向转发（主进程 → HTTPS 进程）。空 = 广播（旧行为）。
+    raw_targets = payload.get("target_uids") or []
+    targets = tuple(str(t) for t in raw_targets if str(t).strip())
     if not text or not mp3_b64:
         audit_log("api:xiaozhi_push", success=False, error="missing_params", action="push")
         return {"ok": False, "error": "missing text or mp3"}
@@ -1317,13 +1320,18 @@ async def _internal_xiaozhi_push(payload: dict, request: Request):
     except Exception as e:
         log.debug(f"[app.routes.manage] error at line 1010: {e}")
         pass
-    audit_log("api:xiaozhi_push", input_data=text[:50], action="push")
+    audit_log("api:xiaozhi_push", input_data=f"{text[:50]} targets={targets or 'all'}", action="push")
     import base64 as _b64
     from app.state import snapshot_xiaozhi_clients
     mp3_data = _b64.b64decode(mp3_b64)
     clients = snapshot_xiaozhi_clients()
     pushed = 0
     for cid, info in clients.items():
+        if targets:
+            # 定向：这条连接必须属于目标用户（未绑定设备 = default，不在 targets 里）
+            from app.notifications import _client_uid
+            if _client_uid(info) not in targets:
+                continue
         ws = info["ws"]
         try:
             await async_push_tts_to_xiaozhi(ws, text, mp3_data)
@@ -1332,11 +1340,23 @@ async def _internal_xiaozhi_push(payload: dict, request: Request):
             log.warning(f"[xiaozhi-push] 内部转发失败 {cid}: {e}")
     mqtt_pushed = False
     try:
-        from app.mqtt_server import push_tts_to_mqtt
-        mqtt_pushed = push_tts_to_mqtt(text, mp3_data)
-        if mqtt_pushed:
-            pushed += 1
+        if targets:
+            # 定向不能用广播通道 push_tts_to_mqtt —— 会发到所有 MQTT 设备
+            from app.mqtt_server import active_device_ids, push_tts_to_device
+            from agent.device_users import resolve_device_user
+            for device_id in active_device_ids():
+                if resolve_device_user(device_id) not in targets:
+                    continue
+                if push_tts_to_device(text, mp3_data, device_id=device_id):
+                    pushed += 1
+                    mqtt_pushed = True
+        else:
+            from app.mqtt_server import push_tts_to_mqtt
+            mqtt_pushed = push_tts_to_mqtt(text, mp3_data)
+            if mqtt_pushed:
+                pushed += 1
     except Exception as e:
         log.debug(f"[app.routes.manage] error at line 1031: {e}")
         pass
-    return {"ok": True, "pushed": pushed, "total": len(clients), "mqtt": mqtt_pushed}
+    return {"ok": True, "pushed": pushed, "total": len(clients),
+            "mqtt": mqtt_pushed, "targets": list(targets) or "all"}

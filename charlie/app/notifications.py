@@ -338,7 +338,8 @@ async def async_push_tts_to_xiaozhi(ws, text: str, mp3_data: bytes):
         log.warning(f"[xiaozhi-push] 推送失败: {e}")
 
 
-def _https_forward_reminder(text: str, mp3_data: bytes) -> None:
+def _https_forward_reminder(text: str, mp3_data: bytes,
+                            target_uids: list | None = None) -> None:
     """异步线程：将提醒 TTS 转发到 HTTPS 端口（ESP32 可能连 8443）。"""
     try:
         import urllib3
@@ -348,7 +349,8 @@ def _https_forward_reminder(text: str, mp3_data: bytes) -> None:
         mp3_b64 = _b64enc.b64encode(mp3_data).decode()
         r = requests.post(
             f"https://127.0.0.1:{_hport}/api/internal/xiaozhi-push",
-            json={"text": text, "mp3": mp3_b64},
+            json={"text": text, "mp3": mp3_b64,
+                  **({"target_uids": target_uids} if target_uids else {})},
             verify=False, timeout=10)
         if r.status_code in (200, 202):
             data = r.json()
@@ -420,10 +422,11 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None,
             qsize = enqueue_xiaozhi_pending(text, mp3_data, reminder_id=reminder_id,
                                             target_uids=targets)
             log.info("[xiaozhi-push] 提醒 TTS 入队待flush(%d): %s", qsize, text[:30])
-            # 定向推送不走 HTTPS 转发：那个进程只有"广播"接口，转发等于发给所有人
-            if not targets:
-                _th = threading.Thread(target=_https_forward_reminder, args=(text, mp3_data), daemon=True)
-                _th.start()
+            _th = threading.Thread(
+                target=_https_forward_reminder, args=(text, mp3_data),
+                kwargs={"target_uids": list(targets) if targets else None},
+                daemon=True)
+            _th.start()
             return "enqueued"
     except Exception as e:
         log.debug(f"[app.notifications] error at line 245: {e}")
@@ -492,10 +495,9 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None,
                                    target_uids=targets)
     log.info(f"[xiaozhi-push] ESP32未连接，入队({qsize}): {text[:30]}")
 
-    # 3. 异步转发到 HTTPS 进程（ESP32 可能连 8443），不阻塞调度线程
-    if targets:
-        # 定向项不转发：对端只有广播接口，转发出去就等于发给所有设备
-        return "enqueued"
+    # 3. 异步转发到 HTTPS 进程（ESP32 可能连 8443），不阻塞调度线程。
+    # 定向项也转发 —— 端点已支持 target_uids 过滤（否则 8443 上的设备
+    # 永远收不到定向提醒）。
     import threading as _th
     _hport = https_port()
     mp3_b64 = _b64enc.b64encode(mp3_data).decode()
@@ -506,7 +508,8 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None,
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             r = requests.post(
                 f"https://127.0.0.1:{_hport}/api/internal/xiaozhi-push",
-                json={"text": text, "mp3": mp3_b64},
+                json={"text": text, "mp3": mp3_b64,
+                      **({"target_uids": list(targets)} if targets else {})},
                 verify=False, timeout=10)
             if r.status_code in (200, 202):
                 data = r.json()

@@ -34,7 +34,7 @@
 import datetime as dt
 import os
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -867,3 +867,86 @@ class TestEndToEndDeviceToDevice:
             assert push_tts_to_xiaozhi("主人，提醒您：吃药", b"x" * 500,
                                        target_uids=None) == "direct"
             assert mock_run.call_count == 2
+
+
+# ======================================================================
+# 13. 主进程 → HTTPS 进程（8443）的定向转发
+# ======================================================================
+
+class TestHttpsForwardTargeting:
+    """8443 进程的内部推送端点要能按 target_uids 过滤。
+
+    定向提醒若不做 HTTPS 转发（或转发不带目标），连在 HTTPS 进程上的设备
+    永远收不到 —— 和 MQTT 盲区同构。
+    """
+
+    @pytest.fixture
+    def client(self, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.routes import manage
+        # TestClient 的来源 IP 不是 127.0.0.1，过不了端点的本机白名单 →
+        # 走 INTERNAL_API_TOKEN 头鉴权路径（顺带覆盖它）
+        monkeypatch.setenv("INTERNAL_API_TOKEN", "test-token")
+        app = FastAPI()
+        app.include_router(manage.router)
+        c = TestClient(app)
+        c.headers.update({"X-Internal-Token": "test-token"})
+        return c
+
+    @pytest.fixture
+    def two_devices(self, monkeypatch):
+        import agent.device_users as du
+        mapping = {DEV_LAOYU: LAOYU, DEV_MAMA: MAMA}
+        monkeypatch.setattr(du, "get_device_user",
+                            lambda dk: mapping.get(dk), raising=True)
+        monkeypatch.setattr(du, "devices_for_user",
+                            lambda uid: {k for k, v in mapping.items() if v == uid},
+                            raising=True)
+        return mapping
+
+    @patch("app.mqtt_server.push_tts_to_device", return_value=True)
+    @patch("app.mqtt_server.active_device_ids", return_value=[DEV_MAMA, DEV_LAOYU])
+    @patch("app.mqtt_server.push_tts_to_mqtt")
+    @patch("app.routes.manage.async_push_tts_to_xiaozhi", new_callable=AsyncMock)
+    @patch("app.state.snapshot_xiaozhi_clients")
+    def test_targeted_forward_filters_by_device_owner(
+            self, mock_snap, mock_ws_push, mock_mqtt_bcast, mock_ids,
+            mock_dev_push, client, rem, two_devices, monkeypatch):
+        """target_uids=(mama,) ⇒ 只推 mama 的 WS 设备和 mama 的 MQTT 设备。"""
+        loop = MagicMock()
+        mock_snap.return_value = {
+            "s-laoyu": _client_info(object(), loop, DEV_LAOYU),
+            "s-mama": _client_info(object(), loop, DEV_MAMA),
+        }
+        r = client.post("/api/internal/xiaozhi-push",
+                        json={"text": "妈妈吃药", "mp3": "aaaa",
+                              "target_uids": [MAMA]})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["targets"] == [MAMA]
+        # 只推 mama 的 WS 设备（laoyu 的被过滤）
+        ws_targets = [c.args[0] for c in mock_ws_push.await_args_list]  # (ws, text, mp3)
+        assert len(ws_targets) == 1
+        # MQTT 只推 mama 的设备，不广播
+        mock_mqtt_bcast.assert_not_called()
+        assert mock_dev_push.call_count == 1
+        assert mock_dev_push.call_args.kwargs["device_id"] == DEV_MAMA
+
+    @patch("app.mqtt_server.push_tts_to_mqtt", return_value=True)
+    @patch("app.routes.manage.async_push_tts_to_xiaozhi", new_callable=AsyncMock)
+    @patch("app.state.snapshot_xiaozhi_clients")
+    def test_broadcast_forward_unchanged(
+            self, mock_snap, mock_ws_push, mock_mqtt_bcast, client, rem, monkeypatch):
+        """不带 target_uids ⇒ 广播，行为与改造前一致。"""
+        loop = MagicMock()
+        mock_snap.return_value = {
+            "s-a": _client_info(object(), loop, None),
+            "s-b": _client_info(object(), loop, None),
+        }
+        r = client.post("/api/internal/xiaozhi-push",
+                        json={"text": "系统提醒", "mp3": "aaaa"})
+        assert r.status_code == 200
+        assert r.json()["targets"] == "all"
+        assert mock_ws_push.await_count == 2
+        mock_mqtt_bcast.assert_called_once()
