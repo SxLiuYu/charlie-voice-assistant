@@ -869,6 +869,10 @@ def _baidu_invalidate_token() -> None:
 
 
 def _baidu_get_token() -> str:
+    # 未配置就直接失败：key 为空时也会发真实 HTTP 请求（拿 400），
+    # TTS/ASR 兜底链每个 provider 白等一次 RTT，日志还刷 400 噪音
+    if not BAIDU_API_KEY or not BAIDU_SECRET_KEY:
+        raise RuntimeError("Baidu Key 未配置")
     now = time.time()
     with _baidu_token_lock:
         if _baidu_token["token"] and now - _baidu_token["at"] < 86400 * 28:
