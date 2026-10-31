@@ -59,3 +59,6 @@ _probe_e.py
 _probe_f.py
 agent/memory.db-shm
 agent/memory.db-wal
+esp32_firmware/pio/.pio/
+esp32_firmware/pio/flash.img
+esp32_firmware/wokwi/bin/
