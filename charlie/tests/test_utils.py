@@ -3,6 +3,7 @@ Charlie - 工具模块单元测试
 测试: parse_time_str / sanitize_error / cleanup_temp_files / truncate_history_file
 """
 import os, json, tempfile, datetime, subprocess, sys, time
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 from utils import parse_time_str, sanitize_error, cleanup_temp_files, truncate_history_file
 
 
@@ -298,20 +299,33 @@ class TestTruncateHistoryFile:
         lock_path = path.with_name(path.name + ".lock")
         path.write_text(json.dumps([{"role": "user", "content": f"msg{i}"} for i in range(5)]), encoding="utf-8")
 
+        marker = str(lock_path) + ".held"
         script = f"""
-import fcntl, time
+import os as _os, sys as _sys
+try:
+    import fcntl
+except ImportError:
+    _sys.path.insert(0, _os.environ.get("CHARLIE_PROJECT_DIR", _os.getcwd()))
+    import fcntl_compat as fcntl, time
 with open({str(lock_path)!r}, "a+", encoding="utf-8") as lock_file:
     fcntl.flock(lock_file, fcntl.LOCK_EX)
-    time.sleep(0.5)
+    open({marker!r}, "w").write("held")
+    time.sleep(0.6)
 """
-        proc = subprocess.Popen([sys.executable, "-c", script])
+        proc = subprocess.Popen([sys.executable, "-c", script],
+                                env={**os.environ, "CHARLIE_PROJECT_DIR": PROJECT_DIR})
         try:
-            time.sleep(0.1)
+            for _ in range(100):
+                if os.path.exists(marker):
+                    break
+                time.sleep(0.05)
             started = time.monotonic()
             truncate_history_file(os.fspath(path), max_entries=2)
             elapsed = time.monotonic() - started
         finally:
             proc.wait(timeout=5)
+            if os.path.exists(marker):
+                os.unlink(marker)
 
         assert elapsed >= 0.35
         result = json.loads(path.read_text(encoding="utf-8"))

@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 import requests
 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 import voice_agent
 import agent.cache
 import agent.history
@@ -280,20 +281,35 @@ class TestHistory:
         voice_agent.reset_history()
         voice_agent._history.append({"role": "user", "content": "文件锁保存"})
         lock_file = voice_agent.HISTORY_FILE + ".lock"
+        # Windows 上子进程 Python 启动要几百 ms，盲等 0.1s 会撞上"子进程还没持锁"
+        # ⇒ 主进程立即拿到锁，elapsed=0。改为子进程持锁后写 marker，主进程等 marker。
+        marker = lock_file + ".held"
         script = f"""
-import fcntl, time
+import os as _os, sys as _sys
+try:
+    import fcntl
+except ImportError:
+    _sys.path.insert(0, _os.environ.get("CHARLIE_PROJECT_DIR", _os.getcwd()))
+    import fcntl_compat as fcntl, time
 with open({lock_file!r}, "a+", encoding="utf-8") as lock_file:
     fcntl.flock(lock_file, fcntl.LOCK_EX)
-    time.sleep(0.5)
+    open({marker!r}, "w").write("held")
+    time.sleep(0.6)
 """
-        proc = subprocess.Popen([sys.executable, "-c", script])
+        proc = subprocess.Popen([sys.executable, "-c", script],
+                                env={**os.environ, "CHARLIE_PROJECT_DIR": PROJECT_DIR})
         try:
-            time.sleep(0.1)
+            for _ in range(100):
+                if os.path.exists(marker):
+                    break
+                time.sleep(0.05)
             started = time.monotonic()
             voice_agent._save_history()
             elapsed = time.monotonic() - started
         finally:
             proc.wait(timeout=5)
+            if os.path.exists(marker):
+                os.unlink(marker)
 
         assert elapsed >= 0.35
         assert os.path.exists(voice_agent.HISTORY_FILE)
