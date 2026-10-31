@@ -22,28 +22,76 @@ def _clean_state():
 # --------------------------------------------------------------------------- #
 # 1. 时间意图: 不再关键词短路，走 LLM 分类→工具
 # --------------------------------------------------------------------------- #
+def _st_intent_cache_cleared():
+    """意图缓存是进程级单例，跨测试共享 —— 用例间会互相命中。"""
+    from agent.llm_state import intent_cache
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        saved = dict(intent_cache)
+        intent_cache.clear()
+        try:
+            yield
+        finally:
+            intent_cache.clear()
+            intent_cache.update(saved)
+
+    return _ctx()
+
+
 class TestTimeFastPath:
+    """时间问句的路由（2026-10-31 调整，见 test_keyword_llm_routing 的
+    test_time_registered_local_only）。
+
+    纯问句（<12 字）走本地 FastPath 零 LLM；复合句仍走意图分类。
+    """
+
     def test_brain_stream_time_goes_through_llm(self):
-        """时间查询不再走关键词快路径，改为 LLM 分类→工具调用。"""
-        with patch("agent.llm._get_brain") as m_get_brain, \
+        """流式路径同样有 FAST_PATHS 链：纯时间问句本地应答，不过意图分类。
+
+        （FAST_PATHS 循环在 brain() 与 brain_stream_sentences() 各有一份，
+        语音主链路的时间问句同样享受零 LLM 应答。）
+        """
+        with _st_intent_cache_cleared(), \
+             patch("agent.llm._get_brain") as m_get_brain, \
              patch("agent.llm._classify_intent", return_value="magic-info") as m_cls, \
              patch("agent.llm._chat_lite_stream", return_value=iter([])):
             sentences = list(voice_agent.brain_stream_sentences("现在几点啦"))
-        # 时间不再被 FAST_PATHS 拦截，应该走 LLM 分类
+        assert m_cls.call_count == 0, "纯时间问句在流式路径也应走本地快路径"
+        assert sentences and "点" in sentences[0][0]
+
+    def test_brain_stream_compound_time_still_classified(self):
+        """流式路径的复合时间句（≥12 字）仍走意图分类。"""
+        with _st_intent_cache_cleared(), \
+             patch("agent.llm._get_brain"), \
+             patch("agent.llm._classify_intent", return_value="magic-info") as m_cls, \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])):
+            list(voice_agent.brain_stream_sentences("现在几点啦然后顺便放一首歌"))
         assert m_cls.call_count >= 1
 
     def test_brain_time_goes_through_llm(self):
         with patch("agent.llm._get_brain") as m_get_brain, \
              patch("agent.llm._classify_intent", return_value="magic-info"):
             reply = voice_agent.brain("几点了")
-        # 时间不再被 FAST_PATHS 短路
         assert m_get_brain.call_count >= 0  # 可能走 lite stream 或 brain
 
-    def test_time_goes_through_llm_not_fastpath(self):
-        """时间查询不再走关键词快路径，改为 LLM 分类。"""
+    def test_time_pure_question_hits_local_fastpath(self):
+        """纯问句本地应答，不烧 LLM 分类（datetime.now() 就能答）。"""
         with patch("agent.llm._classify_intent", return_value="magic-info") as m_cls, \
-             patch("agent.llm._get_brain"):
-            voice_agent.brain("现在几点")
+             patch("agent.llm._get_brain") as m_brain:
+            reply = voice_agent.brain("现在几点")
+        assert m_cls.call_count == 0, "纯时间问句不应再走意图分类"
+        assert m_brain.call_count == 0
+        assert "点" in reply
+
+    def test_time_compound_question_still_classified(self):
+        """复合句（≥12 字）不受快路径拦截，仍走意图分类。"""
+        with _st_intent_cache_cleared(), \
+             patch("agent.llm._classify_intent", return_value="magic-info") as m_cls, \
+             patch("agent.llm._get_brain"), \
+             patch("agent.llm._chat_lite_stream", return_value=iter([])):
+            voice_agent.brain("现在几点了顺便把音乐打开")
         assert m_cls.call_count >= 1
 
 

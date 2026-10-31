@@ -473,7 +473,26 @@ class FastPath:
 
 
 def _time_handler(text: str) -> str:
+    """本地时间/日期/星期应答（零 LLM）。
+
+    ⚠️ 只接**纯问句**（≤12 字）。此前这个 handler 写了却从未注册，
+    "现在几点了"这类高频短句每次都掉进完整 brain（两次 LLM 往返 +
+    可能的冷构建，实测 2-7s）。复合句（"现在几点了顺便放首歌"）不在
+    匹配表，仍走意图分类。
+    """
+    if len(text) >= 12:
+        return None
+    # Demo 模式（未配置任何 LLM key）下不本地应答，落回 demo 引导提示 ——
+    # demo 的语义是"引导完成配置"，此时给真实时间会掩盖"服务未就绪"。
+    from agent.llm import _demo_mode_active
+    if _demo_mode_active():
+        return None
     now = datetime.datetime.now()
+    weekday_names = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+    if "星期" in text or "礼拜" in text:
+        return f"今天是{weekday_names[now.weekday()]}。"
+    if "几号" in text or "多少号" in text or "日期" in text or "几月" in text:
+        return f"今天是{now.strftime('%Y年%m月%d日')}。"
     return f"现在{now.strftime('%H点%M分')}。"
 
 
@@ -489,9 +508,11 @@ def _scene_protocol_handler(text: str) -> str | None:
     return None
 
 
-# 快路径链：仅保留零延迟系统控制（角色切换、社交问候）。
-# 天气/音乐/空调/时间/视觉/场景等动作类意图不再用关键词短路，
-# 统一走 LLM 意图分类 → MCP 工具调用，确保复合请求和上下文引用正确路由。
+# 快路径链：零延迟系统控制（角色切换、社交问候）+ 本地时间应答。
+# 时间/日期/星期是纯本地事实（datetime.now() 就能答），问句形态高度固定；
+# 走 LLM 意图分类 → magic-info brain 是两次云端往返（实测 2-7s）。
+# 其余动作类意图（天气/音乐/空调/视觉/场景）仍统一走 LLM 意图分类 →
+# MCP 工具调用，确保复合请求和上下文引用正确路由。
 FAST_PATHS = [
     FastPath("role_switch", ("切换到贾维斯", "变成贾维斯", "切换贾维斯", "我要贾维斯", "换成贾维斯",
                              "切换回贾维斯", "切回贾维斯", "变回贾维斯", "回到贾维斯",
@@ -501,10 +522,14 @@ FAST_PATHS = [
                              "切换到charlie", "切换回charlie", "切到charlie", "换成charlie",
                              "回到默认", "恢复默认", "切换到默认", "切换回默认",
                              "切换到白泽", "变成白泽", "切换白泽", "我要白泽", "换成白泽",
-                             "切换回白泽", "切回白泽", "变回白泽"),
+                             "切换回白泽", "变回白泽"),
              "_role_switch_handler", case_insensitive=True),
     FastPath("social", ("谢谢", "多谢", "辛苦了", "再见", "拜拜"),
              "_social_reply_handler"),
+    FastPath("time", ("现在几点", "几点了", "几点啦", "现在时间", "现在多少点",
+                      "今天几号", "今天多少号", "几月几号", "今天日期", "现在日期",
+                      "今天星期几", "今天礼拜几", "星期几了", "礼拜几了"),
+             "_time_handler"),
 ]
 
 

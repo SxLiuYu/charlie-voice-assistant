@@ -18,7 +18,10 @@ class TestFastPathsTrimmed:
 
     def test_fast_paths_count(self):
         from voice_agent import FAST_PATHS
-        assert len(FAST_PATHS) == 2, f"Expected 2 fast paths, got {len(FAST_PATHS)}: {[p.name for p in FAST_PATHS]}"
+        # role_switch / social / time。time 是纯本地事实（datetime.now()），
+        # 且 handler 对 >12 字长句和 demo 模式返回 None，不破坏
+        # "动作类意图统一走 LLM 意图分类"的路由决策。
+        assert len(FAST_PATHS) == 3, f"Expected 3 fast paths, got {len(FAST_PATHS)}: {[p.name for p in FAST_PATHS]}"
 
     def test_role_switch_kept(self):
         from voice_agent import FAST_PATHS
@@ -30,10 +33,17 @@ class TestFastPathsTrimmed:
         names = [p.name for p in FAST_PATHS]
         assert "social" in names
 
-    def test_time_removed(self):
+    def test_time_registered_local_only(self):
+        """time 回归本地快路径（此前被整体移除）。
+
+        与当年移除时的差异：旧实现无长度门槛，复合句（"现在几点了顺便放歌"）
+        会被错误短路；新 handler 只接 ≤12 字纯问句，复合句仍走意图分类；
+        demo 模式下返回 None 落回配置引导。动作类意图（天气/音乐/空调）依然
+        不走关键词短路。
+        """
         from voice_agent import FAST_PATHS
         names = [p.name for p in FAST_PATHS]
-        assert "time" not in names
+        assert "time" in names
 
     def test_weather_removed(self):
         from voice_agent import FAST_PATHS
