@@ -1076,9 +1076,10 @@ def restart_brain() -> str:
         _st.brain_failures = 0
     log.info("[brain] 手动重启, 所有缓存大脑已清除")
     # 立即预热默认大脑：否则 ready=len(brains)>0 在下一个需要 MCP 的请求前
-    # 一直为 False，健康检查/watchdog 会误判服务不可用（lite 通道不重建缓存）
+    # 一直为 False，健康检查/watchdog 会误判服务不可用（lite 通道不重建缓存）。
+    # 预热 ("none","voice")：语音对话是主路径，预热 default 键等于白热。
     try:
-        _get_brain("none")
+        _get_brain("none", channel="voice")
         msg = "大脑已重启并预热完成"
     except Exception as e:
         log.warning(f"[brain] 重启预热失败(请求时将重建): {e}")
@@ -2005,12 +2006,16 @@ def brain_stream_sentences(text: str, session_id: str = "default", interrupted_r
         is_conn = _is_conn_error(_err)
         _record_brain_failure(_err[:60])
         # 超时/连接错误时主动清除当前 brain 缓存，避免复用状态不一致的实例
+        # ⚠️ 缓存键是 (mcp_set, channel) 二元组（见 _get_brain）。按字符串键
+        # `mcp_set in _st.brains` 判断永远不会命中 ⇒ 清理静默失效，
+        # 状态不一致的实例会被继续复用（症状：超时后每轮都挂）。
         if is_conn or 'timeout' in _err.lower():
+            _bad_key = (mcp_set, channel)
             with _st.brain_lock:
-                if mcp_set in _st.brains:
-                    _cleanup_brain_processes(_st.brains[mcp_set])
-                    del _st.brains[mcp_set]
-                    log.info(f"[brain] 超时/连接错误，清除 brain 缓存: mcp={mcp_set}")
+                if _bad_key in _st.brains:
+                    _cleanup_brain_processes(_st.brains[_bad_key])
+                    del _st.brains[_bad_key]
+                    log.info(f"[brain] 超时/连接错误，清除 brain 缓存: key={_bad_key}")
         from app import llm_config as _llm_cfg
         _do_retry = _llm_cfg.is_glm_configured() and not _llm_cfg.is_ark_configured()
         if not full_reply and _do_retry:

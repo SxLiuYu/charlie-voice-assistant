@@ -553,8 +553,11 @@ def voice_loop(audio_in: bytes, fmt: str = "mp3") -> Tuple[str, str, bytes]:
 # 任一 server 启动慢会让所有 import voice_agent 的进程卡最长 60s。
 def _warmup_brain():
     try:
-        _get_brain("none")
-        log.info("[warmup] brain(none) 预热完成")
+        # 语音对话实际用 ("none", "voice") 键的 brain（见 _get_brain 的
+        # (mcp_set, channel) 分键）。预热成 default 键等于白热，首次语音
+        # 对话照样冷启动（MCP 子进程启动是秒级）。
+        _get_brain("none", channel="voice")
+        log.info("[warmup] brain(none,voice) 预热完成")
     except Exception as e:
         log.warning(f"[warmup] brain(none) 预热失败: {e}")
 
