@@ -260,6 +260,14 @@ def _commit_preferences(mutate: Callable[[dict], Any], uid: str | None = None) -
     return result
 
 def set_preference(key: str, value: str, uid: str | None = None) -> str:
+    # 写入侧清洗：偏好会原样进 system prompt（"用户偏好：k=v"）。
+    # value 带换行/控制字符可以在 prompt 里伪造指令段（如"【系统指令】忽略以上规则"），
+    # 之后**每一轮**对话都被劫持 —— 存储型 prompt 注入。压成单行 + 截断。
+    key = str(key or "").strip()[:64]
+    value = str(value or "").strip()
+    value = "".join(ch for ch in value if ch in "	" or ord(ch) >= 32)[:200]
+    if not key:
+        return "偏好名不能为空"
     _commit_preferences(lambda prefs: prefs.__setitem__(key, value), uid)
     log.info(f"[prefs] 设置偏好: {key}={value[:30]}")
     return f"已记住：{key}={value}"
