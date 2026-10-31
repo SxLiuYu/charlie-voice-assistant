@@ -391,11 +391,13 @@ def _classify_intent(text: str) -> str:
             log.info(f"[intent] 消歧: 电视专属词命中 → magic-tv: '{text[:30]}'")
             _intent_cache_set(text, "magic-tv")
             return "magic-tv"
-        # 确定性消歧: magic-preferences 的"，记住"句式是用户存储事实的固定模式
-        # 优先于 scenes(起床/早安) / reminder(提醒) 等域
-        if "magic-preferences" in matched_domains and (
-            "，记住" in text or ",记住" in text or "，记一下" in text or ",记一下" in text
-        ):
+        # 确定性消歧: magic-preferences 的"记住"句式是用户存储事实的固定模式
+        # 优先于 scenes(起床/早安) / reminder(提醒) 等域。
+        # 不再要求逗号前缀："记住我最喜欢的颜色是xxx"这类长句此前会因
+        # _is_compound_query 降级 LLM，而日志统计 LLM 结论 100% 与关键词域
+        # 一致（30/30），每次白等 ~1.1s。排除疑问句（"记得吗/记住了吗"是查询）。
+        if "magic-preferences" in matched_domains and re.search(
+                r"记住|记一下", text) and not re.search(r"吗$|吗[?？]|来着", text):
             log.info(f"[intent] 消歧: '记住'句式 → magic-preferences: '{text[:30]}'")
             _intent_cache_set(text, "magic-preferences")
             return "magic-preferences"
@@ -409,11 +411,17 @@ def _classify_intent(text: str) -> str:
             log.info(f"[intent] 消歧: '访问/http'关键词优先 → magic-browser: '{text[:30]}'")
             _intent_cache_set(text, "magic-browser")
             return "magic-browser"
-        # 确定性消歧: 偏好设置"我喜欢..."句式应优先于 reminder/notes/apps 的"记一下"
-        if "magic-preferences" in matched_domains and re.search(r'我喜[欢爱]', text):
+        # 确定性消歧: 偏好设置"我喜欢/我最喜欢..."句式应优先于 reminder/notes/apps
+        if "magic-preferences" in matched_domains and re.search(r'我(?:最)?喜[欢爱]', text):
             log.info(f"[intent] 消歧: '我喜欢'优先 → magic-preferences: '{text[:30]}'")
             _intent_cache_set(text, "magic-preferences")
             return "magic-preferences"
+        # 确定性消歧: "把…翻译/翻成…"是 magic-info 的固定句式。实测 LLM 分类会
+        # 把"把'hello world'翻译成中文"误分到 magic-notes（关键词反而更准）。
+        if "magic-info" in matched_domains and re.search(r"翻译|翻成|译成|用英语说|怎么说", text):
+            log.info(f"[intent] 消歧: '翻译'句式 → magic-info: '{text[:30]}'")
+            _intent_cache_set(text, "magic-info")
+            return "magic-info"
         log.info(f"[intent] 多域关键词命中 {matched_domains}，降级到 LLM 分类: '{text[:30]}'")
         # 多个域命中 → 继续走 LLM 分类
     # disabled 检查 — 仅影响 LLM 分类路径
