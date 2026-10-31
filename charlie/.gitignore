@@ -62,3 +62,4 @@ agent/memory.db-wal
 esp32_firmware/pio/.pio/
 esp32_firmware/pio/flash.img
 esp32_firmware/wokwi/bin/
+esp32_firmware/qemu/
