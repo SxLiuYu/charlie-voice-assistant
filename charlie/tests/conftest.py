@@ -194,3 +194,22 @@ def _snapshot_global_state():
                     setattr(mod, attr_name, orig_val)
         except Exception:
             pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _quiet_qwen_agent_atexit():
+    """测试结束时清空 qwen_agent MCPManager 单例的 clients。
+
+    某些测试会把 MagicMock 留在单例里；qwen_agent 注册的 atexit 钩子在进程
+    退出时对每个 client 调 asyncio.run_coroutine_threadsafe(client.cleanup())，
+    MagicMock 返回值不是 coroutine ⇒ 退出时打印 TypeError 噪音（不影响结果，
+    但会让人误以为测试炸了）。
+    """
+    yield
+    try:
+        from qwen_agent.tools import mcp_manager as _mm
+        inst = getattr(_mm.MCPManager, "_instance", None)
+        if inst is not None and hasattr(inst, "clients"):
+            inst.clients = {}
+    except Exception:
+        pass

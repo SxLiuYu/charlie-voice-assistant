@@ -742,7 +742,10 @@ def _install_mcp_fault_tolerance_patch() -> None:
 
 
 # ===== Brain build / cache =====
-_BRAIN_CACHE_MAX = int(os.getenv("BRAIN_CACHE_MAX", "12"))
+# inproc 模式下 brain 对象很轻（工具是进程内函数引用，不是子进程）。
+# 键是 (mcp_set, channel) 二元组：mcp_set 七八个 × channel 两三个，
+# 12 的上限会让不同通道互相挤掉缓存、频繁重建，提到 24。
+_BRAIN_CACHE_MAX = int(os.getenv("BRAIN_CACHE_MAX", "24"))
 _BRAIN_RUN_TIMEOUT = float(os.getenv("BRAIN_RUN_TIMEOUT", "35"))
 _BRAIN_BUILD_TIMEOUT = float(os.getenv("BRAIN_BUILD_TIMEOUT", "60"))
 
