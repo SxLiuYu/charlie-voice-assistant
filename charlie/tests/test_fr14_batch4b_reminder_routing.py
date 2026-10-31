@@ -388,6 +388,46 @@ class TestPushRouting:
         assert mock_enqueue.call_count == 0
         mock_mqtt.assert_called_once()
 
+    @patch("app.state.enqueue_xiaozhi_pending")
+    @patch("app.mqtt_server.push_tts_to_device", return_value=True)
+    @patch("app.mqtt_server.active_device_ids", return_value=[DEV_MAMA, DEV_LAOYU])
+    @patch("app.state.snapshot_xiaozhi_clients")
+    def test_targeted_push_covers_online_mqtt_devices(
+            self, mock_snap, mock_ids, mock_dev_push, mock_enqueue, rem,
+            two_devices, no_binding):
+        """⚠️ 定向推送必须覆盖 **MQTT 在线设备**。
+
+        WS 快照里没有 MQTT 设备；不补这一步，绑定 MQTT 设备的用户会被当成
+        "不在线"入队 —— 明明在线却要白等 TTL 超时（真实路径推不过去）。
+        """
+        from app.notifications import push_tts_to_xiaozhi
+
+        mock_snap.return_value = {}  # WS 一台都不在线
+        status = push_tts_to_xiaozhi("妈妈吃药", b"x" * 500, target_uids=(MAMA,))
+        assert status == "direct"
+        # 只推 mama 的那台
+        assert mock_dev_push.call_count == 1
+        assert mock_dev_push.call_args.kwargs["device_id"] == DEV_MAMA
+        assert mock_enqueue.call_count == 0, "在线直推成功就不该入队"
+
+    @patch("app.state.enqueue_xiaozhi_pending", return_value=1)
+    @patch("app.mqtt_server.push_tts_to_device", return_value=True)
+    @patch("app.mqtt_server.active_device_ids", return_value=[DEV_LAOYU])
+    @patch("app.mqtt_server.push_tts_to_mqtt")
+    @patch("app.state.snapshot_xiaozhi_clients")
+    def test_targeted_push_skips_other_users_mqtt_devices(
+            self, mock_snap, mock_mqtt, mock_ids, mock_dev_push, mock_enqueue,
+            rem, two_devices, no_binding):
+        """MQTT 在线设备不属于目标用户 ⇒ 不推、定向入队，也**不走 MQTT 广播**。"""
+        from app.notifications import push_tts_to_xiaozhi
+
+        mock_snap.return_value = {}
+        status = push_tts_to_xiaozhi("妈妈吃药", b"x" * 500, target_uids=(MAMA,))
+        assert status == "enqueued"
+        mock_dev_push.assert_not_called()
+        mock_mqtt.assert_not_called()
+        assert mock_enqueue.call_count == 1
+
     def test_client_uid_without_device_key_is_default(self, rem):
         from app.notifications import _client_uid
         assert _client_uid({}) == "default"

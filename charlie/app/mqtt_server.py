@@ -362,6 +362,10 @@ class MqttXiaozhiServer:
             # 同时向 up_topic 发送以确保设备收到
             self._client.publish(up_topic, json.dumps(response, ensure_ascii=False), qos=1)
         log.info(f"[mqtt-server] [{device_id}] hello 回复: UDP {lan_ip}:{self._udp_port} (down+up)")
+        # FR-14：设备上线后补发定向给它的待推送项。UDP 地址要等第一个包才就绪，
+        # 所以延迟几秒再试；addr 没就绪时 push_tts_single 返回 False，项会放回队列。
+        threading.Thread(target=_flush_pending_for_device, args=(device_id, 3.0),
+                         daemon=True).start()
 
     def _handle_listen(self, data: dict, device_id: str):
         """处理 listen → 开始接收语音"""
@@ -549,6 +553,9 @@ class MqttXiaozhiServer:
                                         with _addr_to_device_lock:
                                             _addr_to_device[addr] = did
                                         log.info(f"[mqtt-server] 自动匹配设备: {addr} → {did}")
+                                        # UDP 通道就绪 ⇒ 可以补发待推送项了
+                                        threading.Thread(target=_flush_pending_for_device,
+                                                         args=(did,), daemon=True).start()
                                         break
                             except Exception:
                                 continue
@@ -929,6 +936,76 @@ def init_server(loop: asyncio.AbstractEventLoop) -> bool:
             pass
     _server = MqttXiaozhiServer()
     return _server.start(loop)
+
+
+def active_device_ids() -> list:
+    """当前有活跃会话（UDP 通道就绪与否不限）的设备 id 列表。
+
+    供定向推送判断"目标用户的 MQTT 设备在不在线"用。与 `_sessions` 同源。
+    """
+    if not _server:
+        return []
+    with _sessions_lock:
+        return list(_sessions.keys())
+
+
+def push_tts_to_device(text: str, mp3_data: bytes, device_id: str) -> bool:
+    """推送 TTS 到**单个** MQTT 设备（供定向提醒路由用）。
+
+    `push_tts` 是广播（发给所有活跃设备），定向场景不能用它 ——
+    会把「妈妈的提醒」放到老于房间。
+    """
+    if not _server or not _server.is_connected():
+        return False
+    try:
+        from app.xiaozhi_codec import mp3_to_opus_packets
+        packets = mp3_to_opus_packets(mp3_data, DOWNLINK_SAMPLE_RATE)
+        if not packets:
+            log.warning("[mqtt-push] Opus 编码失败")
+            return False
+        return _server.push_tts_single(text, packets, device_id)
+    except Exception as e:
+        log.warning(f"[mqtt-push] 定向推送失败({device_id}): {e}")
+        return False
+
+
+def _flush_pending_for_device(device_id: str, delay: float = 0.0):
+    """把待推送队列里属于该设备的项补发出去（FR-14）。
+
+    WS 设备在 register/hello 时由 app.state.flush 取件，MQTT 设备此前**没有**
+    对应路径 —— 定向项又会被广播通道跳过，结果绑定 MQTT 设备的用户永远收不到
+    定向提醒。这里补上：取件 → UDP 推送 → 成功才标记提醒完成，失败放回队列。
+
+    取件语义与 WS 侧一致：未绑定设备只取广播项；已绑定取 广播+本人定向项。
+    """
+    if delay:
+        time.sleep(delay)
+    try:
+        from app import state as app_state
+        from agent.device_users import resolve_device_user
+
+        uid = resolve_device_user(device_id)
+        # 未绑定（default）设备只取广播项；绑定设备取 广播+本人定向项
+        pending = app_state._take_pending_for_flush(uid if uid != "default" else None)
+        if not pending:
+            return
+        for item in pending:
+            ok = push_tts_to_device(item.get("text", ""),
+                                    item.get("mp3", b""), device_id)
+            if not ok:
+                # UDP 通道还没就绪（hello 后首个包未到）——放回队列等下次触发
+                app_state._requeue_xiaozhi_pending([item])
+                continue
+            rid = item.get("reminder_id")
+            if rid is not None:
+                try:
+                    from app.reminders import complete_reminder_delivery
+                    complete_reminder_delivery(rid)
+                except Exception as e:
+                    log.warning(f"[mqtt-server] 补发后标记提醒完成失败({rid}): {e}")
+        log.info(f"[mqtt-server] [{device_id}] 补发待推送 {len(pending)} 项 (uid={uid})")
+    except Exception as e:
+        log.debug(f"[mqtt-server] 补发待推送失败({device_id}): {e}")
 
 
 def push_tts_to_mqtt(text: str, mp3_data: bytes) -> bool:

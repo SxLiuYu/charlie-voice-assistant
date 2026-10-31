@@ -454,6 +454,25 @@ def push_tts_to_xiaozhi(text: str, mp3_data: bytes, reminder_id=None,
         log.info(f"[xiaozhi-push] 直推 {pushed} 个设备: {text[:30]}")
         return "direct"
 
+    # 1b. 定向推送还要覆盖 **MQTT 在线设备**：WS 快照里没有它们。
+    # 不补这一步的话，绑定 MQTT 设备的用户会被当成"不在线"入队，
+    # 而定向项又只能由该设备上线时取走 —— 明明在线却要白等（甚至超时丢失）。
+    if targets:
+        try:
+            from app.mqtt_server import active_device_ids, push_tts_to_device
+            from agent.device_users import resolve_device_user
+            mqtt_pushed = 0
+            for device_id in active_device_ids():
+                if resolve_device_user(device_id) not in targets:
+                    continue  # 别人的设备，不推
+                if push_tts_to_device(text, mp3_data, device_id=device_id):
+                    mqtt_pushed += 1
+            if mqtt_pushed > 0:
+                log.info(f"[xiaozhi-push] MQTT 定向直推 {mqtt_pushed} 台: {text[:30]}")
+                return "direct"
+        except Exception as e:
+            log.debug(f"[xiaozhi-push] MQTT 定向直推失败: {e}")
+
     # 2. 本进程无连接 → 尝试 MQTT 直推 + 入队 + HTTPS 转发
     # 2a. MQTT 协议端（ESP32 常驻连接时直接推送，秒级响应）
     # ⚠️ 定向推送**跳过 MQTT**：MQTT 是广播通道，没有按设备过滤的能力，
