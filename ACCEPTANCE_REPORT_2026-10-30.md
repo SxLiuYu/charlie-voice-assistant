@@ -304,7 +304,27 @@ FR-14 全部批次（3a/3b/4a/4b/5/6/跨通道）完成后重测：
 3. **`owner="default"` 在投递层是广播**，不是"只发给未绑定设备"。生产现状是所有
    提醒 owner 都是 default、没有任何设备绑定，提醒照旧全屋响。
 
-### 6.4 现场验证（新接口实测）
+### 6.4 落地后复查发现的两个问题（均已修）
+
+**1. MQTT 设备收不到定向提醒（功能盲区）**
+
+FR-14 落地后，绑定 MQTT 设备的用户永远收不到定向提醒。断在两处：
+MQTT 设备的 `_handle_hello` 不像 WS 那样有 flush 取件路径；定向推送跳过了
+MQTT 广播通道，又没有按设备推的能力。修复：`mqtt_server` 补
+`active_device_ids()` / `push_tts_to_device()` / `_flush_pending_for_device()`
+（hello 后延迟触发 + UDP 通道就绪时触发），定向推送遍历 MQTT 在线设备按
+归属过滤。新增 2 个路由用例。
+
+**2. 静态段每轮重复注入（~500-800 token/轮浪费）**
+
+3a 的原始设计里，流式路径把通道渲染后的静态段注入 `messages[0]`，而
+qwen_agent 每次 run 又会把 `brain.system_message`（同一份静态段）前置合并
+—— 最终 prompt 静态段出现两遍（none 通道 ~500 token，magic-info ~800，
+占 system 的 25-40%），并破坏前缀缓存。修复：brain 缓存键从 `mcp_set`
+变成 `(mcp_set, channel)`，构建时就按通道渲染好；`messages[0]` 只放动态段。
+实测对话正常（天气问答 13.2s 含工具链，算术走 lite 2.2s）。
+
+### 6.5 现场验证（新接口实测）
 
 在 `http://127.0.0.1:8020` 上跑了一遍真实 HTTP 调用：
 
