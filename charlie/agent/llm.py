@@ -63,7 +63,7 @@ from agent.history import (
 from agent.system_msg import (
     _build_system_msg, _build_lite_system_msg,
     _build_system_msg_static, _build_system_msg_static_cached,
-    _build_system_msg_dynamic,
+    _build_system_msg_dynamic, _replace_system_msg_for_channel,
 )
 from agent.asr_tts import _clean_for_tts, _tts_cleaned_to_mp3
 from agent.intent import LOW_INTENT_ASR_REPLY, is_low_intent_asr, is_garbled_asr
@@ -794,7 +794,7 @@ def _tool_progress_text(tool_name: str) -> str:
     return f"正在处理..."
 
 
-def _build_brain(mcp_set="all", session_id="default"):
+def _build_brain(mcp_set="all", session_id="default", channel="default"):
     """构建大脑，带超时保护防止 MCP server 启动卡死导致永久阻塞。
 
     Assistant() 构造函数内部调用 MCPManager().initConfig() → future.result() 无超时，
@@ -806,7 +806,7 @@ def _build_brain(mcp_set="all", session_id="default"):
 
     def _do_build():
         try:
-            _result.append(_build_brain_inner(mcp_set, session_id=session_id))
+            _result.append(_build_brain_inner(mcp_set, session_id=session_id, channel=channel))
         except Exception as e:
             _error.append(e)
 
@@ -823,7 +823,7 @@ def _build_brain(mcp_set="all", session_id="default"):
     return _result[0]
 
 
-def _build_brain_inner(mcp_set="all", session_id="default"):
+def _build_brain_inner(mcp_set="all", session_id="default", channel="default"):
     try:
         import psutil
         mem = psutil.virtual_memory()
@@ -851,7 +851,10 @@ def _build_brain_inner(mcp_set="all", session_id="default"):
                 # FR-14 3A：共享 brain 只承载**静态段**（与 session/用户无关）。
                 # 动态段（偏好/记忆/摘要/人格/房间）由每次调用注入 messages[0]，
                 # 否则 A 会话的内容会被 B 会话读到（4a 之前"串台"的根因）。
-                system_message=_build_system_msg_static(mcp_set),
+                # 通道规则（<<<VOICE_RULE>>>）在这里就渲染好 —— brain 按
+                # (mcp_set, channel) 分键，调用方不必把静态段再塞一遍 messages[0]。
+                system_message=_replace_system_msg_for_channel(
+                    _build_system_msg_static(mcp_set), channel),
                 function_list=tools)
             _install_openai_compat(brain)
             return brain
@@ -872,8 +875,9 @@ def _build_brain_inner(mcp_set="all", session_id="default"):
     log.info(f"[brain] 构建大脑(stdio) mcp_set={mcp_set}, 启用{len(mcp_servers)}个MCP: {list(mcp_servers.keys())}")
     tools = [{"mcpServers": mcp_servers}] if mcp_servers else []
     brain = Assistant(llm=llm_cfg, name='Charlie',
-        # 同上：只放静态段
-        system_message=_build_system_msg_static(mcp_set),
+        # 同上：只放静态段（含通道渲染）
+        system_message=_replace_system_msg_for_channel(
+            _build_system_msg_static(mcp_set), channel),
         function_list=tools)
     _install_openai_compat(brain)
     _install_mcp_timeout_patch()
@@ -924,35 +928,45 @@ def _brain_run_iter(brain_instance, messages, total_timeout: float = None, cance
         elif kind == "done":
             break
 
-def _get_brain(mcp_set="none", session_id="default"):
+def _get_brain(mcp_set="none", session_id="default", channel="default"):
+    """获取共享 brain。缓存键是 `(mcp_set, channel)`。
+
+    为什么带 channel：通道规则（<<<VOICE_RULE>>> 占位符的渲染）作用在**静态段**
+    上，而静态段放在共享 brain 的 system_message 里、由 qwen_agent 每次 run 时
+    前置合并。若所有通道共用一个 brain，静态段只能存未渲染的占位符，调用方
+    就得把渲染后的静态段再塞进 messages[0] ⇒ 每轮 prompt 静态段出现两遍
+    （实测 none 通道浪费 ~500 token/轮，magic-info ~800）。按通道分键后，
+    构建时就渲染好，调用方只注入动态段。
+    """
+    cache_key = (mcp_set, channel)
     # 快路径：无锁缓存命中（dict.get 在 GIL 下原子安全）
-    brain = _st.brains.get(mcp_set)
+    brain = _st.brains.get(cache_key)
     if brain is None:
         # 慢路径：加锁双重检查
         with _st.brain_lock:
-            brain = _st.brains.get(mcp_set)
+            brain = _st.brains.get(cache_key)
             if brain is None:
                 # 淘汰在锁内（快），构建在锁外
                 while len(_st.brains) >= _BRAIN_CACHE_MAX:
                     oldest_key = next(iter(_st.brains))
                     old_brain = _st.brains.pop(oldest_key)
                     _cleanup_brain_processes(old_brain)
-                    log.info(f"[brain] 缓存淘汰: mcp={oldest_key}, 当前缓存={len(_st.brains)}")
+                    log.info(f"[brain] 缓存淘汰: key={oldest_key}, 当前缓存={len(_st.brains)}")
         if brain is None:
             # 锁外构建，但用 _brain_build_lock 序列化（防止并发 MCPManager init_config_async 竞争）
             with _brain_build_lock:
                 # 双重检查：等待锁期间其他线程可能已完成构建并缓存
-                brain = _st.brains.get(mcp_set)
+                brain = _st.brains.get(cache_key)
                 if brain is None:
-                    new_brain = _build_brain(mcp_set, session_id=session_id)
+                    new_brain = _build_brain(mcp_set, session_id=session_id, channel=channel)
                     with _st.brain_lock:
-                        brain = _st.brains.get(mcp_set)
+                        brain = _st.brains.get(cache_key)
                         if brain is None:
-                            _st.brains[mcp_set] = new_brain
+                            _st.brains[cache_key] = new_brain
                             if not _st.brain_build_time:
                                 _st.brain_build_time = time.time()
                             brain = new_brain
-                            log.info(f"[brain] 大脑构建完成: mcp={mcp_set}, 缓存总数={len(_st.brains)}")
+                            log.info(f"[brain] 大脑构建完成: mcp={mcp_set}, channel={channel}, 缓存总数={len(_st.brains)}")
     # system_message 刷新在锁外（cache miss 时构建耗时 50-200ms，
     # 持锁会阻塞失败计数/watchdog；实例属性赋值 GIL 下原子安全）
     #
@@ -960,7 +974,8 @@ def _get_brain(mcp_set="none", session_id="default"):
     # 相关内容写进来都会被下一个用户读到（FR-14 3A 修的就是这个）。动态段见
     # `brain_stream_sentences` / `_brain_llm` 注入的 messages[0]。
     # 用 cached 版本：TTL 内返回同一个字符串对象，避免每轮重建 persona/规则/工具文档。
-    brain.system_message = _build_system_msg_static_cached(mcp_set)
+    brain.system_message = _replace_system_msg_for_channel(
+        _build_system_msg_static_cached(mcp_set), channel)
     return brain
 
 _thread_loop_local = threading.local()
@@ -1399,9 +1414,9 @@ def _brain_llm(text: str, session_id: str = "default") -> str:
             return "大脑启动失败，请稍后重试。"
         hist = _get_history(session_id)
         messages = [{'role': m['role'], 'content': m['content']} for m in hist] + [{'role': 'user', 'content': text}]
-        # FR-14 批次 3A：与流式路径一致 —— 静态段来自共享 brain，动态段按本会话现拼，
-        # 合并成**一条** system（双 system 会让 qwen_agent 截断路径抛 400）。
-        _sys_parts_llm = [brain_instance.system_message]
+        # FR-14 批次 3A：动态段按本会话现拼；静态段在 brain.system_message 里由
+        # qwen_agent 前置合并成**一条** system（双 system 会让截断路径抛 400）。
+        _sys_parts_llm = []
         try:
             _dyn_llm = _build_system_msg_dynamic(session_id, _resolve_uid(session_id))
             if _dyn_llm:
@@ -1834,7 +1849,7 @@ def brain_stream_sentences(text: str, session_id: str = "default", interrupted_r
             return
         log.info("[lite] 快速通道无产出，回退完整大脑")
     try:
-        brain_instance = _get_brain(mcp_set, session_id=session_id)
+        brain_instance = _get_brain(mcp_set, session_id=session_id, channel=channel)
     except Exception as e:
         _record_brain_failure(_fmt_exc(e)[:400])
         if not _llm_has_any_key():
@@ -1863,18 +1878,12 @@ def brain_stream_sentences(text: str, session_id: str = "default", interrupted_r
     # 仅允许一条且位于首位的 system——qwen_agent 截断路径遇双 system 直接抛 400
     # ModelServiceError（上下文超限时必现），故 channel 规则与工作记忆合并为一条
     _sys_parts = []
-    # 共享 brain 只持有静态段（_get_brain 保证），通道改写也只作用于它
-    _base_sys = brain_instance.system_message
-    if channel in ("voice", "feishu_text"):
-        try:
-            from agent.system_msg import _replace_system_msg_for_channel
-            _base_sys = _replace_system_msg_for_channel(_base_sys, channel)
-        except Exception as e:
-            log.debug(f"[agent.llm] error at line 1311: {e}")
-            pass
-    _sys_parts.append(_base_sys)
     # FR-14 批次 3A：动态段（人格/偏好/记忆/摘要/房间/上下文）必须**按本次会话**
     # 现拼。它是用户态，绝不能留在共享 brain 上，否则 A 会话的内容会被 B 读到。
+    #
+    # 静态段（含通道规则）已在 brain.system_message 里按 (mcp_set, channel)
+    # 渲染好，qwen_agent 每次 run 前置合并 —— 这里**不要**再注入一份，
+    # 否则每轮 prompt 静态段出现两遍（实测 none 通道 ~500 token/轮白费）。
     try:
         _dyn_seg = _build_system_msg_dynamic(session_id, _resolve_uid(session_id))
         if _dyn_seg:

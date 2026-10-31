@@ -57,3 +57,5 @@ _probe_rest.sh
 _probe_d.py
 _probe_e.py
 _probe_f.py
+agent/memory.db-shm
+agent/memory.db-wal

@@ -679,11 +679,11 @@ class TestOpenAICompat:
             for k in keys:
                 voice_agent._get_brain(k)
             assert len(voice_agent._brains) == cache_max
-            # 再建一个应淘汰 set0
+            # 再建一个应淘汰 set0（缓存键是 (mcp_set, channel) 二元组）
             voice_agent._get_brain(f"set{cache_max}")
             assert len(voice_agent._brains) == cache_max
-            assert f"set0" not in voice_agent._brains
-            assert f"set{cache_max}" in voice_agent._brains
+            assert ("set0", "default") not in voice_agent._brains
+            assert (f"set{cache_max}", "default") in voice_agent._brains
         voice_agent.restart_brain()
 
 

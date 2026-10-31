@@ -155,7 +155,7 @@ class TestSharedBrainHoldsStaticOnly:
         uc.set_session_user("s-A", "laoyu")
         fake = _CapturingBrain(system_message="")
         monkeypatch.setattr(llm_mod, "_build_brain",
-                            lambda mcp_set="all", session_id="default": fake)
+                            lambda mcp_set="all", session_id="default", channel="default": fake)
 
         brain = llm_mod._get_brain("none", session_id="s-A")
 
@@ -170,7 +170,8 @@ class TestSharedBrainHoldsStaticOnly:
         uc.set_session_user("s-A", "laoyu")
         uc.set_session_user("s-B", "jiaren1")
         monkeypatch.setattr(llm_mod, "_build_brain",
-                            lambda mcp_set="all", session_id="default": _CapturingBrain(system_message=""))
+                            lambda mcp_set="all", session_id="default", channel="default":
+                            _CapturingBrain(system_message=""))
 
         brain_a = llm_mod._get_brain("none", session_id="s-A")
         msg_a = brain_a.system_message
@@ -276,10 +277,11 @@ class TestStreamPathInjectsPerSessionDynamic:
         assert STATIC_SENTINEL in content and "北京" in content
 
     def test_no_dynamic_when_nothing_to_inject(self, monkeypatch):
-        """动态段为空时，注入的 system 里**只有静态段**，不凭空造内容。
+        """动态段为空时，messages[0] 里**不注入任何 system**，不凭空造内容。
 
-        注：流式路径按既有设计始终把（通道改写后的）静态段注入 messages[0]
-        （因为静态段里的 ``<<<VOICE_RULE>>>`` 占位符必须由通道层渲染）。
+        注：静态段（含 ``<<<VOICE_RULE>>>`` 通道渲染）在 brain.system_message 里，
+        brain 按 ``(mcp_set, channel)`` 分键、构建时就渲染好，qwen_agent 每次
+        run 前置合并。流式路径只注入动态段 —— 静态段出现两份是纯浪费。
         本用例锁的是"动态段为空 ⇒ 不追加任何用户/会话内容"。
         """
         uc.clear_all_session_users()
@@ -291,7 +293,9 @@ class TestStreamPathInjectsPerSessionDynamic:
 
         list(llm_mod.brain_stream_sentences("今天怎么样", session_id="s-X"))
 
-        assert _system_contents(brain.calls[0]) == [STATIC_SENTINEL]
+        # 动态段为空 ⇒ messages[0] 不注入任何 system（静态段在 brain.system_message
+        # 里由 qwen_agent 前置合并，注入第二份就是每轮白费 ~500-800 token）。
+        assert _system_contents(brain.calls[0]) == []
         assert "用户偏好" not in _all_text(brain.calls[0])
         assert "用户画像" not in _all_text(brain.calls[0])
         assert "历史对话摘要" not in _all_text(brain.calls[0])

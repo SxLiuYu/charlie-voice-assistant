@@ -53,7 +53,7 @@ class TestBrainBuildLock:
         build_calls = []
         original_build = _build_brain
 
-        def tracking_build(mcp_set="none", session_id="default"):
+        def tracking_build(mcp_set="none", session_id="default", channel="default"):
             build_calls.append((mcp_set, threading.get_native_id()))
             time.sleep(0.05)  # simulate build latency
             return FakeBrain(mcp_set)
@@ -90,7 +90,7 @@ class TestBrainBuildLock:
 
         build_calls = []
 
-        def tracking_build(mcp_set="none", session_id="default"):
+        def tracking_build(mcp_set="none", session_id="default", channel="default"):
             build_calls.append(mcp_set)
             time.sleep(0.05)
             return FakeBrain(mcp_set)

@@ -250,25 +250,44 @@ class TestNB2FeishuChannelIsolation:
         assert brain.system_message == original_sys_msg
 
     def test_feishu_text_injects_channel_rules_at_head(self):
+        """飞书文本通道的规则要能进 prompt。
+
+        FR-14 3A 之后通道规则渲染进共享 brain 的 system_message（brain 按
+        (mcp_set, channel) 分键、构建时就渲染好），流式路径的 messages[0]
+        只放动态段。所以这里不 mock `_get_brain`，走真实的按通道构建路径。
+        """
+        import agent.llm as llm_mod
         from agent.llm import brain_stream_sentences
+        from agent.llm_state import brains as _brains_cache
         brain = FakeBrain()
-        with patch("agent.llm._get_brain", return_value=brain), \
-             patch("agent.llm._classify_intent", return_value="none"), \
-             patch("agent.llm._cache_get", return_value=None), \
-             patch("agent.llm._get_history", return_value=[]), \
-             patch("agent.llm._append_history"), \
-             patch("agent.llm._cache_set"), \
-             patch("agent.llm._build_wm_anaphor_prompt", return_value=None), \
-             patch("agent.llm._remember_conversation_async"), \
-             patch("agent.llm._chat_lite_stream", return_value=iter([])):
-            list(brain_stream_sentences("hi", channel="feishu_text"))
-        messages = brain.calls[0]
-        # 头部应为 feishu 规则 system message
-        assert messages[0]["role"] == "system"
-        assert "飞书文本对话" in messages[0]["content"]
-        # 原有 base system 应在 brain.run 中被 assistant 自己消费，这里不强制位置
-        # 但至少 feishu 规则在 messages 头部
-        assert any("飞书文本对话" in m.get("content", "") for m in messages)
+        saved = dict(_brains_cache)
+        _brains_cache.clear()
+        try:
+            with patch("agent.llm._build_brain", return_value=brain) as m_build, \
+                 patch("agent.llm._classify_intent", return_value="none"), \
+                 patch("agent.llm._cache_get", return_value=None), \
+                 patch("agent.llm._get_history", return_value=[]), \
+                 patch("agent.llm._append_history"), \
+                 patch("agent.llm._cache_set"), \
+                 patch("agent.llm._build_wm_anaphor_prompt", return_value=None), \
+                 patch("agent.llm._remember_conversation_async"), \
+                 patch("agent.llm._chat_lite_stream", return_value=iter([])):
+                list(brain_stream_sentences("hi", channel="feishu_text"))
+
+            # brain 按 (mcp_set, channel) 取，构建时必须拿到 feishu 通道
+            assert m_build.call_args.kwargs.get("channel") == "feishu_text"
+            # 构建被 mock 了，通道渲染发生在 _build_brain_inner 里 → 单独验证
+            # "静态段 + feishu 通道" 的渲染结果确实含飞书规则
+            from agent.system_msg import _replace_system_msg_for_channel
+            rendered = _replace_system_msg_for_channel(brain.system_message, "feishu_text")
+            assert "飞书文本对话" in rendered
+            # messages[0] 是动态段，不再重复注入静态/通道规则
+            messages = brain.calls[0]
+            if messages and messages[0].get("role") == "system":
+                assert "飞书文本对话" not in messages[0]["content"]
+        finally:
+            _brains_cache.clear()
+            _brains_cache.update(saved)
 
     def test_voice_channel_unchanged(self):
         from agent.llm import brain_stream_sentences
