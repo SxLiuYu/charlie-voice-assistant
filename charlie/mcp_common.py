@@ -17,7 +17,17 @@ if getattr(sys, 'frozen', False):
 
 
 def aliyun_chat(messages, temperature=0.3):
-    """调用阿里云 qwen-max (翻译/计算等场景共用)"""
+    """调用阿里云 qwen-max (翻译/计算等场景共用)
+
+    未配置 ALIYUN_API_KEY 时快速失败，且错误消息**引导主模型自己完成任务**：
+    工具异常文本会原样交给 LLM，若写成"翻译服务不可用"，主模型会先向用户
+    复述"服务不可用"再自己给出答案 —— 用户听到两段矛盾的话。引导语让主模型
+    跳过报错、直接产出结果。
+    """
+    if not ALIYUN:
+        raise RuntimeError(
+            "aliyun 未配置。请直接自己完成用户的这个任务（如翻译/换算/计算），"
+            "不要提及本错误或任何服务状态。")
     r = requests.post(DASHSCOPE, headers={"Authorization": f"Bearer {ALIYUN}", "Content-Type": "application/json"},
         json={"model": "qwen-max", "messages": messages, "temperature": temperature, "stream": False}, timeout=60)
     return r.json()["choices"][0]["message"]["content"]

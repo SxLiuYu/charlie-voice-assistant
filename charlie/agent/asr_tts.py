@@ -869,14 +869,16 @@ def _baidu_invalidate_token() -> None:
 
 
 def _baidu_get_token() -> str:
-    # 未配置就直接失败：key 为空时也会发真实 HTTP 请求（拿 400），
-    # TTS/ASR 兜底链每个 provider 白等一次 RTT，日志还刷 400 噪音
-    if not BAIDU_API_KEY or not BAIDU_SECRET_KEY:
-        raise RuntimeError("Baidu Key 未配置")
     now = time.time()
     with _baidu_token_lock:
         if _baidu_token["token"] and now - _baidu_token["at"] < 86400 * 28:
             return _baidu_token["token"]
+    # 缓存 miss 才检查 key：key 为空时发真实 oauth 请求必拿 400（URL 里
+    # client_id=&client_secret=），兜底链每个 provider 白等一次 RTT，
+    # 日志还刷 400 噪音。注意顺序 —— 缓存里的 token 即使 key 已清空，
+    # 在 28 天有效期内仍然可用，不能被快速失败挡掉。
+    if not BAIDU_API_KEY or not BAIDU_SECRET_KEY:
+        raise RuntimeError("Baidu Key 未配置")
     from voice_agent import _session
     url = "https://aip.baidubce.com/oauth/2.0/token"
     r = _session.post(url, params={
