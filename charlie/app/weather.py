@@ -4,6 +4,7 @@
 Open-Meteo: https://open-meteo.com/ （无需注册，无限制，CORS 友好）
 """
 import copy
+import datetime
 import json
 import os
 import logging
@@ -163,29 +164,53 @@ def _amap_get(city: str, return_casts: bool = False) -> dict | list | None:
         return None
 
 
+_geo_cache = {}  # city -> (lat, lon) | None；进程级，避免每问都打 geocoding API
+
+
 def _open_meteo_fetch_raw(city: str) -> tuple[dict, dict] | None:
     """Geocode city and fetch Open-Meteo daily + current_weather data.
 
     Returns (daily_dict, current_weather_dict) or None on failure.
     """
     try:
-        geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "zh"}, timeout=5)
-        results = geo.json().get("results")
-        if not results:
-            pinyin_map = {"北京": "Beijing", "上海": "Shanghai", "广州": "Guangzhou",
-                          "深圳": "Shenzhen", "杭州": "Hangzhou", "成都": "Chengdu",
-                          "武汉": "Wuhan", "南京": "Nanjing", "西安": "Xian",
-                          "重庆": "Chongqing", "苏州": "Suzhou", "天津": "Tianjin"}
-            en = pinyin_map.get(city, city)
-            geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": en, "count": 1}, timeout=5)
-            results = geo.json().get("results")
-        if not results:
-            log.debug(f"[weather] Open-Meteo 找不到城市: {city}")
-            return None
-        lat = results[0]["latitude"]
-        lon = results[0]["longitude"]
+        lat, lon = _geo_cache.get(city, (None, None))
+        if lat is None:
+            pinyin_map = {
+                "北京": "Beijing", "上海": "Shanghai", "广州": "Guangzhou",
+                "深圳": "Shenzhen", "杭州": "Hangzhou", "成都": "Chengdu",
+                "武汉": "Wuhan", "南京": "Nanjing", "西安": "Xian",
+                "重庆": "Chongqing", "苏州": "Suzhou", "天津": "Tianjin",
+                "厦门": "Xiamen", "青岛": "Qingdao", "大连": "Dalian",
+                "哈尔滨": "Harbin", "昆明": "Kunming", "拉萨": "Lhasa",
+                "长沙": "Changsha", "郑州": "Zhengzhou", "沈阳": "Shenyang",
+                "福州": "Fuzhou", "合肥": "Hefei", "济南": "Jinan",
+                "南宁": "Nanning", "贵阳": "Guiyang", "兰州": "Lanzhou",
+                "太原": "Taiyuan", "石家庄": "Shijiazhuang", "南昌": "Nanchang",
+                "长春": "Changchun", "银川": "Yinchuan", "西宁": "Xining",
+            }
+            candidates = [city]
+            if not city.endswith("市"):
+                candidates.append(city + "市")
+            en = pinyin_map.get(city)
+            if en:
+                candidates.append(en)
+            results = None
+            for name in candidates:
+                try:
+                    geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                        params={"name": name, "count": 1, "language": "zh"}, timeout=5)
+                    results = geo.json().get("results")
+                except Exception:
+                    results = None
+                if results:
+                    break
+            if not results:
+                log.debug(f"[weather] Open-Meteo 找不到城市: {city}")
+                _geo_cache[city] = (None, None)
+                return None
+            lat = results[0]["latitude"]
+            lon = results[0]["longitude"]
+            _geo_cache[city] = (lat, lon)
 
         r = requests.get("https://api.open-meteo.com/v1/forecast",
             params={
@@ -306,12 +331,31 @@ def get_weather(city: str = "北京") -> dict:
     return copy.deepcopy(result)
 
 
-def get_weather_text(city: str = "北京", detail: bool = False) -> str:
+def get_weather_text(city: str = "北京", detail: bool = False, day_offset: int = 0) -> str:
     """返回格式化天气文本，供 voice_agent / TTS 直接使用。
 
     detail=False（默认）：语音短答——"城市今天X，A到B度"+ 伞提示，~3 秒播完。
     detail=True：完整版（实时温度 + 穿衣建议），供晨报/飞书等文本场景。
+    day_offset: 0=今天, 1=明天, 2=后天（Open-Meteo/AMAP 都有逐日预报）。
     """
+    if day_offset > 0:
+        try:
+            casts = get_weather_casts(city)
+            if casts and len(casts) > day_offset:
+                c = casts[day_offset]
+                label = {1: "明天", 2: "后天"}.get(day_offset, c.get("date") or "那天")
+                dt = int(float(c.get("daytemp", 20)))
+                nt = int(float(c.get("nighttemp", 20)))
+                wx = c.get("dayweather") or c.get("day_weather") or "晴"
+                bits = [f"{city}{label}{wx}，{nt}到{dt}度"]
+                if "雨" in wx:
+                    bits.append("记得带伞")
+                elif "雪" in wx:
+                    bits.append("注意防滑")
+                return "。".join(bits) + "。"
+        except Exception as e:
+            log.debug(f"[weather] day_offset 查询失败: {e}")
+        # 预报拿不到 → 落回今天，别报错
     w = get_weather(city)
     if w.get("source") == "default":
         return f"{city}天气数据暂时不可用，请稍后再试。"
@@ -331,17 +375,27 @@ def get_weather_text(city: str = "北京", detail: bool = False) -> str:
         cur_text = f"实时{cur_w}，{cur}度" if (cur is not None and cur_w) else ""
 
     if not detail:
-        parts = [f"{city}今天{weather}，{night}到{day}度"]
+        # 语音短答压到 3s 内：去掉冗余的"今天"（语境已是今天），伞/滑提示
+        # 并入同一句用逗号连读。实测 TTS_SPEED=1.3 下
+        # "北京今天阴，5到16度。" 2.60s → "北京阴，5到16度。" 1.94s；
+        # 雨雪句 "北京小雨，5到16度，带伞。" 3.00s（原来 3.74s）。
+        parts = [f"{city}{weather}，{night}到{day}度"]
         rain = w.get("rain_prob", 0)
-        if rain and rain >= 50:
-            parts.append("记得带伞")
-        elif "雨" in weather:
-            parts.append("记得带伞")
+        if (rain and rain >= 50) or "雨" in weather:
+            parts.append("带伞")
         elif "雪" in weather:
-            parts.append("注意防滑")
+            parts.append("路滑")
+        # 26 度穿衣法：说清"现在这个温度该穿什么"。
+        # 有实时温度就用实时（用户此刻体感），否则退回白天预报温度。
+        _wear_temp = cur if cur is not None else day
+        try:
+            _outfit, _feel = outfit_for_26(_wear_temp, short=True)
+            parts.append(f"穿{_outfit}")
+        except Exception as e:
+            log.debug(f"[weather] 26度穿衣法失败: {e}")
         if _wet and cur_text.startswith("实时报"):
             parts.append(cur_text)  # 仅矛盾提示时补充，避免首句超长
-        return "。".join(parts) + "。"
+        return "，".join(parts) + "。"
 
     parts = [f"{city}今天{weather}，{night}到{day}度"]
     if cur_text:
@@ -369,6 +423,131 @@ def get_weather_text(city: str = "北京", detail: bool = False) -> str:
 
     result = "。".join(parts) + "。"
     return result
+
+
+_WEEKDAY_NAMES = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+
+# ===== 26 度穿衣法 =====
+# 公式：气温 + 各层衣物"保暖温度"之和 ≈ 26℃ 时体感最舒适。
+# 每件衣物标注的是它能等效补偿的温差（不是它的标称厚度），
+# 所以按当前气温逐件挑选，凑到 26 就停。
+CLOTHING_TEMP = {
+    # 上衣
+    "短袖": 1, "薄衬衫": 2, "长袖T恤": 2, "薄卫衣": 3, "衬衫加薄外套": 4,
+    "毛衣": 4, "卫衣加外套": 5, "夹克": 4, "风衣": 4, "薄羽绒服": 6,
+    "厚毛衣": 6, "羽绒服": 8, "厚羽绒服": 10,
+    # 下装
+    "短裤": 1, "薄长裤": 2, "牛仔裤": 3, "运动裤": 3, "加绒裤": 5, "保暖裤": 7,
+    # 外层补充
+    "围巾": 1, "帽子": 1,
+}
+
+# 由热到冷的候选穿搭：(完整名, 语音短名, 衣物层)。
+# 顺序必须单调递增保暖值（越往后越暖），挑第一个能满足 26 度的。
+# 相邻档只差 1-3 度，避免"20 度直接跳到体感 28"这种过冲。
+# 语音短名是为了控制句长：中文 TTS ≈0.2s/字，一句"天气+温度+穿搭"
+# 最好压在 16 字内（≈3.2s），所以简写成"夹克薄卫衣"而不是
+# "夹克加薄卫衣加牛仔裤"。
+_CLOTHING_OUTFITS = (
+    ("短袖短裤", "短袖", ("短袖", "短裤")),                        # +2
+    ("短袖长裤", "短袖", ("短袖", "薄长裤")),                      # +3
+    ("短袖牛仔裤", "短袖", ("短袖", "牛仔裤")),                    # +4
+    ("长袖T恤牛仔裤", "长袖", ("长袖T恤", "牛仔裤")),               # +5
+    ("薄卫衣牛仔裤", "薄卫衣", ("薄卫衣", "牛仔裤")),                # +6
+    ("卫衣外套", "卫衣外套", ("卫衣加外套", "牛仔裤")),             # +8
+    ("夹克薄卫衣", "夹克加薄卫衣", ("夹克", "薄卫衣", "牛仔裤")),       # +9
+    ("夹克毛衣", "夹克加毛衣", ("夹克", "毛衣", "牛仔裤")),           # +11
+    ("薄羽绒加绒裤", "薄羽绒服", ("薄羽绒服", "加绒裤")),           # +11
+    ("薄羽绒加绒裤围巾", "薄羽绒服", ("薄羽绒服", "加绒裤", "围巾")), # +12
+    ("风衣毛衣加绒裤", "风衣加毛衣", ("风衣", "毛衣", "加绒裤")),      # +13
+    ("薄羽绒保暖裤", "薄羽绒服", ("薄羽绒服", "保暖裤")),           # +13
+    ("风衣厚毛衣加绒裤", "风衣加厚毛衣", ("风衣", "厚毛衣", "加绒裤")), # +15
+    ("羽绒服保暖裤", "羽绒服", ("羽绒服", "保暖裤")),              # +15
+    ("厚羽绒保暖裤", "厚羽绒服", ("厚羽绒服", "保暖裤")),           # +17
+    ("厚羽绒保暖裤围巾", "厚羽绒服", ("厚羽绒服", "保暖裤", "围巾")), # +18
+)
+
+COMFORT_TARGET = 26
+
+
+def outfit_for_26(current_temp: float, short: bool = False) -> tuple[str, float]:
+    """按 26 度穿衣法给当前气温挑一套衣服。
+
+    返回 (搭配名, 体感温度)。体感 = 气温 + 衣物保暖值之和。
+    short=True 返回适合语音播报的短名（"夹克薄卫衣"而非"夹克薄卫衣牛仔裤"）。
+    """
+    gap = COMFORT_TARGET - float(current_temp)
+    if gap <= 0:
+        # 气温本身就 ≥26：不需要任何保暖层
+        return ("短袖" if short else "短袖短裤", float(current_temp))
+    best = _CLOTHING_OUTFITS[-1]
+    for item in _CLOTHING_OUTFITS:
+        layers = item[2]
+        if sum(CLOTHING_TEMP.get(layer, 0) for layer in layers) >= gap:
+            best = item
+            break
+    feel = float(current_temp) + sum(CLOTHING_TEMP.get(l, 0) for l in best[2])
+    return ((best[1] if short else best[0]), feel)
+
+
+def get_weather_week_text(city: str = "北京") -> str:
+    """未来 7 天语音周报（Open-Meteo daily 已有 7 天，无需额外 Key）。
+
+    天猫精灵风格：前 4 天逐日 + 一周温度范围 + 雨/雪提示，控制在 2-3 句。
+    失败返回空串，调用方回退今日天气。
+    """
+    try:
+        casts = get_weather_casts(city)
+    except Exception as e:
+        log.debug(f"[weather] 周报 casts 失败: {e}")
+        return ""
+    if not casts:
+        return ""
+    days = casts[:7]
+    daytemps: list[int] = []
+    nighttemps: list[int] = []
+    rain_labels: list[str] = []
+    snow_labels: list[str] = []
+    pieces: list[str] = []
+    for i, c in enumerate(days):
+        try:
+            hi = int(float(c.get("daytemp", 20)))
+            lo = int(float(c.get("nighttemp", 20)))
+        except Exception:
+            hi, lo = 20, 10
+        daytemps.append(hi)
+        nighttemps.append(lo)
+        wx = (c.get("dayweather") or c.get("day_weather") or "晴").strip()
+        date = c.get("date") or ""
+        if i == 0:
+            label = "今天"
+        elif i == 1:
+            label = "明天"
+        else:
+            try:
+                label = _WEEKDAY_NAMES[datetime.date.fromisoformat(date).weekday()]
+            except Exception:
+                label = f"{i + 1}号"
+        pieces.append(f"{label}{wx}{lo}到{hi}度")
+        if "雨" in wx:
+            rain_labels.append(label)
+        if "雪" in wx:
+            snow_labels.append(label)
+    if not pieces:
+        return ""
+    lo_all = min(nighttemps) if nighttemps else 10
+    hi_all = max(daytemps) if daytemps else 20
+    spoken = "；".join(pieces[:4])
+    if len(pieces) > 4:
+        spoken += f"；之后{pieces[-1]}"
+    if snow_labels:
+        tail = f"{'、'.join(snow_labels[:3])}有雪，注意防滑保暖"
+    elif rain_labels:
+        tail = f"{'、'.join(rain_labels[:3])}有雨，记得带伞"
+    else:
+        tail = "一周基本无雨"
+    return f"{city}{spoken}。整周气温{lo_all}到{hi_all}度，{tail}。"
 
 
 def get_weather_alerts(city: str = "北京") -> list[str]:

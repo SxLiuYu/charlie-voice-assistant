@@ -162,13 +162,16 @@ async def xiaozhi_ota(request: Request):
         host = _get_lan_ip() or "127.0.0.1"
     elif host in ("localhost", "127.0.0.1", "::1", ""):
         host = _get_lan_ip() or "127.0.0.1"
-    ws_url = f"ws://{host}:{http_port()}/ws/xiaozhi"
+    ws_url = f"ws://{host}:{http_port()}/xiaozhi/v1/"
     if AUTH_TOKEN:
         # OTA 端点公开可达，不返回真实 AUTH_TOKEN；设备连接 WS 时自行携带预置 token
         ws_url = f"{ws_url}?token=device"
+    # xiaozhi v2.1.0 OTA 解析 websocket.token / firmware，缺了可能抛异常不连 WS
+    # （实测 19:07 OTA 200 后设备只反复重新 OTA、不开 WS）
     ota_response = {
-        "websocket": {"url": ws_url, "version": 1},
+        "websocket": {"url": ws_url, "token": "device", "version": 1},
         "server_time": {"timestamp": int(datetime.datetime.now().timestamp()), "timezone_offset": 480},
+        "firmware": {"version": "2.1.0", "url": ""},
     }
     mqtt_broker = os.getenv("MQTT_BROKER", "")
     if mqtt_broker and os.getenv("MQTT_ENABLE_OTA", "0") == "1":

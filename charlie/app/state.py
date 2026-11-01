@@ -5,6 +5,7 @@
 """
 import asyncio
 import logging
+import os
 from collections import deque
 import threading
 import time
@@ -276,12 +277,14 @@ class InterruptTelemetry:
 
 _interrupt_telemetry = InterruptTelemetry()
 
-# ===== 限流(每IP每分钟60普通+10语音, 每会话30) =====
+# ===== 限流(每IP每分钟60普通+10语音, 每会话30; 可用环境变量覆盖) =====
+# 回环地址(127.0.0.1)不做 IP 级限流 —— 本机 CLI / 测试 / 管理面不应被自家限流卡死。
 _rate_buckets = {}        # {ip: {"voice":[ts], "general":[ts]}}
-_RATE_GENERAL = 60
-_RATE_VOICE = 10
+_RATE_GENERAL = int(os.getenv("RATE_GENERAL", "60"))
+_RATE_VOICE = int(os.getenv("RATE_VOICE", "10"))
 _RATE_WINDOW = 60
-_RATE_PER_SESSION = 30
+_RATE_PER_SESSION = int(os.getenv("RATE_PER_SESSION", "30"))
+_RATE_LOOPBACK_EXEMPT = os.getenv("RATE_LOOPBACK_EXEMPT", "1") == "1"
 _RATE_LOCK = threading.Lock()  # 限流计数器锁
 _session_buckets = {}      # {session_id: [ts]}
 

@@ -85,7 +85,7 @@ from app.config import http_port, https_port
 from app.state import (
     _metrics, MAX_REQUEST_BODY, _ws_client_count, _RATE_GENERAL, _RATE_VOICE,
     _RATE_PER_SESSION, _rate_buckets, _session_buckets, _RATE_LOCK, _RATE_WINDOW,
-    sse_client_count,
+    _RATE_LOOPBACK_EXEMPT, sse_client_count,
 )
 from app.cors import (
     DynamicCORSMiddleware, refresh_cors_origins, reload_cors_origins,
@@ -149,6 +149,12 @@ async def lifespan(app):
     asyncio.get_running_loop().set_default_executor(_io_pool)
     if os.environ.get("SKIP_BACKGROUND") == "1":
         log.info("后台调度器跳过(SKIP_BACKGROUND=1，由HTTP进程管理)")
+        # 提醒不到点不响等于没有闹钟（天猫核心功能）。SKIP_BACKGROUND 只
+        # 跳过重预热/MQTT/进化等，提醒调度器除非显式关掉否则照起。
+        if os.environ.get("REMINDER_SCHEDULER_ENABLED", "1") == "1":
+            set_main_loop(asyncio.get_running_loop())
+            start_scheduler()
+            log.info("提醒调度器已启动（SKIP_BACKGROUND=1 下单独放行）")
     else:
         _main_loop = asyncio.get_running_loop()
         set_main_loop(_main_loop)
@@ -213,6 +219,13 @@ async def lifespan(app):
         pass
 
 app = FastAPI(title="Charlie语音服务", lifespan=lifespan)
+
+# 白噪音 / 本地音频静态目录（magic-music.play_white_noise 生成后经 /audio 拉流）
+from fastapi.staticfiles import StaticFiles as _StaticFiles
+_AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "audio")
+os.makedirs(_AUDIO_DIR, exist_ok=True)
+app.mount("/audio", _StaticFiles(directory=_AUDIO_DIR), name="audio")
+
 app.include_router(system_router)
 app.include_router(tuya_router)
 app.include_router(conversation_router)
@@ -277,7 +290,11 @@ async def request_logger(request: Request, call_next):
     is_voice = "/api/voice" in path or "/api/tts" in path or "/api/asr" in path
     bucket_type = "voice" if is_voice else "general"
     limit = _RATE_VOICE if is_voice else _RATE_GENERAL
-    allowed, remaining, retry_after = check_rate(ip, bucket_type, limit)
+    loopback = ip in ("127.0.0.1", "::1", "localhost")
+    if _RATE_LOOPBACK_EXEMPT and loopback:
+        allowed, remaining, retry_after = True, limit, 0
+    else:
+        allowed, remaining, retry_after = check_rate(ip, bucket_type, limit)
     if not allowed:
         log.warning(f"[{rid}] 限流 {ip} {path} (超过{limit}/min)")
         return JSONResponse({"error": f"请求过于频繁, 请{retry_after}秒后重试"}, status_code=429, headers={"Retry-After": str(retry_after)})

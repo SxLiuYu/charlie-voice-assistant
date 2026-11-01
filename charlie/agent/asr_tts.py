@@ -8,7 +8,7 @@ import logging
 import re
 import tempfile
 from typing import Optional, Dict, Any, Tuple
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor
 from agent.intent import is_garbled_asr
 
 log = logging.getLogger("magic")
@@ -248,6 +248,8 @@ _TTS_EMOJI_RE = re.compile(
     re.UNICODE)
 _TTS_PAREN_RE = re.compile(r'[（(][^）)]{0,40}[）)]?')
 _TTS_WHITESPACE_RE = re.compile(r'\s{2,}')
+# 中文串里夹的单个空格（"我是 贾维斯"）会让中文 TTS 停顿半拍，直接去掉
+_TTS_CJK_SPACE_RE = re.compile(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])')
 _TTS_STRIKETHROUGH_RE = re.compile(r'~~([^~]+)~~')
 _TTS_IMAGE_RE = re.compile(r'!\[([^\]]*)\]\([^)]*\)')
 _TTS_MULTI_PUNCT_RE = re.compile(r'([！？。，！？。，]){2,}')
@@ -255,6 +257,20 @@ _TTS_MULTI_PUNCT_RE = re.compile(r'([！？。，！？。，]){2,}')
 _DIGIT_CN = "零一二三四五六七八九"
 _UNIT_AFTER_DIGIT = ("点", "度", "分", "秒", "层", "楼", "块", "号", "岁")
 _NORMALIZE_DIGITS_RE = re.compile(r'(\d{1,4}(?:\.\d+)?)(' + '|'.join(_UNIT_AFTER_DIGIT) + ')')
+
+# 逐字母念的缩写对中文 TTS 极不友好：实测 "我是 J.A.R.V.I.S.。" 要 2.38s，
+# "我是贾维斯。" 只要 1.37s —— 同一句话省 1 秒。语音链路把它换成中文读法。
+_TTS_SPELLED_NAMES = (
+    (re.compile(r'J\.?\s*A\.?\s*R\.?\s*V\.?\s*I\.?\s*S\.?', re.IGNORECASE), "贾维斯"),
+    (re.compile(r'\bJARVIS\b', re.IGNORECASE), "贾维斯"),
+)
+
+
+def _expand_spelled_names(text: str) -> str:
+    """把 J.A.R.V.I.S. 这类逐字母缩写换成中文读法，省掉 ~1s 播放时间。"""
+    for _rx, _cn in _TTS_SPELLED_NAMES:
+        text = _rx.sub(_cn, text)
+    return text
 
 
 def _normalize_digits(text: str) -> str:
@@ -312,7 +328,9 @@ class TTSUnavailableError(Exception):
     pass
 
 def _clean_for_tts(text: str) -> str:
-    t = text
+    # 缩写替换必须放在空格清洗之前：J.A.R.V.I.S. → 贾维斯 之后
+    # 原文两侧还有英文空格（"我是 贾维斯"），TTS 会在空格处停顿。
+    t = _expand_spelled_names(text)
     t = _TTS_BOLD_RE.sub('', t)
     t = _TTS_HEADER_RE.sub('', t)
     t = _TTS_BLOCKQUOTE_RE.sub('', t)
@@ -330,18 +348,33 @@ def _clean_for_tts(text: str) -> str:
     t = _TTS_WHITESPACE_RE.sub(' ', t)
     t = t.strip()
     t = _normalize_digits(t)
+    # 中英混排里英文两侧的空格会让 TTS 停顿（"我是 贾维斯"），去掉中文之间的空格
+    t = _TTS_CJK_SPACE_RE.sub('', t)
     return t
 
 def get_effective_tts_config() -> tuple[str, float]:
-    """获取当前生效的 TTS 配置（voice, speed），优先使用角色配置"""
+    """获取当前生效的 TTS 配置（voice, speed）。
+
+    voice 用角色配置；speed 优先用显式 TTS_SPEED 环境变量 —— 角色表里
+    jarvis 是 0.92（比正常慢 8%），语音链路每字≈0.23s，一句 18 字就多
+    0.3s，人格配置不该压过运维开关。
+    """
+    _override = os.getenv("TTS_SPEED", "").strip()
     try:
         from agent.roles import get_current_role, get_role_tts_config
         role_id = get_current_role()
         role_config = get_role_tts_config(role_id)
         voice = role_config.get("voice", "") or TTS_VOICE
+        if _override:
+            return voice, float(_override)
         speed = role_config.get("speed", _tts_speed)
         return voice, float(speed)
     except Exception:
+        if _override:
+            try:
+                return TTS_VOICE, float(_override)
+            except ValueError:
+                pass
         return TTS_VOICE, _tts_speed
 
 
@@ -537,171 +570,67 @@ def asr_race(audio_bytes: bytes, fmt: str = "wav", session_id: str = "default", 
             return asr(audio_bytes, fmt, session_id), "legacy"
 
     deadline_ms = deadline_ms if deadline_ms is not None else int(os.getenv("ASR_RACE_DEADLINE_MS", "1200"))
-    grace_ms = int(os.getenv("ASR_RACE_GRACE_MS", "50"))  # 本地干净时不等云端（实测 StepFun 800ms+ 永远赶不上宽限）；乱码路径仍等满 deadline
 
     local_start = time.perf_counter()
-    cloud_start = time.perf_counter()
 
     local_text = None
     local_ms = None
     cloud_text = None
     cloud_ms = None
 
+    # 本地优先：SenseVoice 实测 116-300ms，云端 nmcloud 常态 600ms+，竞速永远
+    # 选不上云端。原来的并行竞速反而有害 —— 云端 future 没人 cancel，一直在
+    # 占 2 个 worker 的池子；连着说几句就把本地任务挤到排队，超过 deadline
+    # 直接掉 legacy（581-1387ms，日志里 15:37-15:43 连续 11 次）。
+    # 现在只有本地空/乱码时才发云端，池子不再被无谓占用。
     pool = _get_race_pool()
     local_future = pool.submit(_asr_sense_voice, audio_bytes, fmt)
-    cloud_future = pool.submit(cloud_fn, audio_bytes, fmt)
-
     try:
-        done, not_done = wait(
-            [local_future, cloud_future],
-            timeout=deadline_ms / 1000.0,
-            return_when=FIRST_COMPLETED,
-        )
+        local_text = local_future.result(timeout=deadline_ms / 1000.0)
     except Exception as e:
-        log.warning(f"[asr-race] wait failed: {e}")
-        return asr(audio_bytes, fmt, session_id), "legacy"
+        log.warning(f"[asr-race] 本地失败/超时: {e}")
+        local_text = None
+    local_ms = (time.perf_counter() - local_start) * 1000
 
-    if local_future in done:
+    if local_text and local_text.strip() and not is_garbled_asr(local_text):
+        log.info(f"[asr-race] 本地={local_ms:.0f}ms 选择=local 原因=本地干净(不再并发云端)")
         try:
-            local_text = local_future.result()
-        except Exception:
-            pass
-        local_ms = (time.perf_counter() - local_start) * 1000
+            from agent.asr_correction import correct_asr_text
+            local_text = correct_asr_text(local_text, session_id=session_id)
+        except Exception as e:
+            log.debug(f"[agent.asr_tts] asr correction skipped: {e}")
+        return local_text, "sensevoice"
 
-    if cloud_future in done:
-        try:
-            cloud_text = cloud_future.result()
-        except Exception:
-            pass
+    # 本地空/乱码 → 才花钱问云端
+    cloud_start = time.perf_counter()
+    try:
+        cloud_future = pool.submit(cloud_fn, audio_bytes, fmt)
+        cloud_text = cloud_future.result(timeout=deadline_ms / 1000.0)
         cloud_ms = (time.perf_counter() - cloud_start) * 1000
+    except Exception as e:
+        log.warning(f"[asr-race] 云端失败/超时: {e}")
+        cloud_text = None
 
-    cloud_done = cloud_future.done()
-    local_done = local_future.done()
-
-    # Case A: Cloud finished within deadline with valid text
-    if cloud_done and cloud_text:
-        reason = "云端先完成且≤deadline"
-        if local_done and local_text and not is_garbled_asr(local_text):
-            reason = "本地干净+云端已完成"
-        log.info(f"[asr-race] 本地={local_ms or 'N/A'}ms 云端={cloud_ms:.0f}ms 选择=cloud 原因={reason}")
+    if cloud_text and cloud_text.strip():
+        log.info(f"[asr-race] 本地={local_ms:.0f}ms({'空' if not local_text else '乱码'}) "
+                 f"云端={cloud_ms or 0:.0f}ms 选择=cloud")
         try:
             from agent.asr_correction import correct_asr_text
             cloud_text = correct_asr_text(cloud_text, session_id=session_id)
         except Exception as e:
-            log.debug(f"[agent.asr_tts] error at line ...: {e}")
+            log.debug(f"[agent.asr_tts] asr correction skipped: {e}")
         return cloud_text, cloud_name
 
-    # Case B: Cloud failed/empty, wait for local if still running
-    if cloud_done and not cloud_text:
-        if not local_done:
-            remaining = max(0, deadline_ms - (time.perf_counter() - local_start) * 1000) / 1000.0
-            if remaining > 0:
-                try:
-                    wait([local_future], timeout=remaining, return_when=FIRST_COMPLETED)
-                except Exception:
-                    pass
-            if local_future.done():
-                try:
-                    local_text = local_future.result()
-                    local_ms = (time.perf_counter() - local_start) * 1000
-                except Exception:
-                    pass
+    if local_text is not None:
+        log.info(f"[asr-race] 本地={local_ms:.0f}ms 云端=err 选择=local 原因=云端也失败")
+        return local_text, "sensevoice"
 
-        if local_text is not None:
-            log.info(f"[asr-race] 本地={local_ms or 'N/A'}ms 云端=err 选择=local 原因=云端异常/失败")
-            try:
-                from agent.asr_correction import correct_asr_text
-                local_text = correct_asr_text(local_text, session_id=session_id)
-            except Exception as e:
-                log.debug(f"[agent.asr_tts] error at line ...: {e}")
-            return local_text, "sensevoice"
+    if local_text is None and cloud_text is None:
+        # 本地+云端都没出字（多半是噪声/太轻）：legacy 全家桶大概率也空，
+        # 别再烧 ~700ms（实测 20:06 空识别 legacy 765ms 后照样 garbled）。
+        log.info("[asr-race] 本地+云端均空，跳过 legacy 快速返回")
+        return "", "none"
 
-    # Case C: Local finished first
-    if local_done and local_text is not None:
-        if local_text.strip() and not is_garbled_asr(local_text):
-            # Local clean
-            if cloud_done:
-                if cloud_text:
-                    log.info(f"[asr-race] 本地={local_ms:.0f}ms 云端={cloud_ms:.0f}ms 选择=cloud 原因=本地干净+云端已完成")
-                    try:
-                        from agent.asr_correction import correct_asr_text
-                        cloud_text = correct_asr_text(cloud_text, session_id=session_id)
-                    except Exception as e:
-                        log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                    return cloud_text, cloud_name
-                else:
-                    log.info(f"[asr-race] 本地={local_ms:.0f}ms 云端=err 选择=local 原因=本地干净+云端失败")
-                    try:
-                        from agent.asr_correction import correct_asr_text
-                        local_text = correct_asr_text(local_text, session_id=session_id)
-                    except Exception as e:
-                        log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                    return local_text, "sensevoice"
-            else:
-                # Wait grace for cloud
-                try:
-                    cloud_done_futures, _ = wait([cloud_future], timeout=grace_ms / 1000.0, return_when=FIRST_COMPLETED)
-                except Exception:
-                    cloud_done_futures = set()
-
-                if cloud_future in cloud_done_futures:
-                    try:
-                        cloud_text = cloud_future.result()
-                        cloud_ms = (time.perf_counter() - cloud_start) * 1000
-                        if cloud_text:
-                            log.info(f"[asr-race] 本地={local_ms:.0f}ms 云端={cloud_ms:.0f}ms 选择=cloud 原因=本地干净+云端宽限期内到达")
-                            try:
-                                from agent.asr_correction import correct_asr_text
-                                cloud_text = correct_asr_text(cloud_text, session_id=session_id)
-                            except Exception as e:
-                                log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                            return cloud_text, cloud_name
-                    except Exception:
-                        pass
-
-                log.info(f"[asr-race] 本地={local_ms:.0f}ms 云端=timeout 选择=local 原因=本地干净+云端超宽限")
-                try:
-                    from agent.asr_correction import correct_asr_text
-                    local_text = correct_asr_text(local_text, session_id=session_id)
-                except Exception as e:
-                    log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                return local_text, "sensevoice"
-        else:
-            # Local empty or garbled
-            if not cloud_done:
-                remaining = max(0, deadline_ms - (time.perf_counter() - cloud_start) * 1000) / 1000.0
-                if remaining > 0:
-                    try:
-                        wait([cloud_future], timeout=remaining, return_when=FIRST_COMPLETED)
-                    except Exception:
-                        pass
-
-            if cloud_future.done():
-                try:
-                    cloud_text = cloud_future.result()
-                    cloud_ms = (time.perf_counter() - cloud_start) * 1000
-                except Exception:
-                    pass
-
-            if cloud_text:
-                log.info(f"[asr-race] 本地={local_ms or 'N/A'}ms 云端={cloud_ms:.0f}ms 选择=cloud 原因=本地乱码/空+云端成功")
-                try:
-                    from agent.asr_correction import correct_asr_text
-                    cloud_text = correct_asr_text(cloud_text, session_id=session_id)
-                except Exception as e:
-                    log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                return cloud_text, cloud_name
-
-            if local_text is not None:
-                log.info(f"[asr-race] 本地={local_ms or 'N/A'}ms 云端={'err' if cloud_ms is None else f'{cloud_ms:.0f}ms'} 选择=local 原因=云端也失败")
-                try:
-                    from agent.asr_correction import correct_asr_text
-                    local_text = correct_asr_text(local_text, session_id=session_id)
-                except Exception as e:
-                    log.debug(f"[agent.asr_tts] error at line ...: {e}")
-                return local_text, "sensevoice"
-
-    # Neither done or both failed: fallback to serial asr
     return asr(audio_bytes, fmt, session_id), "legacy"
 
 

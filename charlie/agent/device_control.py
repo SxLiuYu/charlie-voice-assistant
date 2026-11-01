@@ -268,6 +268,36 @@ def direct_ac_control(text: str) -> str:
     return ""
 
 
+def _win_volume_iface():
+    """Windows IAudioEndpointVolume。新版 pycaw 的 AudioDevice 没有 Activate()，
+    EndpointVolume 属性就是指针（实测 SetMasterVolumeLevelScalar 可用）。"""
+    import comtypes
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    from ctypes import cast, POINTER
+    dev = AudioUtilities.GetSpeakers()
+    ep = getattr(dev, "EndpointVolume", None)
+    if ep is not None:
+        return cast(ep, POINTER(IAudioEndpointVolume))
+    iface = dev.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
+    return cast(iface, POINTER(IAudioEndpointVolume))
+
+
+def get_volume_pct() -> int | None:
+    """当前系统音量 0-100，失败返回 None。"""
+    _sys = platform.system()
+    try:
+        if _sys == "Windows":
+            vol = _win_volume_iface()
+            return round(vol.GetMasterVolumeLevelScalar() * 100)
+        if _sys == "Darwin":
+            r = subprocess.run(["osascript", "-e", "output volume of (get volume settings)"],
+                               capture_output=True, text=True, timeout=3)
+            return int(r.stdout.strip() or -1)
+    except Exception:
+        return None
+    return None
+
+
 def set_volume(delta_pct: int) -> bool:
     """跨平台系统音量增减(delta_pct 正=调大/负=调小)。返回是否成功。"""
     delta_pct = max(-100, min(100, delta_pct))  # clamp 到 [-100,100]
@@ -277,23 +307,40 @@ def set_volume(delta_pct: int) -> bool:
             op = "+" if delta_pct >= 0 else ""
             subprocess.run(['osascript', '-e', f'set volume output volume (output volume of (get volume settings) {op}{delta_pct})'], timeout=3)
         elif _sys == "Windows":
-            try:
-                import comtypes
-                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-                from ctypes import cast, POINTER
-            except Exception:
-                return False
-            dev = AudioUtilities.GetSpeakers()
-            iface = dev.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
-            vol = cast(iface, POINTER(IAudioEndpointVolume))
+            vol = _win_volume_iface()
             cur = vol.GetMasterVolumeLevelScalar()
             vol.SetMasterVolumeLevelScalar(max(0.0, min(1.0, cur + delta_pct / 100.0)), None)
+            vol.SetMute(0, None)
         else:
             import shutil
             if shutil.which('amixer'):
                 subprocess.run(['amixer', '-q', 'set', 'Master', f'{delta_pct}%+'], timeout=3)
             elif shutil.which('pactl'):
-                subprocess.run(['pactl', 'set-sink-volume', '@DEFAULT_SINK@', f'{delta_pct}%+'], timeout=3)
+                subprocess.run(['pactl', '-q', 'set-sink-volume', '@DEFAULT_SINK@', f'{delta_pct}%+'], timeout=3)
+            else:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def set_volume_abs(level_pct: int) -> bool:
+    """把系统音量设为绝对值 0-100。"""
+    level_pct = max(0, min(100, int(level_pct)))
+    _sys = platform.system()
+    try:
+        if _sys == "Darwin":
+            subprocess.run(['osascript', '-e', f'set volume output volume {level_pct}'], timeout=3)
+        elif _sys == "Windows":
+            vol = _win_volume_iface()
+            vol.SetMasterVolumeLevelScalar(level_pct / 100.0, None)
+            vol.SetMute(1, None) if level_pct == 0 else vol.SetMute(0, None)
+        else:
+            import shutil
+            if shutil.which('amixer'):
+                subprocess.run(['amixer', '-q', 'set', 'Master', f'{level_pct}%'], timeout=3)
+            elif shutil.which('pactl'):
+                subprocess.run(['pactl', '-q', 'set-sink-volume', '@DEFAULT_SINK@', f'{level_pct}%'], timeout=3)
             else:
                 return False
         return True
@@ -308,19 +355,14 @@ def mute_volume() -> bool:
         if _sys == "Darwin":
             subprocess.run(['osascript', '-e', 'set volume output muted true'], timeout=3)
         elif _sys == "Windows":
-            import comtypes
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            from ctypes import cast, POINTER
-            dev = AudioUtilities.GetSpeakers()
-            iface = dev.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
-            vol = cast(iface, POINTER(IAudioEndpointVolume))
+            vol = _win_volume_iface()
             vol.SetMute(1, None)
         else:
             import shutil
             if shutil.which('amixer'):
                 subprocess.run(['amixer', '-q', 'set', 'Master', 'mute'], timeout=3)
             elif shutil.which('pactl'):
-                subprocess.run(['pactl', 'set-sink-mute', '@DEFAULT_SINK@', 'toggle'], timeout=3)
+                subprocess.run(['pactl', '-q', 'set-sink-mute', '@DEFAULT_SINK@', 'toggle'], timeout=3)
             else:
                 return False
         return True

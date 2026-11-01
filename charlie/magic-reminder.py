@@ -68,23 +68,50 @@ def add_reminder(text: str, time: str = "", repeat: str = "") -> str:
 
 
 @mcp.tool()
-def list_reminders() -> str:
-    """查询当前所有未完成的提醒。
+def list_reminders(detailed: bool = False) -> str:
+    """查询未完成的提醒。默认只报**还没响**的，按时间升序。
 
-    返回每条提醒的编号(id)、内容、时间和重复规则。用户问"我有哪些提醒/提醒列表"时调用。
+    用户问"我有哪些提醒/提醒列表"时调用。语音单句模式只播第一句，
+    所以第一句永远是"最近一条 X点X分，内容"。detailed=True 才展开更多条。
     """
-    log.info("[reminder] list_reminders 被调用")
+    log.info("[reminder] list_reminders 被调用 detailed=%s", detailed)
     try:
+        import datetime as _dt
         from app.reminders import list_reminders_for as _list
-        # 用户面工具只看本人：问"我有哪些提醒"不该听到家人的
         items = _list(include_completed=False)
-        if not items:
-            return "当前没有未完成的提醒。"
-        lines = []
+        now = _dt.datetime.now()
+        upcoming = []
         for r in items:
-            repeat_desc = {"daily": "（每天）", "weekly": "（每周）", "weekdays": "（工作日）"}.get(r.get("repeat", ""), "")
-            lines.append(f"id={r.get('id')}：{r.get('text','')}，时间{str(r.get('due','')).replace('T',' ')}{repeat_desc}")
-        return "共有%d条提醒：\n" % len(items) + "\n".join(lines)
+            due = r.get("due") or ""
+            if not due:
+                continue  # 没时间的僵尸提醒不占播报
+            try:
+                dd = _dt.datetime.fromisoformat(due)
+            except Exception:
+                continue
+            # 2 小时内刚过的也算（可能还没播完）；更早的一次性视为已过期
+            if dd >= now - _dt.timedelta(hours=2):
+                upcoming.append((dd, r))
+        upcoming.sort(key=lambda x: x[0])
+        if not upcoming:
+            return "没有待响的提醒。"
+        n = len(upcoming)
+        dd0, r0 = upcoming[0]
+        txt0 = (r0.get("text") or "").strip() or "提醒"
+        rep0 = {"daily": "，每天", "weekly": "，每周", "weekdays": "，工作日"}.get(r0.get("repeat", ""), "")
+        when0 = dd0.strftime("%H点%M分")
+        if dd0.date() != now.date():
+            when0 = dd0.strftime("%m月%d日%H点%M分")
+        head = f"最近一条{when0}，{txt0}{rep0}。"
+        if n == 1 or not detailed:
+            if n > 1:
+                head += f"另外还有{n - 1}条。"
+            return head
+        lines = [head]
+        for dd, r in upcoming[1:8]:
+            t = (r.get("text") or "").strip()
+            lines.append(f"{dd.strftime('%H点%M分')}{t}")
+        return "".join(lines)
     except Exception as e:
         return f"查询提醒失败: {e}"
 

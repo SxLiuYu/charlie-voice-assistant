@@ -63,3 +63,6 @@ esp32_firmware/pio/.pio/
 esp32_firmware/pio/flash.img
 esp32_firmware/wokwi/bin/
 esp32_firmware/qemu/
+
+# 交接说明（含服务器 IP / SSH / Key 前缀，不入库）
+HANDOFF.md

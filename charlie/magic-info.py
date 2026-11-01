@@ -10,8 +10,10 @@ __mcp_meta__ = {
 from mcp.server.fastmcp import FastMCP
 from mcp_common import aliyun_chat, _safe_math_eval, ESP32_IP
 from datetime import datetime
-import os, requests
+import os, requests, time
 import logging
+
+_NEWS_CACHE: dict = {}
 log = logging.getLogger("magic")
 mcp = FastMCP("magic-info")
 
@@ -126,6 +128,13 @@ def get_news(topic: str = "科技", count: int = 5) -> str:
         get_news("财经", 3) → 获取3条财经新闻
     """
     # 优先 OkSurf 免费 API（无需 Key），降级 Bing 爬取
+    # 5 分钟缓存：OkSurf 冷启动实测 9s，撞 xiaozhi 首句 12s 超时；缓存后毫秒级
+    global _NEWS_CACHE
+    _ck = f"{topic}:{count}"
+    _now = time.time()
+    if _NEWS_CACHE.get("key") == _ck and _now - _NEWS_CACHE.get("t", 0) < 300:
+        return _NEWS_CACHE["val"]
+
     oksurf_map = {"科技": "Technology", "财经": "Business", "商业": "Business",
                   "体育": "Sports", "健康": "Health", "科学": "Science",
                   "国际": "World", "世界": "World", "娱乐": "Entertainment"}
@@ -144,7 +153,9 @@ def get_news(topic: str = "科技", count: int = 5) -> str:
                         results.append(f"{title}")
                 if results:
                     log.info(f"[info] OkSurf新闻成功: {topic} → {len(results)}条")
-                    return f"最新{topic}新闻：{'；'.join(results)}。"
+                    val = f"最新{topic}新闻：{'；'.join(results)}。"
+                    _NEWS_CACHE.update(key=_ck, t=time.time(), val=val)
+                    return val
         except Exception as e:
             log.debug(f"[info] OkSurf新闻失败: {e}")
 
@@ -232,11 +243,58 @@ def translate(text: str, target: str = "英文") -> str:
     ])
 
 
+def _cn_arith_to_expr(text: str) -> str | None:
+    """中文口算 → 数值算式。"三十七乘以八十九" → "37*89"。
+    语音 ASR 常出中文数字，正则 [\d.] 接不住就会白跑一次 LLM。"""
+    import re as _re
+    t = (text or "").strip().rstrip("=＝?？。")
+    t = t.replace("等于多少", "").replace("等于", "").replace("是多少", "")
+    t = (t.replace("乘以", "*").replace("乘", "*").replace("×", "*").replace("x", "*")
+          .replace("除以", "/").replace("除", "/").replace("÷", "/")
+          .replace("加上", "+").replace("加", "+")
+          .replace("减去", "-").replace("减", "-"))
+    if not t:
+        return None
+
+    _CN_DIGIT = {"零": "0", "一": "1", "二": "2", "两": "2", "三": "3",
+                 "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
+
+    def _cn_num(m: "_re.Match") -> str:
+        s = m.group(0)
+        if s in _CN_DIGIT:
+            return _CN_DIGIT[s]
+        total, cur = 0, 0
+        for c in s:
+            if c in _CN_DIGIT:
+                cur = int(_CN_DIGIT[c])
+            elif c == "十":
+                total += (cur or 1) * 10
+                cur = 0
+            elif c == "百":
+                total += (cur or 1) * 100
+                cur = 0
+            elif c == "千":
+                total += (cur or 1) * 1000
+                cur = 0
+            elif c == "万":
+                total = (total + cur) * 10000
+                cur = 0
+        return str(total + cur)
+
+    t = _re.sub(r"[零一二两三四五六七八九十百千万]+", _cn_num, t)
+    t = _re.sub(r"\s+", "", t)
+    if not t or _re.search(r"[^\d.\s+\-*/]", t):
+        return None
+    return t or None
+
+
 @mcp.tool()
 def calculate(expression: str) -> str:
     """计算或单位换算。expression=算式如'123*456'或'5公里等于多少英里'"""
     import re
     e = expression.strip().rstrip("=＝")
+    if not re.fullmatch(r"[\d.\s+\-*/()%^]+", e):
+        e = _cn_arith_to_expr(expression) or e
     if re.fullmatch(r"[\d.\s+\-*/()%^]+", e):
         result = _safe_math_eval(e.replace("^", "**"))
         if result is not None:

@@ -30,6 +30,12 @@ def set_volume(level: int = -1) -> str:
                 r = subprocess.run(["osascript", "-e", "output volume of (get volume settings)"],
                                  capture_output=True, text=True, timeout=5)
                 return f"当前音量：{r.stdout.strip()}%"
+            if _sys == "Windows":
+                try:
+                    from pycaw.pycaw import AudioUtilities
+                    return f"当前音量：{round(AudioUtilities.GetSpeakers().volume_percent)}%"
+                except Exception as e:
+                    return f"音量查询失败：{e}"
             return "音量查询仅在macOS原生环境可用"
         level = max(0, min(100, level))
         if _sys == "Darwin":
@@ -41,16 +47,22 @@ def set_volume(level: int = -1) -> str:
                 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume  # type: ignore
                 from ctypes import cast, POINTER
                 dev = AudioUtilities.GetSpeakers()
-                iface = dev.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
-                vol = cast(iface, POINTER(IAudioEndpointVolume))
+                # 新版 pycaw 的 AudioDevice 没有 Activate()，EndpointVolume
+                # 就是 IAudioEndpointVolume 指针（实测 SetMasterVolumeLevelScalar 可用）
+                ep = getattr(dev, "EndpointVolume", None)
+                if ep is not None:
+                    vol = cast(ep, POINTER(IAudioEndpointVolume))
+                else:
+                    iface = dev.Activate(IAudioEndpointVolume._iid_, comtypes.CLSCTX_ALL, None)
+                    vol = cast(iface, POINTER(IAudioEndpointVolume))
                 vol.SetMasterVolumeLevelScalar(level / 100.0, None)
                 if level == 0:
                     vol.SetMute(1, None)
                 else:
                     vol.SetMute(0, None)
                 return f"音量已调到{level}%"
-            except Exception:
-                return "Windows 音量控制需安装 pycaw（pip install pycaw comtypes）"
+            except Exception as e:
+                return f"音量控制失败：{e}"
         else:  # Linux
             import shutil
             if shutil.which('amixer'):

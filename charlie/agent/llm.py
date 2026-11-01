@@ -143,7 +143,7 @@ _KEYWORD_MAP = [
     ({"我叫什么", "我的名字", "我之前说过", "你记得吗", "你记得我", "我跟你说过",
       "我记得我", "我上次说", "我刚才说", "我刚才告诉你",
       "我名字里有几个字", "我名字里有几个",
-      "猫叫什么", "狗叫什么", "宠物叫"}, "magic-memory"),
+      "我家猫叫什么", "我家狗叫什么", "我宠物叫什么", "我的猫叫", "我的狗叫"}, "magic-memory"),
     ({"切换到", "切换回", "切换", "我要切换", "切到", "换角色", "换到", "切回去"}, "magic-jarvis"),
     # 摄像头/视觉/看看（"看看"在屏幕语境下是mimo-vision，门口/院子是vision_camera类场景）
     ({"摄像头", "门口有", "门口没", "看看门口", "看看后门", "看看院子", "看看猫眼", "后门有人", "前门有人",
@@ -157,7 +157,7 @@ _KEYWORD_MAP = [
     ({"天气", "气温", "下雨", "温度", "几度", "今天天气", "明天天气", "今天冷", "今天热", "定位"}, "amap-maps"),
     ({"地图", "导航", "附近", "我在哪", "路线", "怎么走", "到哪"}, "amap-maps"),
     ({"搜一下", "查一下", "查查", "谷歌", "购物", "买东西", "票房", "票房多少"}, "baize-skills"),
-    ({"提醒", "定时", "闹钟", "备忘", "日程", "待办", "记一下", "提醒我"}, "magic-reminder"),
+    ({"提醒", "定时", "闹钟", "备忘", "日程", "待办", "记一下", "提醒我", "叫我起床", "叫醒我", "叫醒"}, "magic-reminder"),
     ({"笔记", "备忘录", "记下来", "记一下"}, "magic-notes"),
     ({"音量", "说慢", "说快", "语速", "大声", "小声"}, "magic-system"),
     ({"状态", "运行", "负载", "设备"}, "magic-system"),
@@ -166,13 +166,13 @@ _KEYWORD_MAP = [
     ({"翻译", "翻成", "英语说", "怎么说"}, "magic-info"),
     ({"计算", "算一下", "换算", "等于多少", "等于几", "加几", "减几", "加多少", "减多少", "乘以", "除以",
       "what time", "what time is it"}, "magic-info"),
-    ({"放歌", "放一首", "放个", "播放", "听歌", "放周杰伦", "放毛不易", "音乐", "歌单", "停止播放", "每日推荐", "随机", "来一首", "播一首", "点一首", "放首", "放点", "整首", "整点", "循环", "单曲", "来首", "点歌", "唱首歌", "放音乐", "暂停", "继续播放", "继续", "下一首", "上一首", "换一首", "切歌", "停止", "停"}, "magic-music"),
-    ({"空调", "电视", "制冷", "制热", "风扇", "开灯", "关灯", "关闭空调", "关闭电视"}, "ac-control"),
+    ({"放歌", "放一首", "放个", "播放", "听歌", "放周杰伦", "放毛不易", "音乐", "歌单", "停止播放", "每日推荐", "随机", "来一首", "播一首", "点一首", "放首", "放点", "整首", "整点", "循环", "单曲", "来首", "点歌", "唱首歌", "放音乐", "暂停", "继续播放", "下一首", "上一首", "换一首", "切歌", "停止"}, "magic-music"),
+    ({"空调", "电视", "制冷", "制热", "风扇", "开灯", "关灯", "灯关", "把灯关", "关闭空调", "关闭电视"}, "ac-control"),
     ({"文件", "读文件", "写文件", "笔记"}, "filesystem"),
     ({"外卖", "点餐", "购物", "商品", "查一下", "充电桩", "特斯拉", "出门"}, "magic-life"),
     ({"穿什么", "穿搭", "今天穿", "明天穿", "出门穿", "约会穿", "搭配", "衣橱", "衣服", "加衣服", "外套", "冷了穿", "热了穿", "穿几件"}, "magic-wardrobe"),
     ({"做菜", "菜谱", "食谱", "做什么菜", "食材", "吃什么", "吃饭", "好吃", "想吃什么", "做饭", "怎么做", "做法", "怎么煮", "怎么炒", "今天吃啥", "今晚吃啥", "中午吃啥", "推荐个菜", "推荐一道菜", "凉菜", "热菜", "汤", "主食", "下饭", "买菜", "番茄炒蛋", "可乐鸡翅"}, "magic-recipe"),
-    ({"学习", "进化", "自进化", "优化", "自我优化", "自学习", "学习进度", "进化状态"}, "magic-evolution"),
+    ({"自进化", "自我进化", "进化状态", "自学习", "学习进度", "自我优化", "进化报告"}, "magic-evolution"),
     ({"淘宝", "京东", "比价", "商品", "价格对比", "买东西", "购物", "买一个", "买个"}, "magic-taobao"),
     ({"浏览器", "打开网页", "打开网站", "访问", "浏览", "爬取", "截图", "页面", "网页", "百度"}, "magic-browser"),
     ({"飞书", "飞书文档", "飞书消息", "飞书日历", "日历"}, "magic-feishu"),
@@ -198,6 +198,18 @@ _COMPOUND_INDICATORS = ("和", "同时", "然后", "再", "接着", "之后", "�
                         "以及", "并且", "适合", "需要", "应该", "还是", "不如",
                         "顺便", "帮我还", "加上", "搭配")
 
+# 知识/原理/发明/历史/比较类问句：即使命中工具关键词也不短路
+# （"空调是谁发明的"不是开空调，"音乐是谁发明的"不是放歌）。
+_KNOWLEDGE_Q = re.compile(
+    r"是谁发明的|的发明者|是谁开发的|是谁创办的|是谁创立的|谁发明的"
+    r"|的历史|的起源|的由来|的发展史|的原理|原理|是怎么形成|是怎么来的|是怎么工作"
+    r"|为什么不准|是什么意思|是什么职业|是什么工作|是干什么的|是什么$"
+    r"|怎么办|怎么养|怎么选|哪个好|多少钱|有必要吗|好当吗|好做吗|好使吗"
+    r"|用英语怎么说|英语怎么说|和.{1,6}哪个好|有什么区别|的区别"
+    r"|是怎么回事|安全吗|快吗|辛苦吗|环保吗|手续费|什么时候便宜"
+    r"|入门|怎么洗|怎么标|怎么加密"
+)
+
 
 def _is_compound_query(text: str) -> bool:
     """检测是否为复合/复杂查询（可能需要多个工具或 LLM 理解上下文）。
@@ -213,7 +225,16 @@ def _is_compound_query(text: str) -> bool:
 
 def _is_exclamatory_weather(text: str) -> bool:
     """如果文本包含天气类歧义词且以感叹/评价后缀结尾，判定为闲聊而非查询。"""
-    if any(kw in text for kw in _AMBIGUOUS_KWS) and any(text.endswith(suf) for suf in _EXCLAMATION_SUFFIXES):
+    if not any(kw in text for kw in _AMBIGUOUS_KWS):
+        return False
+    if any(text.endswith(suf) for suf in _EXCLAMATION_SUFFIXES):
+        return True
+    # "今天天气不错适合聊天" / "天气真好" / "下雨天真烦" / "今天温度刚好"
+    if re.search(r"天气(真|不错|挺好|很好|刚好|合适)", text) and "怎么样" not in text and "如何" not in text:
+        return True
+    if re.search(r"(下雨天|下雪天)(真|好|啦)", text) and "吗" not in text:
+        return True
+    if re.search(r"温度(刚好|合适|正好)", text):
         return True
     return False
 
@@ -338,6 +359,38 @@ def _normalize_intent(raw: str) -> str:
     else: return "none"
 
 
+_JEV_CRITERIA = {
+    "none": "闲聊问候常识讲笑话你是谁你好谢谢为什么原理怎么形成怎么来的",
+    "amap-maps": "查今天明天实时天气气温几度下雨带伞地图导航路线我在哪附近怎么走",
+    "magic-music": "播放放歌音乐歌单暂停停止下一首随机点歌唱歌",
+    "magic-info": "时间几点日期星期翻译计算新闻头条热点",
+    "magic-reminder": "提醒日程定时闹钟待办叫我起床",
+    "baize-skills": "搜索互联网查资料票房购物买东西谷歌",
+    "magic-memory": "回忆之前说过我的猫叫什么你记得吗我上次说",
+    "magic-preferences": "我喜欢记住偏好口味别再我习惯我最喜欢",
+    "magic-recipe": "做菜菜谱食谱吃什么食材怎么做今天吃啥",
+    "magic-life": "外卖充电桩特斯拉出门点餐",
+    "ac-control": "空调电视灯风扇制冷制热开灯关灯",
+    "magic-scenes": "晚安早安睡觉电影看电影起床好梦",
+    "magic-system": "音量语速说慢说快大声小声设备状态运行负载",
+    "magic-notes": "备忘录笔记记下来",
+    "filesystem": "文件读写文件",
+    "magic-wardrobe": "穿什么穿搭衣服外套搭配衣橱",
+    "magic-browser": "浏览器打开网页百度截图网页",
+    "magic-apps": "微信支付宝抖音淘宝京东美团拼多多飞书App",
+    "magic-feishu": "飞书文档消息日历",
+    "magic-douyin": "抖音搜索视频热搜",
+    "magic-taobao": "淘宝京东比价商品价格",
+    "magic-jarvis": "切换角色贾维斯查理白泽",
+    "magic-evolution": "学习优化自进化进化状态",
+    "magic-dev": "改代码修改文件修bug编辑",
+    "mimo-vision": "截图看看屏幕识别图片摄像头门口院子",
+    "magic-tv": "电视音量电视静音投屏DLNA",
+    "magic-habits": "习惯打卡日常",
+    "magic-summary": "总结摘要刚才说了什么",
+}
+
+
 def _classify_intent(text: str) -> str:
     """意图分类: 关键词预判 → ARK API, 返回MCP组合名"""
     now = time.time()
@@ -362,6 +415,24 @@ def _classify_intent(text: str) -> str:
             log.info(f"[intent] 消歧: 感叹语境，降级为 none: '{text[:30]}'")
             _intent_cache_set(text, "none")
             return "none"
+        # 知识/原理/发明/历史问句：关键词只是同字不同义，交 LLM 分类
+        if _KNOWLEDGE_Q.search(text):
+            log.info(f"[intent] 消歧: 知识/原理问句跳过关键词短路: '{text[:30]}'")
+            matched_domains = set()
+        # 叫我起床/叫醒 是闹钟，不是晚安场景
+        if "magic-reminder" in matched_domains and "magic-scenes" in matched_domains:
+            if re.search(r"叫我|叫醒|闹钟|定时", text):
+                log.info(f"[intent] 消歧: 叫醒/闹钟 → magic-reminder: '{text[:30]}'")
+                _intent_cache_set(text, "magic-reminder")
+                return "magic-reminder"
+        # 失眠/打呼噜/睡不着 是健康闲聊，不是"我睡了"场景协议
+        if "magic-scenes" in matched_domains and re.search(
+                r"睡不着|失眠|打呼噜|啼哭|嗜睡|睡觉打|睡觉流|睡觉磨", text):
+            log.info(f"[intent] 消歧: 睡眠健康问句跳过 scenes: '{text[:30]}'")
+            matched_domains.discard("magic-scenes")
+            if not matched_domains:
+                _intent_cache_set(text, "none")
+                return "none"
         try:
             from app.audit_log import audit_log
             # 审计记实际命中的域集合（而非单个域名），
@@ -473,32 +544,73 @@ def _classify_intent(text: str) -> str:
     t0 = time.time()
     log.info(f"[intent] LLM分类开始: text='{text[:30]}'")
     try:
-        _ep_base, _ep_key, _ep_model = active_chat_endpoint()
-        _max_tokens = 2048
-        _is_stepfun = "stepfun" in _ep_base.lower()
-        _payload = {"model": _ep_model,
-                  "messages": [{"role": "user", "content": prompt}],
-                  "stream": False,
-                  "max_tokens": 4, "temperature": 0}
-        if _is_stepfun:
-            _payload["reasoning_effort"] = "low"
-        # GLM_KEY / ARK_KEY 均未配置（.env 无对应条目），专用端点方案不可用。
-        # 使用当前 active_chat_endpoint，收紧超时防止卡住整条流水线：
-        #   (2, 10) = 连接 2s / 读取 10s。
-        # Agnes 延迟波动大（0.3s~8s），5s 误杀频繁；10s 给足余量。
-        # 失败时直接回退 none（不走重试），等待 INTENT_FAILURE_COOLDOWN 冷却后再尝试。
-        r = _session.post(f"{_ep_base}/chat/completions",
-            json=_payload,
-            headers={"Authorization": f"Bearer {_ep_key}"},
-            timeout=(2, 10))
-        raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
-        mcp = _normalize_intent(raw)
+        # 专用意图端点优先（INTENT_BASE/INTENT_MODEL）。
+        # jev (systemone/choice) 或 OpenAI chat/completions。
+        _ep_base = os.getenv("INTENT_BASE", "").strip().rstrip("/")
+        _ep_model = os.getenv("INTENT_MODEL", "").strip()
+        _ep_key = os.getenv("INTENT_KEY", os.getenv("NM_CLOUD_KEY", "")).strip()
+        if _ep_base and _ep_model:
+            _read_timeout = float(os.getenv("INTENT_TIMEOUT", "8.0"))
+        else:
+            _ep_base, _ep_key, _ep_model = active_chat_endpoint()
+            _read_timeout = 10.0
+        _is_jev = "/jev" in _ep_base.lower() or "systemone" in _ep_base.lower()
+        _intent_src = "jev" if _is_jev else "chat"
+        answers = {}
+        raw = ""
+        if _is_jev:
+            # jev 决策接口：choices 打分，热身 0.5-1s，冷启 10s+（靠 keep-hot 压住）
+            headers = {"Authorization": f"Bearer {_ep_key}"} if _ep_key else {}
+            r = _session.post(
+                f"{_ep_base}/systemone",
+                headers=headers,
+                json={
+                    "model": _ep_model,
+                    "state": text[:200],
+                    "questions": {
+                        "q1": {
+                            "type": "choice",
+                            "instructions": (
+                                "判断用户这句话需要哪个能力，只选一个最合适的。"
+                                "问原理/为什么/怎么形成/怎么来的/是谁发明 → none；"
+                                "只有查实时天气/导航/路线才选 amap-maps"
+                            ),
+                            "criteria": _JEV_CRITERIA,
+                        }
+                    },
+                },
+                timeout=(3, _read_timeout))
+            answers = (r.json().get("answers") or {}).get("q1") or {}
+            mcp = _normalize_intent(str(answers.get("choice") or "none"))
+            _conf = answers.get("confidence")
+        else:
+            _max_tokens = 2048
+            _is_stepfun = "stepfun" in _ep_base.lower()
+            _payload = {"model": _ep_model,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "stream": False,
+                      "max_tokens": 4, "temperature": 0}
+            if _is_stepfun:
+                _payload["reasoning_effort"] = "low"
+            # 失败时直接回退 none（不走重试），等待 INTENT_FAILURE_COOLDOWN 冷却后再尝试。
+            r = _session.post(f"{_ep_base}/chat/completions",
+                json=_payload,
+                headers={"Authorization": f"Bearer {_ep_key}"} if _ep_key else {},
+                timeout=(2, _read_timeout))
+            raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
+            mcp = _normalize_intent(raw)
         with _st.intent_cache_lock:
             _st.intent_failures = 0
             _st.intent_disabled_until = 0.0
         _intent_cache_set(text, mcp)
         t1 = time.time()
-        log.info(f"[intent] LLM分类完成: {t1-t0:.3f}s | '{text[:30]}' → {mcp} ({raw[:15]})")
+        _raw_show = str(answers.get("choice") or raw)[:15]
+        if _is_jev:
+            log.info(f"[intent] LLM分类完成[{_intent_src}]: {t1-t0:.3f}s | "
+                     f"'{text[:30]}' → {mcp} conf={_conf} ({_raw_show})")
+        else:
+            log.info(f"[intent] LLM分类完成[{_intent_src}]: {t1-t0:.3f}s | "
+                     f"'{text[:30]}' → {mcp} ({_raw_show})")
         try:
             from app.audit_log import audit_log
             audit_log("intent", input_data=text, output_data=mcp,
@@ -1414,7 +1526,10 @@ def _brain_llm(text: str, session_id: str = "default") -> str:
     from app import llm_config as _llm_cfg
     _glm_tries = len(_llm_cfg.get_glm_models() or [None]) if _llm_cfg.is_glm_configured() and not _llm_cfg.is_ark_configured() else 1
     final = None
-    for _attempt in range(_glm_tries):
+    # nmcloud / 其他 OpenAI 兼容中继 429 时也退避重试，不再立即"忙不过来"。
+    # GLM 轮换逻辑保持不变；非 GLM 最多 3 次退避。
+    _max_attempts = max(_glm_tries, 4)
+    for _attempt in range(_max_attempts):
         try:
             brain_instance = _get_brain(mcp_set, session_id=session_id)
         except Exception as e:
@@ -1482,6 +1597,11 @@ def _brain_llm(text: str, session_id: str = "default") -> str:
                     _st.brains.clear()
                     _st.brain_failures = 0
                 continue
+            if is_429 and not _llm_cfg.active_is_glm() and _attempt < 3:
+                _wait = 1.5 * (2 ** _attempt)
+                log.warning(f"[brain] 429 限流，{_wait:.1f}s 后重试({_attempt+1}/3)")
+                time.sleep(_wait)
+                continue
             _record_brain_failure(_err[:60])
             # 超时/连接错误时清掉当前 brain 缓存，避免下次复用状态不一致的
             # 实例再次超时（与 brain_stream_sentences 的处理保持一致）
@@ -1530,10 +1650,41 @@ def _is_filler_word(s: str) -> bool:
 # intent=none 的闲聊不需要 MCP 工具；带全套工具定义进 fncall 模式会让
 # prompt 膨胀、Agnes 首包从 ~1s 恶化到 13s+（实测 2026-08-22 事故 75s）。
 # 此通道直连 chat/completions 流式接口，payload 只含 system+history。
-_LITE_MAX_TOKENS = 300
+_LITE_MAX_TOKENS = int(os.getenv("LITE_MAX_TOKENS", "120"))
 _LITE_TIMEOUT = (2, 15)   # 连接2s；chunk间最大等待15s（超时抛异常→回退重brain）
 _LITE_TOTAL_TIMEOUT = float(os.getenv("LITE_TOTAL_TIMEOUT", "12"))
 _LITE_HISTORY_TURNS = int(os.getenv("LITE_HISTORY_TURNS", "6"))
+# 语音闲聊只播一句：人格爱追加"需要我…吗/随时待命"，每句多 2-4s 播放。
+_VOICE_ONE_SENTENCE = os.getenv("VOICE_ONE_SENTENCE", "1") == "1"
+# 首分句即开口：遇到逗号/问号就先播，不等整句出完。
+# 太短的分句（"好"、"嗯"）听着像卡顿，至少要 5 字。
+_VOICE_FIRST_CLAUSE_RE = re.compile(r"[^，,。！？!?；;]{5,}[，,。！？!?；;]")
+_VOICE_MIN_CLAUSE_CHARS = 5
+# 逗号前只有这些客套词时不要当首分句播（"Sir，"。听着像被截断）
+_VOICE_FILLER_CLAUSE_RE = re.compile(
+    r"^(?:Sir|sir|先生|好的先生|好的|嗯|好|是的|当然|没问题|好的sir)"
+    r"[，,]?[。！？]?$")
+
+
+def _voice_first_clause_cut(text: str):
+    """返回首个可播分句的 (start, end)，None 表示还没到可切的位置。
+
+    start 会跳过 "Sir，"/"好的，" 这类客套前缀 —— 播报里单独念一句
+    "Sir，" 听着像被截断，直接从实质内容开始。
+    """
+    pos = 0
+    start = 0
+    while True:
+        m = _COMMA_SOFT.search(text, pos)
+        if not m:
+            return None
+        head = text[start:m.start()].strip()
+        if len(head) >= _VOICE_MIN_CLAUSE_CHARS and not _VOICE_FILLER_CLAUSE_RE.match(head):
+            return (start, m.start())
+        # 这一段是客套词：把它连同逗号一起跳过，下一段从它后面开始
+        if _VOICE_FILLER_CLAUSE_RE.match(head):
+            start = m.end()
+        pos = m.end()
 _LITE_FIRST_CONTENT_TIMEOUT = 8.0  # 首 content chunk 最大等待（秒）；Agnes 尾部抖动最高 7.9s，8s 几乎不误杀
 # delta_stream 门控：qwen_agent 0.0.34 不支持 brain 路径 delta_stream=True，
 # 保留此 env 作未来版本兼容开关（当前恒为 False）。
@@ -1610,25 +1761,33 @@ def _chat_lite_stream(text: str, session_id: str = "default", channel: str = "vo
     if "glm" in base.lower() or "zhipu" in base.lower():
         payload["thinking"] = {"type": "disabled"}
     t0 = time.time()
-    try:
-        r = _session.post(f"{base}/chat/completions",
-                          json=payload,
-                          headers={"Authorization": f"Bearer {key}"},
-                          timeout=_LITE_TIMEOUT, stream=True)
-        r.raise_for_status()
-    except Exception as e:
-        log.warning(f"[lite] 快速通道请求失败，回退大脑: {e}")
-        # 连接类失败（超时/断连）计入 provider 失败计数，让轮换机制
-        # 在节点风暴时切到备节点。真实事故：agnes 节点 40 分钟内 19 次
-        # Read timeout，lite 15s 超时 + 回退大脑再撞 35s 超时 = 用户等 50s，
-        # 而 lite 路径不计失败导致 sagnes 备节点一直没被启用。
+    r = None
+    for _lite_try in range(3):
         try:
-            import requests as _rq
-            if isinstance(e, (TimeoutError, _rq.exceptions.Timeout,
-                              _rq.exceptions.ConnectionError)):
-                _note_provider_failure()
-        except Exception:
-            pass
+            r = _session.post(f"{base}/chat/completions",
+                              json=payload,
+                              headers={"Authorization": f"Bearer {key}"},
+                              timeout=_LITE_TIMEOUT, stream=True)
+            r.raise_for_status()
+            break
+        except Exception as e:
+            _status = getattr(getattr(e, "response", None), "status_code", None)
+            is_429 = _status == 429 or "429" in str(e) or "Too Many" in str(e)
+            if is_429 and _lite_try < 2:
+                _wait = 1.5 * (_lite_try + 1)
+                log.warning(f"[lite] 429 限流，{_wait:.1f}s 后重试({_lite_try+1}/2)")
+                time.sleep(_wait)
+                continue
+            log.warning(f"[lite] 快速通道请求失败，回退大脑: {e}")
+            try:
+                import requests as _rq
+                if isinstance(e, (TimeoutError, _rq.exceptions.Timeout,
+                                  _rq.exceptions.ConnectionError)):
+                    _note_provider_failure()
+            except Exception:
+                pass
+            return
+    if r is None:
         return
     full = ""
     sent_len = 0
@@ -1677,6 +1836,32 @@ def _chat_lite_stream(text: str, session_id: str = "default", channel: str = "vo
                     log.info(f"[lite] 首token={first_at - t0:.2f}s")
                 full += delta
                 unsent = full[sent_len:]
+                # 语音单句模式：首个分句够长就开口，不等整句出完。
+                # "我是贾维斯，您的私人智能系统。"——等到句号要多吃 0.3-0.5s，
+                # 而用户此刻只是在等一句开场白。
+                # 但 "Sir，我是贾维斯，……" 的逗号前是纯客套词，读出来突兀，
+                # 所以逐个逗号往后找第一个剥掉客套后仍有实质内容的切点。
+                if channel == "voice" and _VOICE_ONE_SENTENCE and sent_len == 0:
+                    _cut = _voice_first_clause_cut(unsent)
+                    if _cut:
+                        _cs, _ce = _cut
+                        sentence = unsent[_cs:_ce].strip()
+                        sent_len = len(full) - len(unsent[_ce:])
+                        cleaned = _clean_for_tts(sentence)
+                        if cleaned and not _is_filler_word(cleaned):
+                            yield (cleaned, full)
+                            log.info("[lite] 语音单句模式，首分句即开口(%.2fs): %.20s",
+                                     time.time() - t0, cleaned)
+                            _append_history(hist, text, full)
+                            _cache_set(text, full, session_id=session_id)
+                            try:
+                                import threading as _mem_thread
+                                _mem_thread.Thread(
+                                    target=_remember_conversation_async,
+                                    args=(text, full), daemon=True).start()
+                            except Exception:
+                                pass
+                            return
                 while True:
                     m = _SENTENCE_END.search(unsent)
                     if not m:
@@ -1688,10 +1873,26 @@ def _chat_lite_stream(text: str, session_id: str = "default", channel: str = "vo
                         cleaned = _clean_for_tts(sentence) if channel == "voice" else sentence
                         if cleaned and not _is_filler_word(cleaned):
                             yield (cleaned, full)
+                            # 语音渠道只播一句：实测人格爱追加"需要我…吗""随时待命"，
+                            # 每句多 2-4s 播放（15:46 闲聊 9.3s）。用户想继续会自己追问。
+                            if channel == "voice" and _VOICE_ONE_SENTENCE:
+                                log.info("[lite] 语音单句模式，首句后停止")
+                                _append_history(hist, text, full)
+                                _cache_set(text, full, session_id=session_id)
+                                try:
+                                    import threading as _mem_thread
+                                    _mem_thread.Thread(
+                                        target=_remember_conversation_async,
+                                        args=(text, full), daemon=True).start()
+                                except Exception:
+                                    pass
+                                return
             if full and len(full) > sent_len:
                 remaining = (_clean_for_tts(full[sent_len:].strip())
                              if channel == "voice" else full[sent_len:].strip())
-                if remaining and not _is_filler_word(remaining):
+                # 语音已出过句就到此为止（单句模式），尾部残句不再播
+                if remaining and not _is_filler_word(remaining) and not (
+                        channel == "voice" and _VOICE_ONE_SENTENCE and sent_len > 0):
                     yield (remaining, full)
         except Exception as e:
             # 中途断流：已产出的句子有效，剩余部分放弃
@@ -1700,7 +1901,8 @@ def _chat_lite_stream(text: str, session_id: str = "default", channel: str = "vo
             if full and len(full) > sent_len:
                 remaining = (_clean_for_tts(full[sent_len:].strip())
                              if channel == "voice" else full[sent_len:].strip())
-                if remaining and not _is_filler_word(remaining):
+                if remaining and not _is_filler_word(remaining) and not (
+                        channel == "voice" and _VOICE_ONE_SENTENCE and sent_len > 0):
                     yield (remaining, full)
     finally:
         if timer is not None:
@@ -1792,7 +1994,14 @@ def brain_stream_sentences(text: str, session_id: str = "default", interrupted_r
     # 先分类，再根据意图决定走 lite stream 还是完整 brain
     # 这样需要工具的查询（票房、搜索、记忆等）不会被闲聊通道吞掉
     _keyword_hit = any(kw in text for kw in _ALL_DOMAIN_KEYWORDS)
-    mcp_set = _classify_intent(text)
+    # 无领域关键词 → 闲聊，跳过意图 LLM（实测 ~1.1s 串行白等）。
+    # 工具问句基本都带关键词（天气/播放/提醒/票房/空调/我的猫叫什么...）；
+    # 真正需要 LLM 消歧的是多域关键词命中，那条路仍在 _classify_intent 里。
+    if _keyword_hit or interrupted_reply.strip():
+        mcp_set = _classify_intent(text)
+    else:
+        mcp_set = "none"
+        log.info(f"[intent] 无关键词直进闲聊: '{text[:30]}'")
     _lite_already_failed = False
 
     # intent=none 的纯闲聊走 lite stream（无工具直连流式）
@@ -1923,6 +2132,7 @@ def brain_stream_sentences(text: str, session_id: str = "default", interrupted_r
     _brain_start = time.time()
     _last_fn_count = 0
     _tool_steps = 0
+    _last_progress_tool = ""
     try:
         for rsp in _brain_run_iter(brain_instance, messages, _BRAIN_RUN_TIMEOUT, cancel_event=cancel_event):
             if isinstance(rsp, list):
@@ -1936,6 +2146,22 @@ def brain_stream_sentences(text: str, session_id: str = "default", interrupted_r
                     if t:
                         full_reply = t
                     break
+                # 工具**发起**时就播进度，别等结果——新闻/菜谱 5-8s 静默
+                # 会撞 xiaozhi 首句 8s 超时（实测 news 只听到"抱歉，反应慢了"）。
+                if channel == "voice":
+                    for _m in rsp:
+                        if not isinstance(_m, dict) or _m.get("role") != "assistant":
+                            continue
+                        _tcs = _m.get("tool_calls") or []
+                        if not _tcs:
+                            continue
+                        _tname = ((_tcs[-1].get("function") or {}).get("name") or "")
+                        if _tname and _tname != _last_progress_tool:
+                            _last_progress_tool = _tname
+                            _progress = _tool_progress_text(_tname)
+                            if _progress:
+                                yield (_progress, full_reply)
+                        break
                 # 多步 Agent：检测新的工具调用，播报进度
                 _fn_count = _count_function_msgs(rsp)
                 if _fn_count > _last_fn_count:

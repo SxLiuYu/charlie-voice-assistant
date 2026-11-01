@@ -26,7 +26,7 @@
 // ===== WiFi配置 =====
 const char* WIFI_SSID = "你的WiFi名称";
 const char* WIFI_PASSWORD = "你的WiFi密码";
-const char* SERVER_URL = "http://192.168.1.12:8000/api/voice/stream";
+const char* SERVER_URL = "http://192.168.1.10:8020/api/voice/stream";
 
 // ===== I2S引脚配置 =====
 #define I2S_MIC_WS   25   // INMP441 L/R

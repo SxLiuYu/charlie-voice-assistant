@@ -16,53 +16,70 @@ if PROJECT_DIR not in sys.path:
 # ======================================================================
 
 class TestASRRace:
-    def test_cloud_fast_select_cloud(self, monkeypatch):
-        """云端先完成且≤deadline → 用云端结果"""
+    @staticmethod
+    def _pin_stepfun(monkeypatch):
+        """ASR_PRIORITY 是导入期读的常量，patch.dict 改 env 无效，
+        必须直接改模块变量，否则实际跑的是 nmcloud。"""
         from agent import asr_tts
+        monkeypatch.setattr(asr_tts, "ASR_PRIORITY", ["stepfun"])
+
+    def test_local_clean_never_calls_cloud(self, monkeypatch):
+        """本地干净 → 直接返回本地，云端一次都不发。
+
+        旧实现是并行竞速，云端 nmcloud 常态 600ms+ 永远输给本地，却仍然
+        每句占一个 worker；连续对话时把 2-worker 池占满，本地任务排队超
+        deadline 掉 legacy（实测 15:37-15:43 连续 11 次 581-1387ms）。
+        """
+        from agent import asr_tts
+        self._pin_stepfun(monkeypatch)
+
+        calls = {"cloud": 0}
+
+        def counting_cloud(*a, **k):
+            calls["cloud"] += 1
+            return "云端结果"
 
         monkeypatch.setattr(asr_tts, "_asr_sense_voice", lambda *a, **k: "本地结果")
-        monkeypatch.setattr(asr_tts, "_asr_stepfun", lambda *a, **k: "云端结果")
+        monkeypatch.setattr(asr_tts, "_asr_stepfun", counting_cloud)
 
-        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200", "ASR_RACE_GRACE_MS": "400"}):
-            text, provider = asr_tts.asr_race(b"audio", "wav")
-        assert provider == "stepfun"
-
-    def test_local_fast_clean_cloud_within_grace_select_cloud(self, monkeypatch):
-        """本地快且干净+云端宽限期内到 → 选云端"""
-        from agent import asr_tts
-
-        call_count = {"sv": 0, "sf": 0}
-
-        def slow_sf(*a, **k):
-            call_count["sf"] += 1
-            time.sleep(0.35)
-            return "云端宽限到"
-
-        monkeypatch.setattr(asr_tts, "_asr_sense_voice", lambda *a, **k: (call_count.__setitem__("sv", call_count["sv"] + 1), "本地干净")[1])
-        monkeypatch.setattr(asr_tts, "_asr_stepfun", slow_sf)
-
-        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200", "ASR_RACE_GRACE_MS": "400"}):
-            text, provider = asr_tts.asr_race(b"audio", "wav")
-        assert provider == "stepfun"
-
-    def test_local_fast_clean_cloud_over_grace_select_local(self, monkeypatch):
-        """本地快且干净+云端超宽限 → 选本地"""
-        from agent import asr_tts
-
-        def slow_sf(*a, **k):
-            time.sleep(0.6)
-            return "云端太慢"
-
-        monkeypatch.setattr(asr_tts, "_asr_sense_voice", lambda *a, **k: "本地干净")
-        monkeypatch.setattr(asr_tts, "_asr_stepfun", slow_sf)
-
-        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200", "ASR_RACE_GRACE_MS": "200"}):
+        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "NM_CLOUD_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200"}):
             text, provider = asr_tts.asr_race(b"audio", "wav")
         assert provider == "sensevoice"
+        assert text == "本地结果"
+        assert calls["cloud"] == 0, "本地干净时不该发云端请求"
 
-    def test_local_garbled_waits_cloud_to_deadline(self, monkeypatch):
-        """本地乱码→等云端到deadline（patch 检测器，确定性测试竞速逻辑）"""
+    def test_local_empty_falls_back_to_cloud(self, monkeypatch):
+        """本地空 → 才问云端"""
         from agent import asr_tts
+        self._pin_stepfun(monkeypatch)
+
+        monkeypatch.setattr(asr_tts, "_asr_sense_voice", lambda *a, **k: "")
+        monkeypatch.setattr(asr_tts, "_asr_stepfun", lambda *a, **k: "云端补位")
+
+        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "NM_CLOUD_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200"}):
+            text, provider = asr_tts.asr_race(b"audio", "wav")
+        assert provider == "stepfun"
+        assert text == "云端补位"
+
+    def test_local_failure_uses_cloud(self, monkeypatch):
+        """本地抛异常 → 云端补位"""
+        from agent import asr_tts
+        self._pin_stepfun(monkeypatch)
+
+        def boom(*a, **k):
+            raise RuntimeError("sensevoice down")
+
+        monkeypatch.setattr(asr_tts, "_asr_sense_voice", boom)
+        monkeypatch.setattr(asr_tts, "_asr_stepfun", lambda *a, **k: "云端救场")
+
+        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "NM_CLOUD_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200"}):
+            text, provider = asr_tts.asr_race(b"audio", "wav")
+        assert provider == "stepfun"
+
+    def test_local_garbled_falls_back_to_cloud(self, monkeypatch):
+        """本地乱码 → 走云端（patch 检测器，确定性驱动该分支）"""
+        from agent import asr_tts
+        self._pin_stepfun(monkeypatch)
 
         def garbled_sv(*a, **k):
             time.sleep(0.05)
@@ -75,27 +92,30 @@ class TestASRRace:
         monkeypatch.setattr(asr_tts, "_asr_sense_voice", garbled_sv)
         monkeypatch.setattr(asr_tts, "_asr_stepfun", slow_cloud)
         # 真实 is_garbled_asr 对错字类乱码拦截率为 0（已知局限），此处
-        # patch 为 True 以确定性驱动"本地乱码→等云端"分支
+        # patch 为 True 以确定性驱动"本地乱码→问云端"分支
         monkeypatch.setattr(asr_tts, "is_garbled_asr", lambda t: True)
 
-        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200", "ASR_RACE_GRACE_MS": "200"}):
+        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "NM_CLOUD_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200"}):
             text, provider = asr_tts.asr_race(b"audio", "wav")
         assert provider == "stepfun"
 
     def test_cloud_exception_falls_back_to_local(self, monkeypatch):
-        """云端异常→回退本地"""
+        """云端异常 → 回退本地（本地乱码时仍保留本地结果）"""
         from agent import asr_tts
+        self._pin_stepfun(monkeypatch)
 
         monkeypatch.setattr(asr_tts, "_asr_sense_voice", lambda *a, **k: "本地兜底")
         monkeypatch.setattr(asr_tts, "_asr_stepfun", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        monkeypatch.setattr(asr_tts, "is_garbled_asr", lambda t: True)
 
-        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200", "ASR_RACE_GRACE_MS": "400"}):
+        with patch.dict(os.environ, {"STEPFUN_KEY": "k", "NM_CLOUD_KEY": "k", "ASR_RACE": "1", "ASR_RACE_DEADLINE_MS": "1200"}):
             text, provider = asr_tts.asr_race(b"audio", "wav")
         assert provider == "sensevoice"
 
     def test_asr_race_zero_uses_legacy(self, monkeypatch):
         """ASR_RACE=0 → 走旧 asr()"""
         from agent import asr_tts
+        self._pin_stepfun(monkeypatch)
 
         with patch.object(asr_tts, "asr", return_value="legacy") as mock_asr:
             with patch.dict(os.environ, {"STEPFUN_KEY": "k", "ASR_RACE": "0"}):

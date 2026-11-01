@@ -180,7 +180,7 @@ def _put_sse_event_nowait(client_q: asyncio.Queue, event_frame: str) -> None:
 _reminder_audio_serial_lock = threading.Lock()
 
 # 默认称呼。改造前这句是内联字面量，抽成常量后默认行为逐字节不变。
-DEFAULT_REMINDER_PREFIX = "主人，提醒您："
+DEFAULT_REMINDER_PREFIX = "叮咚，主人，提醒您："
 
 
 def _reminder_prefix(owner: str | None = None) -> str:
@@ -203,6 +203,68 @@ def _reminder_prefix(owner: str | None = None) -> str:
     except Exception as e:
         log.debug(f"[reminder] 读取称呼偏好失败({owner}): {e}")
     return DEFAULT_REMINDER_PREFIX
+
+
+_CHIME_MP3: bytes = b""
+_CHIME_LOCK = threading.Lock()
+
+
+def _reminder_chime_mp3() -> bytes:
+    """两声上行叮咚（E6→A6），比 TTS 念"叮咚"更像天猫闹钟。进程内缓存。"""
+    global _CHIME_MP3
+    if _CHIME_MP3:
+        return _CHIME_MP3
+    with _CHIME_LOCK:
+        if _CHIME_MP3:
+            return _CHIME_MP3
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-y",
+                 "-f", "lavfi", "-i", "sine=frequency=1318:duration=0.18",
+                 "-f", "lavfi", "-i", "sine=frequency=1760:duration=0.28",
+                 "-filter_complex",
+                 "[0:a]afade=t=in:d=0.02[a0];"
+                 "[1:a]afade=t=out:st=0.18:d=0.1[a1];"
+                 "[a0][a1]concat=n=2:v=0:a=1,volume=0.55",
+                 "-ac", "1", "-ar", "24000", "-b:a", "48k",
+                 "-f", "mp3", "pipe:1"],
+                capture_output=True, timeout=10)
+            if r.stdout and len(r.stdout) > 200:
+                _CHIME_MP3 = r.stdout
+                log.info("[reminder] 叮咚铃生成 %s 字节", len(_CHIME_MP3))
+        except Exception as e:
+            log.debug(f"[reminder] 铃生成失败: {e}")
+    return _CHIME_MP3
+
+
+def _concat_mp3(chime: bytes, speech: bytes) -> bytes:
+    """chime + speech 拼接；失败返回空让调用方用原 TTS。"""
+    ta = tb = None
+    try:
+        fd, ta = tempfile.mkstemp(suffix=".mp3")
+        os.write(fd, chime)
+        os.close(fd)
+        fd, tb = tempfile.mkstemp(suffix=".mp3")
+        os.write(fd, speech)
+        os.close(fd)
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", ta, "-i", tb,
+             "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+             "-ac", "1", "-ar", "24000", "-b:a", "48k",
+             "-f", "mp3", "pipe:1"],
+            capture_output=True, timeout=10)
+        if r.stdout and len(r.stdout) > 200:
+            return r.stdout
+    except Exception as e:
+        log.debug(f"[reminder] 铃+语音拼接失败: {e}")
+    finally:
+        for p in (ta, tb):
+            if p:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+    return b""
 
 
 def play_reminder_audio(text: str, reminder_id: int | None = None,
@@ -229,6 +291,10 @@ def play_reminder_audio(text: str, reminder_id: int | None = None,
             from voice_agent import tts_to_mp3
             log.info(f"[reminder] TTS生成: {text}")
             _prefix = _reminder_prefix(owner) if reminder_id is not None else ""
+            # 有真铃就别让 TTS 再念"叮咚"
+            chime = _reminder_chime_mp3() if reminder_id is not None else b""
+            if chime:
+                _prefix = _prefix.replace("叮咚，", "")
             if owner and owner != "default":
                 # TTS 在 owner 身份下合成：称呼/人格等用户相关内容取的是它
                 from agent.user_context import bind_user
@@ -238,6 +304,11 @@ def play_reminder_audio(text: str, reminder_id: int | None = None,
                 audio = tts_to_mp3(f"{_prefix}{text}")
             if not audio or len(audio) < 100:
                 raise RuntimeError("TTS返回空音频")
+            if chime:
+                merged = _concat_mp3(chime, audio)
+                if merged:
+                    audio = merged
+                    log.info("[reminder] 铃+语音合并 %s 字节", len(audio))
 
             # 推送到 ESP32 (xiaozhi WebSocket) — fire and forget
             display_text = f"{_prefix}{text}"
@@ -336,6 +407,64 @@ async def async_push_tts_to_xiaozhi(ws, text: str, mp3_data: bytes):
         log.info(f"[xiaozhi-push] 推送成功: {text[:30]} ({len(packets)}帧)")
     except Exception as e:
         log.warning(f"[xiaozhi-push] 推送失败: {e}")
+
+
+def push_iot_volume(level: int) -> bool:
+    """把音量下发给已连接的 xiaozhi 设备（IoT SetVolume）。
+
+    天猫"调音量"控的是音箱，不是跑服务的电脑。设备没连时返回 False，
+    调用方再落回 PC 音量。
+    """
+    try:
+        from app.state import snapshot_xiaozhi_clients
+        clients = snapshot_xiaozhi_clients()
+    except Exception:
+        return False
+    if not clients:
+        return False
+    payload = json.dumps({
+        "type": "iot",
+        "commands": [{"method": "SetVolume", "parameters": {"volume": int(level)}}],
+    }, ensure_ascii=False)
+    ok = False
+    for _cid, info in clients.items():
+        ws, loop = info.get("ws"), info.get("loop")
+        if not ws or not loop:
+            continue
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
+            ok = True
+            log.info("[xiaozhi-push] IoT SetVolume %s -> %s", level, _cid)
+        except Exception as e:
+            log.debug("[xiaozhi-push] IoT SetVolume fail %s: %s", _cid, e)
+    return ok
+
+
+def push_iot_mute(mute: bool) -> bool:
+    """IoT SetMute 下发到 xiaozhi 设备。"""
+    try:
+        from app.state import snapshot_xiaozhi_clients
+        clients = snapshot_xiaozhi_clients()
+    except Exception:
+        return False
+    if not clients:
+        return False
+    payload = json.dumps({
+        "type": "iot",
+        "commands": [{"method": "SetMute", "parameters": {"mute": bool(mute)}}],
+    }, ensure_ascii=False)
+    ok = False
+    for _cid, info in clients.items():
+        ws, loop = info.get("ws"), info.get("loop")
+        if not ws or not loop:
+            continue
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
+            ok = True
+            log.info("[xiaozhi-push] IoT SetMute %s -> %s", mute, _cid)
+        except Exception as e:
+            log.debug("[xiaozhi-push] IoT SetMute fail %s: %s", _cid, e)
+    return ok
 
 
 def _https_forward_reminder(text: str, mp3_data: bytes,

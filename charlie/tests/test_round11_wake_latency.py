@@ -1,7 +1,6 @@
 """Round 11: 唤醒链路延迟回归测试。
 
-- ASR 竞速宽限默认 50ms（本地干净结果立即采用，实测 StepFun 云端 800ms+
-  永远赶不上旧默认 400ms 宽限，纯浪费）
+- ASR 本地优先：本地干净结果立即采用，不再并发云端
 - 唤醒反馈音 beep 的 opus 包在启动预热后应命中缓存（否则每次重启后的
   第一次唤醒要现场 ffmpeg 转码 ~400ms）
 """
@@ -14,23 +13,23 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 
-class TestAsrRaceGraceDefault:
-    def test_grace_default_is_50ms(self):
-        """宽限默认 50ms：干净本地结果不被云端等待拖慢 ~350ms。"""
-        from agent import asr_tts
-        # 走一次 asr_race 的默认读取路径（未显式设 env 时）
-        os.environ.pop("ASR_RACE_GRACE_MS", None)
-        assert int(os.getenv("ASR_RACE_GRACE_MS", "50")) == 50
-        # 源码级确认默认值（防止回退到 400）
-        import inspect
-        src = inspect.getsource(asr_tts)
-        assert 'ASR_RACE_GRACE_MS", "50"' in src, \
-            "asr_race 宽限默认应保持 50ms"
+class TestAsrRaceLocalFirst:
+    def test_local_first_no_cloud_wait(self):
+        """本地优先：干净本地结果不再等云端，也不再并发发云端请求。
 
-    def test_grace_env_override_still_works(self, monkeypatch):
-        """env 显式设置仍可覆盖默认（保持可调性）。"""
-        monkeypatch.setenv("ASR_RACE_GRACE_MS", "400")
-        assert int(os.getenv("ASR_RACE_GRACE_MS", "50")) == 400
+        旧实现并行发云端 + 等 400ms 宽限，白花 ~350ms；更糟的是云端 future
+        没人取消，占满 2 worker 的池子，连续对话时本地任务排队超 deadline
+        直接掉 legacy（581-1387ms）。现在本地干净就直接返回。
+        """
+        import inspect
+        from agent import asr_tts
+        src = inspect.getsource(asr_tts.asr_race)
+        assert "ASR_RACE_GRACE_MS" not in src, \
+            "本地优先后不该再等云端宽限"
+        local_ret = src.index('return local_text, "sensevoice"')
+        cloud_submit = src.index("pool.submit(cloud_fn")
+        assert local_ret < cloud_submit, \
+            "本地干净时应先于云端提交返回（云端只在本地空/乱码时才发）"
 
 
 class TestWakeBeepOpusPrewarm:

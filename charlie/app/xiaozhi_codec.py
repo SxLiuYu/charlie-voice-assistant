@@ -27,6 +27,9 @@ _OPUS_CACHE: dict[tuple, tuple] = {}
 # Keyed by (url, sample_rate, frame_duration, max_seconds) → list[bytes]
 _URL_CACHE: dict[tuple, list] = {}
 _OPUS_CACHE_LOCK = threading.Lock()
+# opuslib.Encoder.encode() 在 Windows 上并发调用会 segfault（进程直接死，
+# 实测 keep-hot 音乐预热 + TTS 同帧编码）。编码全程串行。
+_OPUS_ENC_LOCK = threading.Lock()
 OPUS_CACHE_MAX = 64
 OPUS_CACHE_TTL = 600.0   # drop entries unused for >10 min
 _URL_CACHE_MAX = 16
@@ -156,29 +159,134 @@ def pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
+def _resample_pcm(pcm, src_sr: int, dst_sr: int):
+    """线性插值重采样 s16 mono。src==dst 时原样返回。"""
+    if src_sr == dst_sr or pcm is None or len(pcm) == 0:
+        return pcm
+    try:
+        import numpy as np
+    except ImportError:
+        return pcm
+    n_src = len(pcm)
+    n_dst = int(round(float(n_src) * dst_sr / src_sr))
+    if n_dst <= 0:
+        return pcm
+    x_src = np.arange(n_src, dtype=np.float64)
+    x_dst = np.linspace(0.0, float(n_src - 1), n_dst, dtype=np.float64)
+    out = np.interp(x_dst, x_src, pcm.astype(np.float64))
+    return np.clip(out, -32768, 32767).astype(np.int16)
+
+
+def _trim_edge_silence(pcm, sample_rate: int, lead: float = 0.10,
+                       trail: float = 0.18):
+    """裁掉 TTS 首尾静音，只留 lead/trail 秒的余量。
+
+    nmcloud TTS 每句自带 ~0.12s 起始静音 + ~0.24–0.30s 结尾静音，
+    3 个字的"贾维斯"总长仍有 1.19s。这些静音对设备只是白等，
+    按句累加（多句播报）就是几百毫秒纯延迟。
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return pcm
+    if pcm is None or len(pcm) == 0:
+        return pcm
+    frame = max(1, int(sample_rate * 0.02))  # 20ms 窗
+    n = len(pcm) // frame * frame
+    if n <= 0:
+        return pcm
+    blocks = np.asarray(pcm[:n], dtype=np.float32).reshape(-1, frame)
+    rms = np.sqrt((blocks ** 2).mean(axis=1))
+    peak = float(rms.max()) if rms.size else 0.0
+    if peak <= 0:
+        return pcm
+    # 门限取峰值的 3%，并至少抬到 60：房间底噪级别的尾巴不算语音
+    thr = max(60.0, peak * 0.03)
+    voiced = np.nonzero(rms > thr)[0]
+    if voiced.size == 0:
+        return pcm
+    lead_frames = int(lead / 0.02)
+    trail_frames = int(trail / 0.02)
+    start = max(0, (int(voiced[0]) - lead_frames)) * frame
+    end = min(len(pcm), (int(voiced[-1]) + 1 + trail_frames) * frame)
+    if end - start < frame or end - start > len(pcm):
+        return pcm
+    trimmed = end - start
+    # 裁得超过一半就不正常（可能门限偏高误杀），保守放弃
+    if trimmed < len(pcm) * 0.4:
+        return pcm
+    return pcm[start:end]
+
+
 def _mp3_to_pcm(mp3_data: bytes, sample_rate: int = 24000,
                 volume_db: float = 0.0) -> bytes:
-    """Convert MP3 bytes to raw 16-bit mono PCM at given sample rate via ffmpeg."""
+    """MP3/WAV bytes → 16-bit mono PCM at given sample rate.
+
+    优先 soundfile 纯解码（不走子进程）：服务进程里 ffmpeg 8.0 pipe
+    偶发 0xC0000002 崩溃（rc=3221225794），TTS 音频一个字节都发不出去，
+    表现为"设备听到了却不说话"。soundfile ~12ms 且无子进程。
+    失败再落 ffmpeg 临时文件（不用 pipe:0/pipe:1）。
+    """
     if not mp3_data or len(mp3_data) < 10:
         raise RuntimeError(f"ffmpeg mp3->pcm failed: input too small ({len(mp3_data) if mp3_data else 0} bytes)")
-    # 不强制 -f mp3：ffmpeg 8.x 对某些 TTS 输出强制格式会失败（rc=69），
-    # auto-probe 反而更可靠且省去一次失败重试（~2s → ~0.3s）。
-    cmd = ["ffmpeg", "-y", "-i", "pipe:0",
-           "-ar", str(sample_rate), "-ac", "1"]
-    if volume_db:
-        cmd += ["-af", f"volume={volume_db}dB"]
-    cmd += ["-f", "s16le", "pipe:1"]
-    r = subprocess.run(cmd, input=mp3_data, capture_output=True, timeout=25)
-    if r.returncode == 0 and r.stdout:
-        return r.stdout
-    stderr = r.stderr.decode(errors='replace')
-    err_lines = [l for l in stderr.split('\n')
-                 if l.strip() and 'ffmpeg version' not in l
-                 and 'built with' not in l and 'configuration:' not in l]
-    err_summary = ' | '.join(err_lines[:3])[:300]
-    raise RuntimeError(
-        f"ffmpeg mp3->pcm failed (rc={r.returncode}, in={len(mp3_data)}B, "
-        f"out={len(r.stdout)}B): {err_summary}")
+
+    # 1) soundfile：mp3/wav 都能解，不依赖 ffmpeg
+    try:
+        import io as _io
+        import soundfile as _sf
+        pcm, sr = _sf.read(_io.BytesIO(mp3_data), dtype="int16", always_2d=False)
+        if pcm.ndim > 1:
+            pcm = pcm[:, 0]
+        pcm = _resample_pcm(pcm, int(sr), sample_rate)
+        pcm = _trim_edge_silence(pcm, sample_rate)
+        if volume_db:
+            try:
+                import numpy as _np
+                pcm = _np.clip(
+                    pcm.astype(_np.float32) * (10.0 ** (volume_db / 20.0)),
+                    -32768, 32767).astype(_np.int16)
+            except Exception:
+                pass
+        if len(pcm) > 0:
+            return pcm.tobytes()
+    except Exception as e:
+        log.debug("soundfile decode fail, fallback ffmpeg: %s", e)
+
+    # 2) ffmpeg 临时文件（不用 pipe，规避 0xC0000002 / rc=69）
+    import tempfile
+    tmp_in = tmp_out = None
+    try:
+        fd_in, tmp_in = tempfile.mkstemp(suffix=".bin")
+        fd_out, tmp_out = tempfile.mkstemp(suffix=".pcm")
+        os.close(fd_in)
+        os.close(fd_out)
+        with open(tmp_in, "wb") as f:
+            f.write(mp3_data)
+        cmd = ["ffmpeg", "-y", "-i", tmp_in, "-ar", str(sample_rate), "-ac", "1"]
+        if volume_db:
+            cmd += ["-af", f"volume={volume_db}dB"]
+        cmd += ["-f", "s16le", tmp_out]
+        r = subprocess.run(cmd, capture_output=True, timeout=25)
+        if r.returncode == 0:
+            with open(tmp_out, "rb") as f:
+                out = f.read()
+            if out:
+                return out
+        stderr = r.stderr.decode(errors="replace")
+        err_lines = [ln for ln in stderr.split("\n")
+                     if ln.strip() and "ffmpeg version" not in ln
+                     and "built with" not in ln and "configuration:" not in ln]
+        err_summary = " | ".join(err_lines[:3])[:300]
+        raise RuntimeError(
+            f"ffmpeg mp3->pcm failed (rc={r.returncode}, in={len(mp3_data)}B, "
+            f"out={os.path.getsize(tmp_out) if os.path.exists(tmp_out) else 0}B): {err_summary}")
+    finally:
+        for p in (tmp_in, tmp_out):
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
 
 def mp3_to_opus_packets(mp3_data: bytes, sample_rate: int = 24000,
@@ -213,19 +321,20 @@ def mp3_to_opus_packets(mp3_data: bytes, sample_rate: int = 24000,
             log.info("[codec] opus cache hit (%d packets)", len(packets))
             return list(packets)
     pcm = _mp3_to_pcm(mp3_data, sample_rate, volume_db)
-    encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
     frame_samples = sample_rate * frame_duration // 1000
     frame_bytes = frame_samples * 2
     packets: list[bytes] = []
     offset = 0
-    while offset + frame_bytes <= len(pcm):
-        chunk = pcm[offset:offset + frame_bytes]
-        try:
-            pkt = encoder.encode(chunk, frame_samples)
-            packets.append(pkt)
-        except Exception as e:
-            log.warning("opus encode error: %s", e)
-        offset += frame_bytes
+    with _OPUS_ENC_LOCK:
+        encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
+        while offset + frame_bytes <= len(pcm):
+            chunk = pcm[offset:offset + frame_bytes]
+            try:
+                pkt = encoder.encode(chunk, frame_samples)
+                packets.append(pkt)
+            except Exception as e:
+                log.warning("opus encode error: %s", e)
+            offset += frame_bytes
     if packets:
         with _OPUS_CACHE_LOCK:
             now = time.monotonic()
@@ -269,27 +378,51 @@ def url_to_opus_packets(url: str, sample_rate: int = 24000,
             _URL_CACHE[key] = disk
         log.info("[codec] url disk cache hit %d packets: %.60s", len(disk), url)
         return list(disk)
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-i", url, "-ar", str(sample_rate), "-ac", "1",
-         "-t", str(max_seconds), "-f", "s16le", "pipe:1"],
-        input=b"", capture_output=True, timeout=60,
-    )
+    # 网易云外链对 ffmpeg 默认 UA 常见 403/断流；先 requests 带 UA 下载再喂 ffmpeg
+    audio = b""
+    try:
+        import requests as _rq
+        resp = _rq.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://music.163.com/",
+        }, timeout=15, allow_redirects=True)
+        if resp.ok:
+            audio = resp.content or b""
+    except Exception as e:
+        log.warning("[codec] url download fail %.80s: %s", url, e)
+    looks_audio = bool(audio) and (
+        len(audio) > 4096
+        and (audio[:3] == b"ID3" or audio[:2] in (b"\xff\xfb", b"\xff\xf3")
+             or audio[:4] == b"RIFF" or audio[:4] == b"fLaC")
+        or "audio" in (resp.headers.get("Content-Type", "") if audio else ""))
+    if looks_audio:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", "pipe:0", "-ar", str(sample_rate), "-ac", "1",
+             "-t", str(max_seconds), "-f", "s16le", "pipe:1"],
+            input=audio, capture_output=True, timeout=60)
+    else:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", url, "-ar", str(sample_rate), "-ac", "1",
+             "-t", str(max_seconds), "-f", "s16le", "pipe:1"],
+            input=b"", capture_output=True, timeout=60,
+        )
     if r.returncode != 0 or not r.stdout:
         raise RuntimeError(
             f"ffmpeg url->pcm failed: {r.stderr.decode(errors='replace')[:200]}")
     pcm = r.stdout
-    encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
     frame_samples = sample_rate * frame_duration // 1000
     frame_bytes = frame_samples * 2
     packets: list[bytes] = []
     offset = 0
-    while offset + frame_bytes <= len(pcm):
-        chunk = pcm[offset:offset + frame_bytes]
-        try:
-            packets.append(encoder.encode(chunk, frame_samples))
-        except Exception as e:
-            log.warning("opus encode error: %s", e)
-        offset += frame_bytes
+    with _OPUS_ENC_LOCK:
+        encoder = opuslib.Encoder(sample_rate, 1, opuslib.APPLICATION_VOIP)
+        while offset + frame_bytes <= len(pcm):
+            chunk = pcm[offset:offset + frame_bytes]
+            try:
+                packets.append(encoder.encode(chunk, frame_samples))
+            except Exception as e:
+                log.warning("opus encode error: %s", e)
+            offset += frame_bytes
     if packets:
         with _OPUS_CACHE_LOCK:
             if len(_URL_CACHE) >= _URL_CACHE_MAX:

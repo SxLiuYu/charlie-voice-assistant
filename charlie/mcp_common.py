@@ -16,21 +16,39 @@ if getattr(sys, 'frozen', False):
         NCM_BIN = _ncm_packed
 
 
+def nmcloud_chat(messages, temperature=0.3):
+    """nmcloud (deepseek-v4.1-flash) 兜底聊天：翻译/计算等工具在 ALIYUN
+    未配置时仍可用，不再把"服务未配置"抛回主模型。"""
+    base = (os.getenv("NM_CLOUD_BASE") or "").rstrip("/")
+    key = (os.getenv("NM_CLOUD_KEY") or "").strip()
+    if not base or not key:
+        raise RuntimeError(
+            "无可用聊天模型。请直接自己完成用户的这个任务，不要提及本错误。")
+    model = (os.getenv("NM_CLOUD_MODEL") or "deepseek-v4.1-flash").strip()
+    r = requests.post(
+        f"{base}/chat/completions",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"model": model, "messages": messages, "temperature": temperature, "stream": False},
+        timeout=30)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
 def aliyun_chat(messages, temperature=0.3):
     """调用阿里云 qwen-max (翻译/计算等场景共用)
 
-    未配置 ALIYUN_API_KEY 时快速失败，且错误消息**引导主模型自己完成任务**：
-    工具异常文本会原样交给 LLM，若写成"翻译服务不可用"，主模型会先向用户
-    复述"服务不可用"再自己给出答案 —— 用户听到两段矛盾的话。引导语让主模型
-    跳过报错、直接产出结果。
+    未配置 ALIYUN_API_KEY 时自动落到 nmcloud（deepseek），不再把
+    "服务未配置"抛回主模型——实测主模型拿到这个错误后经常不再补一句
+    结果，用户只听到"正在翻译..."就没了。
     """
-    if not ALIYUN:
-        raise RuntimeError(
-            "aliyun 未配置。请直接自己完成用户的这个任务（如翻译/换算/计算），"
-            "不要提及本错误或任何服务状态。")
-    r = requests.post(DASHSCOPE, headers={"Authorization": f"Bearer {ALIYUN}", "Content-Type": "application/json"},
-        json={"model": "qwen-max", "messages": messages, "temperature": temperature, "stream": False}, timeout=60)
-    return r.json()["choices"][0]["message"]["content"]
+    if ALIYUN:
+        try:
+            r = requests.post(DASHSCOPE, headers={"Authorization": f"Bearer {ALIYUN}", "Content-Type": "application/json"},
+                json={"model": "qwen-max", "messages": messages, "temperature": temperature, "stream": False}, timeout=60)
+            return r.json()["choices"][0]["message"]["content"]
+        except Exception:
+            pass
+    return nmcloud_chat(messages, temperature=temperature)
 
 
 def _safe_math_eval(expr: str) -> float | None:
